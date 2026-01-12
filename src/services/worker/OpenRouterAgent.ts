@@ -419,34 +419,40 @@ export class OpenRouterAgent {
         const errorMessage = error instanceof Error ? error.message : String(error);
         errors.push({ model, error: errorMessage });
 
-        // Check if this is a quota/rate limit error that should trigger fallback
+        // Check if this is a recoverable error that should trigger fallback
         const isQuotaError = errorMessage.toLowerCase().includes('quota') ||
                             errorMessage.toLowerCase().includes('rate limit') ||
                             errorMessage.toLowerCase().includes('insufficient') ||
                             errorMessage.toLowerCase().includes('credit') ||
                             errorMessage.toLowerCase().includes('429');
 
-        if (isQuotaError && i < models.length - 1) {
-          // Quota error and we have more models to try
-          logger.warn('SDK', `OpenRouter model quota exhausted, falling back to next model`, {
+        // Empty response should also trigger fallback (model issue, not request issue)
+        const isEmptyResponse = errorMessage.toLowerCase().includes('empty response');
+
+        const shouldFallback = isQuotaError || isEmptyResponse;
+
+        if (shouldFallback && i < models.length - 1) {
+          // Recoverable error and we have more models to try
+          const reason = isEmptyResponse ? 'empty response' : 'quota exhausted';
+          logger.warn('SDK', `OpenRouter model ${reason}, falling back to next model`, {
             failedModel: model,
             nextModel: models[i + 1],
-            error: errorMessage
+            error: errorMessage.substring(0, 200)  // Truncate for readability
           });
           continue;
         }
 
-        // Last model or non-quota error - throw
+        // Last model or non-recoverable error - throw
         if (i === models.length - 1) {
           // All models failed
           logger.error('SDK', 'All OpenRouter models failed', {
             attemptedModels: models.join(', '),
-            errors: errors.map(e => `${e.model}: ${e.error}`).join(' | ')
+            errors: errors.map(e => `${e.model}: ${e.error.substring(0, 100)}`).join(' | ')
           });
           throw new Error(`All OpenRouter models failed. Last error: ${errorMessage}`);
         }
 
-        // Non-quota error - throw immediately
+        // Non-recoverable error (not quota, not empty response) - throw immediately
         throw error;
       }
     }
@@ -514,8 +520,24 @@ export class OpenRouterAgent {
     }
 
     if (!data.choices?.[0]?.message?.content) {
-      logger.error('SDK', 'Empty response from OpenRouter');
-      return { content: '' };
+      // Log full response for debugging empty responses
+      const debugInfo = {
+        model,
+        responseKeys: Object.keys(data),
+        choicesLength: data.choices?.length ?? 0,
+        firstChoice: data.choices?.[0] ? {
+          hasMessage: !!data.choices[0].message,
+          messageKeys: data.choices[0].message ? Object.keys(data.choices[0].message) : [],
+          content: data.choices[0].message?.content?.substring(0, 100) || '<empty>',
+          role: data.choices[0].message?.role,
+          finishReason: data.choices[0].finish_reason
+        } : null,
+        usage: data.usage,
+        rawResponse: JSON.stringify(data).substring(0, 500)
+      };
+      logger.error('SDK', 'Empty response from OpenRouter', debugInfo);
+      // Throw error to trigger fallback to next model
+      throw new Error(`Empty response from model ${model}: ${JSON.stringify(debugInfo)}`);
     }
 
     const content = data.choices[0].message.content;
