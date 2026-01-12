@@ -568,7 +568,7 @@ Please see the 3.x to 4.x migration guide for details on how to update your app.
     `).run(e,r,n.type,n.tool_name||null,n.tool_input?JSON.stringify(n.tool_input):null,n.tool_response?JSON.stringify(n.tool_response):null,n.cwd||null,n.last_assistant_message||null,n.prompt_number||null,i).lastInsertRowid}claimAndDelete(e){return this.db.transaction(n=>{let a=this.db.prepare(`
         SELECT * FROM pending_messages
         WHERE session_db_id = ? AND status = 'pending'
-        ORDER BY id ASC
+        ORDER BY created_at_epoch DESC
         LIMIT 1
       `).get(n);return a&&(this.db.prepare("DELETE FROM pending_messages WHERE id = ?").run(a.id),x.info("QUEUE",`CLAIMED | sessionDbId=${n} | messageId=${a.id} | type=${a.message_type}`,{sessionId:n})),a})(e)}getAllPending(e){return this.db.prepare(`
       SELECT * FROM pending_messages

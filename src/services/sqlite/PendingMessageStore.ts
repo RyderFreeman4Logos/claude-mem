@@ -84,10 +84,12 @@ export class PendingMessageStore {
    */
   claimAndDelete(sessionDbId: number): PersistentPendingMessage | null {
     const claimTx = this.db.transaction((sessionId: number) => {
+      // Process most recent messages first (LIFO) to ensure latest context
+      // is available for SessionStart injection after auto-compact
       const peekStmt = this.db.prepare(`
         SELECT * FROM pending_messages
         WHERE session_db_id = ? AND status = 'pending'
-        ORDER BY id ASC
+        ORDER BY created_at_epoch DESC
         LIMIT 1
       `);
       const msg = peekStmt.get(sessionId) as PersistentPendingMessage | null;
