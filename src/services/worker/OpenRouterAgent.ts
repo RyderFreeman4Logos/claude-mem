@@ -504,6 +504,7 @@ export class OpenRouterAgent {
         messages,
         temperature: 0.3,  // Lower temperature for structured extraction
         max_tokens: 4096,
+        tool_choice: 'none',  // Explicitly disable tool calls to prevent Gemini from attempting function calls
       }),
     });
 
