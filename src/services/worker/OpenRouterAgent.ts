@@ -91,6 +91,25 @@ export class OpenRouterAgent {
    */
   async startSession(session: ActiveSession, worker?: WorkerRef): Promise<void> {
     try {
+      // Initialize memorySessionId if not already set
+      // OpenRouter cannot capture session_id from responses (unlike SDK),
+      // so we generate a unique ID proactively
+      if (!session.memorySessionId) {
+        const uniqueMemoryId = `openrouter-${session.contentSessionId}-${Date.now()}`;
+        session.memorySessionId = uniqueMemoryId;
+
+        // Persist to database
+        await this.dbManager.getSessionStore().updateMemorySessionId(
+          session.sessionDbId,
+          uniqueMemoryId
+        );
+
+        logger.info('SDK', 'Generated memorySessionId for OpenRouter session', {
+          sessionDbId: session.sessionDbId,
+          memorySessionId: uniqueMemoryId
+        });
+      }
+
       // Get OpenRouter configuration
       const { apiKey, models, baseUrl, siteUrl, appName } = this.getOpenRouterConfig();
 
@@ -141,95 +160,128 @@ export class OpenRouterAgent {
       // Track lastCwd from messages for CLAUDE.md generation
       let lastCwd: string | undefined;
 
-      // Process pending messages
-      for await (const message of this.sessionManager.getMessageIterator(session.sessionDbId)) {
-        // Capture cwd from messages for proper worktree support
-        if (message.cwd) {
-          lastCwd = message.cwd;
-        }
-        // Capture earliest timestamp BEFORE processing (will be cleared after)
-        const originalTimestamp = session.earliestPendingTimestamp;
+      // Get concurrency setting
+      const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
+      const concurrentMessages = parseInt(settings.CLAUDE_MEM_CONCURRENT_MESSAGES) || 3;
+      logger.info('SDK', 'Processing with concurrency', { concurrentMessages, sessionId: session.sessionDbId });
 
-        if (message.type === 'observation') {
-          // Update last prompt number
-          if (message.prompt_number !== undefined) {
-            session.lastPromptNumber = message.prompt_number;
+      // Collect messages into batches and process concurrently
+      const messageIterator = this.sessionManager.getMessageIterator(session.sessionDbId);
+
+      while (true) {
+        // Collect up to concurrentMessages messages
+        const batch: Array<{
+          message: Awaited<ReturnType<typeof messageIterator.next>>['value'];
+          originalTimestamp: number | null;
+          cwd?: string;
+        }> = [];
+
+        for (let i = 0; i < concurrentMessages; i++) {
+          const result = await messageIterator.next();
+          if (result.done) break;
+
+          const message = result.value;
+          if (message.cwd) {
+            lastCwd = message.cwd;
           }
 
-          // Build observation prompt
-          const obsPrompt = buildObservationPrompt({
-            id: 0,
-            tool_name: message.tool_name!,
-            tool_input: JSON.stringify(message.tool_input),
-            tool_output: JSON.stringify(message.tool_response),
-            created_at_epoch: originalTimestamp ?? Date.now(),
-            cwd: message.cwd
+          batch.push({
+            message,
+            originalTimestamp: session.earliestPendingTimestamp,
+            cwd: message.cwd || lastCwd
           });
-
-          // Add to conversation history and query OpenRouter with full context (with automatic fallback)
-          session.conversationHistory.push({ role: 'user', content: obsPrompt });
-          const obsResponse = await this.queryOpenRouterWithFallback(session.conversationHistory, apiKey, models, baseUrl, siteUrl, appName);
-
-          let tokensUsed = 0;
-          if (obsResponse.content) {
-            // Add response to conversation history
-            session.conversationHistory.push({ role: 'assistant', content: obsResponse.content });
-
-            tokensUsed = obsResponse.tokensUsed || 0;
-            session.cumulativeInputTokens += Math.floor(tokensUsed * 0.7);
-            session.cumulativeOutputTokens += Math.floor(tokensUsed * 0.3);
-          }
-
-          // Process response using shared ResponseProcessor
-          await processAgentResponse(
-            obsResponse.content || '',
-            session,
-            this.dbManager,
-            this.sessionManager,
-            worker,
-            tokensUsed,
-            originalTimestamp,
-            'OpenRouter',
-            lastCwd
-          );
-
-        } else if (message.type === 'summarize') {
-          // Build summary prompt
-          const summaryPrompt = buildSummaryPrompt({
-            id: session.sessionDbId,
-            memory_session_id: session.memorySessionId,
-            project: session.project,
-            user_prompt: session.userPrompt,
-            last_assistant_message: message.last_assistant_message || ''
-          }, mode);
-
-          // Add to conversation history and query OpenRouter with full context (with automatic fallback)
-          session.conversationHistory.push({ role: 'user', content: summaryPrompt });
-          const summaryResponse = await this.queryOpenRouterWithFallback(session.conversationHistory, apiKey, models, baseUrl, siteUrl, appName);
-
-          let tokensUsed = 0;
-          if (summaryResponse.content) {
-            // Add response to conversation history
-            session.conversationHistory.push({ role: 'assistant', content: summaryResponse.content });
-
-            tokensUsed = summaryResponse.tokensUsed || 0;
-            session.cumulativeInputTokens += Math.floor(tokensUsed * 0.7);
-            session.cumulativeOutputTokens += Math.floor(tokensUsed * 0.3);
-          }
-
-          // Process response using shared ResponseProcessor
-          await processAgentResponse(
-            summaryResponse.content || '',
-            session,
-            this.dbManager,
-            this.sessionManager,
-            worker,
-            tokensUsed,
-            originalTimestamp,
-            'OpenRouter',
-            lastCwd
-          );
         }
+
+        if (batch.length === 0) break;
+
+        logger.debug('SDK', 'Processing batch', { batchSize: batch.length, sessionId: session.sessionDbId });
+
+        // Process batch in parallel
+        await Promise.all(batch.map(async ({ message, originalTimestamp, cwd }) => {
+          if (message.type === 'observation') {
+            // Update last prompt number
+            if (message.prompt_number !== undefined) {
+              session.lastPromptNumber = message.prompt_number;
+            }
+
+            // Build observation prompt
+            const obsPrompt = buildObservationPrompt({
+              id: 0,
+              tool_name: message.tool_name!,
+              tool_input: JSON.stringify(message.tool_input),
+              tool_output: JSON.stringify(message.tool_response),
+              created_at_epoch: originalTimestamp ?? Date.now(),
+              cwd: message.cwd
+            });
+
+            // For concurrent processing, use minimal context (init + current message only)
+            // This allows true parallelism without history conflicts
+            const minimalHistory: ConversationMessage[] = [
+              ...session.conversationHistory.slice(0, 2),  // Keep init prompt + response
+              { role: 'user', content: obsPrompt }
+            ];
+
+            const obsResponse = await this.queryOpenRouterWithFallback(minimalHistory, apiKey, models, baseUrl, siteUrl, appName);
+
+            let tokensUsed = 0;
+            if (obsResponse.content) {
+              tokensUsed = obsResponse.tokensUsed || 0;
+              session.cumulativeInputTokens += Math.floor(tokensUsed * 0.7);
+              session.cumulativeOutputTokens += Math.floor(tokensUsed * 0.3);
+            }
+
+            // Process response using shared ResponseProcessor
+            await processAgentResponse(
+              obsResponse.content || '',
+              session,
+              this.dbManager,
+              this.sessionManager,
+              worker,
+              tokensUsed,
+              originalTimestamp,
+              'OpenRouter',
+              cwd
+            );
+
+          } else if (message.type === 'summarize') {
+            // Build summary prompt
+            const summaryPrompt = buildSummaryPrompt({
+              id: session.sessionDbId,
+              memory_session_id: session.memorySessionId,
+              project: session.project,
+              user_prompt: session.userPrompt,
+              last_assistant_message: message.last_assistant_message || ''
+            }, mode);
+
+            // For concurrent processing, use minimal context
+            const minimalHistory: ConversationMessage[] = [
+              ...session.conversationHistory.slice(0, 2),  // Keep init prompt + response
+              { role: 'user', content: summaryPrompt }
+            ];
+
+            const summaryResponse = await this.queryOpenRouterWithFallback(minimalHistory, apiKey, models, baseUrl, siteUrl, appName);
+
+            let tokensUsed = 0;
+            if (summaryResponse.content) {
+              tokensUsed = summaryResponse.tokensUsed || 0;
+              session.cumulativeInputTokens += Math.floor(tokensUsed * 0.7);
+              session.cumulativeOutputTokens += Math.floor(tokensUsed * 0.3);
+            }
+
+            // Process response using shared ResponseProcessor
+            await processAgentResponse(
+              summaryResponse.content || '',
+              session,
+              this.dbManager,
+              this.sessionManager,
+              worker,
+              tokensUsed,
+              originalTimestamp,
+              'OpenRouter',
+              cwd
+            );
+          }
+        }));
       }
 
       // Mark session complete
