@@ -1218,6 +1218,33 @@ export class SessionStore {
   }
 
   /**
+   * Check if observation already exists (deduplication)
+   * Duplicates are identified by memory_session_id + title + subtitle + type
+   */
+  private checkObservationExists(
+    memorySessionId: string,
+    title: string | null,
+    subtitle: string | null,
+    type: string
+  ): { id: number; created_at_epoch: number } | undefined {
+    const stmt = this.db.prepare(`
+      SELECT id, created_at_epoch
+      FROM observations
+      WHERE memory_session_id = ?
+        AND (title IS ? OR (title IS NULL AND ? IS NULL))
+        AND (subtitle IS ? OR (subtitle IS NULL AND ? IS NULL))
+        AND type = ?
+    `);
+
+    return stmt.get(
+      memorySessionId,
+      title, title,
+      subtitle, subtitle,
+      type
+    ) as { id: number; created_at_epoch: number } | undefined;
+  }
+
+  /**
    * Store an observation (from SDK parsing)
    * Assumes session already exists (created by hook)
    */
@@ -1238,6 +1265,22 @@ export class SessionStore {
     discoveryTokens: number = 0,
     overrideTimestampEpoch?: number
   ): { id: number; createdAtEpoch: number } {
+    // Check for duplicate observation
+    const existing = this.checkObservationExists(
+      memorySessionId,
+      observation.title,
+      observation.subtitle,
+      observation.type
+    );
+
+    if (existing) {
+      logger.debug('DB', 'Observation already exists, skipping', {
+        obsId: existing.id,
+        title: observation.title
+      });
+      return { id: existing.id, createdAtEpoch: existing.created_at_epoch };
+    }
+
     // Use override timestamp if provided (for processing backlog messages with original timestamps)
     const timestampEpoch = overrideTimestampEpoch ?? Date.now();
     const timestampIso = new Date(timestampEpoch).toISOString();
@@ -1381,6 +1424,25 @@ export class SessionStore {
       `);
 
       for (const observation of observations) {
+        // Check if observation already exists to prevent duplicates
+        const existing = this.checkObservationExists(
+          memorySessionId,
+          observation.title,
+          observation.subtitle,
+          observation.type
+        );
+
+        if (existing) {
+          logger.debug('DB', 'Observation already exists in batch, skipping', {
+            obsId: existing.id,
+            title: observation.title,
+            subtitle: observation.subtitle
+          });
+          observationIds.push(existing.id);
+          continue; // Skip insertion, use existing ID
+        }
+
+        // Insert new observation
         const result = obsStmt.run(
           memorySessionId,
           project,
