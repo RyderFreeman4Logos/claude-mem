@@ -9,6 +9,13 @@
  * - Parse XML responses (same format as Claude/Gemini)
  * - Sync to database and Chroma
  * - Support dynamic model selection across providers
+ * - Handle 429 rate limits with automatic model fallback within OpenRouter
+ *
+ * Model Fallback Strategy:
+ * - Configure multiple models in CLAUDE_MEM_OPENROUTER_MODEL (comma-separated, priority order)
+ * - On 429/quota errors, automatically try next model in the list
+ * - Only falls back to Gemini/Claude providers after ALL OpenRouter models fail
+ * - Non-recoverable errors (auth, network) immediately propagate without trying other models
  */
 
 import { DatabaseManager } from './DatabaseManager.js';
@@ -458,10 +465,23 @@ export class OpenRouterAgent {
 
         // Success - log if we had to fall back
         if (i > 0) {
-          logger.success('SDK', `OpenRouter fallback successful`, {
+          logger.success('SDK', `OpenRouter model fallback successful`, {
             failedModels: errors.map(e => e.model).join(', '),
+            failedReasons: errors.map(e => {
+              const msg = e.error.toLowerCase();
+              if (msg.includes('429') || msg.includes('rate limit')) return '429';
+              if (msg.includes('quota') || msg.includes('credit')) return 'quota';
+              if (msg.includes('empty response')) return 'empty';
+              return 'unknown';
+            }).join(', '),
             successModel: model,
-            attemptNumber: i + 1
+            attemptNumber: i + 1,
+            totalModels: models.length
+          });
+        } else {
+          logger.debug('SDK', `OpenRouter first model succeeded`, {
+            model,
+            totalModels: models.length
           });
         }
 
@@ -471,40 +491,54 @@ export class OpenRouterAgent {
         const errorMessage = error instanceof Error ? error.message : String(error);
         errors.push({ model, error: errorMessage });
 
-        // Check if this is a recoverable error that should trigger fallback
+        // Detect 429 rate limit errors specifically
+        const is429Error = errorMessage.includes('429') ||
+                          errorMessage.toLowerCase().includes('rate limit') ||
+                          errorMessage.toLowerCase().includes('too many requests');
+
+        // Other quota-related errors (credits exhausted, etc.)
         const isQuotaError = errorMessage.toLowerCase().includes('quota') ||
-                            errorMessage.toLowerCase().includes('rate limit') ||
                             errorMessage.toLowerCase().includes('insufficient') ||
-                            errorMessage.toLowerCase().includes('credit') ||
-                            errorMessage.toLowerCase().includes('429');
+                            errorMessage.toLowerCase().includes('credit');
 
         // Empty response should also trigger fallback (model issue, not request issue)
         const isEmptyResponse = errorMessage.toLowerCase().includes('empty response');
 
-        const shouldFallback = isQuotaError || isEmptyResponse;
+        // Determine if we should try the next model in OpenRouter
+        const shouldFallbackToNextModel = is429Error || isQuotaError || isEmptyResponse;
 
-        if (shouldFallback && i < models.length - 1) {
-          // Recoverable error and we have more models to try
-          const reason = isEmptyResponse ? 'empty response' : 'quota exhausted';
-          logger.warn('SDK', `OpenRouter model ${reason}, falling back to next model`, {
+        if (shouldFallbackToNextModel && i < models.length - 1) {
+          // Recoverable error - try next OpenRouter model
+          const reason = is429Error ? '429 rate limit' :
+                        isQuotaError ? 'quota exhausted' :
+                        'empty response';
+
+          logger.warn('SDK', `OpenRouter model failed (${reason}), trying next model in priority list`, {
             failedModel: model,
             nextModel: models[i + 1],
+            attemptNumber: i + 1,
+            totalModels: models.length,
             error: errorMessage.substring(0, 200)  // Truncate for readability
           });
           continue;
         }
 
-        // Last model or non-recoverable error - throw
+        // Last model or non-recoverable error
         if (i === models.length - 1) {
-          // All models failed
-          logger.error('SDK', 'All OpenRouter models failed', {
+          // All OpenRouter models exhausted
+          logger.error('SDK', 'All OpenRouter models in priority list failed', {
             attemptedModels: models.join(', '),
+            totalAttempts: models.length,
             errors: errors.map(e => `${e.model}: ${e.error.substring(0, 100)}`).join(' | ')
           });
           throw new Error(`All OpenRouter models failed. Last error: ${errorMessage}`);
         }
 
-        // Non-recoverable error (not quota, not empty response) - throw immediately
+        // Non-recoverable error (authentication, network, etc.) - throw immediately without trying other models
+        logger.error('SDK', 'OpenRouter encountered non-recoverable error, not trying other models', {
+          failedModel: model,
+          error: errorMessage.substring(0, 200)
+        });
         throw error;
       }
     }
@@ -626,7 +660,8 @@ export class OpenRouterAgent {
 
   /**
    * Get OpenRouter configuration from settings or environment
-   * Supports multiple models separated by comma for automatic fallback
+   * Supports multiple models separated by comma for automatic fallback within OpenRouter
+   * Models are tried in order of priority (first to last) on 429/quota errors
    */
   private getOpenRouterConfig(): { apiKey: string; models: string[]; baseUrl: string; siteUrl?: string; appName?: string } {
     const settingsPath = USER_SETTINGS_PATH;
@@ -636,6 +671,7 @@ export class OpenRouterAgent {
     const apiKey = settings.CLAUDE_MEM_OPENROUTER_API_KEY || process.env.OPENROUTER_API_KEY || '';
 
     // Models: parse comma-separated list from settings or use default
+    // Models will be tried in order on 429/quota errors (first = highest priority)
     const modelString = settings.CLAUDE_MEM_OPENROUTER_MODEL || 'xiaomi/mimo-v2-flash:free';
     let models = modelString.split(',').map(m => m.trim()).filter(m => m.length > 0);
 
@@ -643,6 +679,12 @@ export class OpenRouterAgent {
     if (models.length === 0) {
       models = ['gemini-3-flash-preview'];
       logger.warn('SDK', 'No OpenRouter models configured, using default: gemini-3-flash-preview');
+    } else if (models.length > 1) {
+      logger.info('SDK', 'OpenRouter configured with model priority list', {
+        models: models.join(' → '),
+        count: models.length,
+        note: 'Will try models in order on 429/quota errors'
+      });
     }
 
     // Base URL: from settings or default
