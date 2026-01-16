@@ -292,6 +292,8 @@ export class OpenRouterAgent {
       }
 
       // Mark session complete
+      this.dbManager.getSessionStore().markSessionCompleted(session.sessionDbId);
+
       const sessionDuration = Date.now() - session.startTime;
       logger.success('SDK', 'OpenRouter agent completed', {
         sessionId: session.sessionDbId,

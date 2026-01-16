@@ -1185,6 +1185,25 @@ export class SessionStore {
 
 
   /**
+   * Mark a session as completed
+   * Updates status to 'completed' and sets completed_at timestamp
+   */
+  markSessionCompleted(sessionDbId: number): void {
+    const now = new Date();
+    const nowEpoch = now.getTime();
+
+    this.db.prepare(`
+      UPDATE sdk_sessions
+      SET status = 'completed',
+          completed_at = ?,
+          completed_at_epoch = ?
+      WHERE id = ?
+    `).run(now.toISOString(), nowEpoch, sessionDbId);
+
+    logger.debug('DB', 'Session marked as completed', { sessionDbId });
+  }
+
+  /**
    * Save a user prompt
    */
   saveUserPrompt(contentSessionId: string, promptNumber: number, promptText: string): number {

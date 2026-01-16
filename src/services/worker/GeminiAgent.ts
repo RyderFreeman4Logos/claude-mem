@@ -305,6 +305,8 @@ export class GeminiAgent {
       }
 
       // Mark session complete
+      this.dbManager.getSessionStore().markSessionCompleted(session.sessionDbId);
+
       const sessionDuration = Date.now() - session.startTime;
       logger.success('SDK', 'Gemini agent completed', {
         sessionId: session.sessionDbId,
