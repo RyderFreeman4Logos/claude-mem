@@ -47,10 +47,54 @@ export class PendingMessageStore {
 
   /**
    * Enqueue a new message (persist before processing)
-   * @returns The database ID of the persisted message
+   * @returns The database ID of the persisted message (existing or newly created)
    */
   enqueue(sessionDbId: number, contentSessionId: string, message: PendingMessage): number {
     const now = Date.now();
+
+    // Check for duplicate messages before inserting
+    let existingMessage: { id: number } | undefined;
+
+    if (message.type === 'observation' && message.prompt_number !== undefined) {
+      // For observation messages: check (session_db_id, message_type='observation', prompt_number)
+      const checkStmt = this.db.prepare(`
+        SELECT id FROM pending_messages
+        WHERE session_db_id = ?
+          AND message_type = 'observation'
+          AND prompt_number = ?
+        LIMIT 1
+      `);
+      existingMessage = checkStmt.get(sessionDbId, message.prompt_number) as { id: number } | undefined;
+
+      if (existingMessage) {
+        logger.debug('QUEUE', 'Observation message already exists, skipping enqueue', {
+          sessionDbId,
+          promptNumber: message.prompt_number,
+          existingMessageId: existingMessage.id
+        });
+        return existingMessage.id;
+      }
+    } else if (message.type === 'summarize') {
+      // For summarize messages: check (session_db_id, message_type='summarize', prompt_number=NULL)
+      const checkStmt = this.db.prepare(`
+        SELECT id FROM pending_messages
+        WHERE session_db_id = ?
+          AND message_type = 'summarize'
+          AND prompt_number IS NULL
+        LIMIT 1
+      `);
+      existingMessage = checkStmt.get(sessionDbId) as { id: number } | undefined;
+
+      if (existingMessage) {
+        logger.debug('QUEUE', 'Summarize message already exists, skipping enqueue', {
+          sessionDbId,
+          existingMessageId: existingMessage.id
+        });
+        return existingMessage.id;
+      }
+    }
+
+    // No duplicate found, proceed with insertion
     const stmt = this.db.prepare(`
       INSERT INTO pending_messages (
         session_db_id, content_session_id, message_type,

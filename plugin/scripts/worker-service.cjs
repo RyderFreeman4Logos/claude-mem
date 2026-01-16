@@ -565,7 +565,19 @@ Please see the 3.x to 4.x migration guide for details on how to update your app.
         content_session_id, prompt_number, prompt_text,
         created_at, created_at_epoch
       ) VALUES (?, ?, ?, ?, ?)
-    `).run(e.content_session_id,e.prompt_number,e.prompt_text,e.created_at,e.created_at_epoch).lastInsertRowid}}}});var Js={};ln(Js,{PendingMessageStore:()=>ip});var ip,fo=Me(()=>{"use strict";ye();ip=class{db;maxRetries;constructor(e,r=3){this.db=e,this.maxRetries=r}enqueue(e,r,n){let i=Date.now();return this.db.prepare(`
+    `).run(e.content_session_id,e.prompt_number,e.prompt_text,e.created_at,e.created_at_epoch).lastInsertRowid}}}});var Js={};ln(Js,{PendingMessageStore:()=>ip});var ip,fo=Me(()=>{"use strict";ye();ip=class{db;maxRetries;constructor(e,r=3){this.db=e,this.maxRetries=r}enqueue(e,r,n){let i=Date.now(),a;if(n.type==="observation"&&n.prompt_number!==void 0){if(a=this.db.prepare(`
+        SELECT id FROM pending_messages
+        WHERE session_db_id = ?
+          AND message_type = 'observation'
+          AND prompt_number = ?
+        LIMIT 1
+      `).get(e,n.prompt_number),a)return x.debug("QUEUE","Observation message already exists, skipping enqueue",{sessionDbId:e,promptNumber:n.prompt_number,existingMessageId:a.id}),a.id}else if(n.type==="summarize"&&(a=this.db.prepare(`
+        SELECT id FROM pending_messages
+        WHERE session_db_id = ?
+          AND message_type = 'summarize'
+          AND prompt_number IS NULL
+        LIMIT 1
+      `).get(e),a))return x.debug("QUEUE","Summarize message already exists, skipping enqueue",{sessionDbId:e,existingMessageId:a.id}),a.id;return this.db.prepare(`
       INSERT INTO pending_messages (
         session_db_id, content_session_id, message_type,
         tool_name, tool_input, tool_response, cwd,
