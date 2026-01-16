@@ -10,6 +10,13 @@ Claude-mem is a Claude Code plugin providing persistent memory across sessions. 
 
 **Worker Service** (`src/services/worker-service.ts`) - Express API on port 37777, Bun-managed, handles AI processing asynchronously
 
+⚠️ **CRITICAL: Do NOT restart worker service unnecessarily** - Restarting the worker causes all pending messages in the processing queue (`pending_messages` table) to be lost. Only restart when:
+- Deploying code changes that affect worker behavior
+- Changing critical configuration (provider, model, etc.) that requires restart
+- Worker is confirmed crashed or unresponsive
+
+To check queue status before restart: `sqlite3 ~/.claude-mem/claude-mem.db "SELECT COUNT(*) FROM pending_messages"`
+
 **Database** (`src/services/sqlite/`) - SQLite3 at `~/.claude-mem/claude-mem.db`
 
 **Search Skill** (`plugin/skills/mem-search/SKILL.md`) - HTTP API for searching past work, auto-invoked when users ask about history
