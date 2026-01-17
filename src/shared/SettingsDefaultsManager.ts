@@ -52,6 +52,7 @@ export interface SettingsDefaults {
   // Feature Toggles
   CLAUDE_MEM_CONTEXT_SHOW_LAST_SUMMARY: string;
   CLAUDE_MEM_CONTEXT_SHOW_LAST_MESSAGE: string;
+  CLAUDE_MEM_ENABLE_FOLDER_CLAUDE_MD: string;  // Enable auto-generation of CLAUDE.md files in project folders
 }
 
 export class SettingsDefaultsManager {
@@ -103,6 +104,7 @@ export class SettingsDefaultsManager {
     // Feature Toggles
     CLAUDE_MEM_CONTEXT_SHOW_LAST_SUMMARY: 'true',
     CLAUDE_MEM_CONTEXT_SHOW_LAST_MESSAGE: 'false',
+    CLAUDE_MEM_ENABLE_FOLDER_CLAUDE_MD: 'false',  // Disabled by default to avoid cluttering codebase
   };
 
   /**

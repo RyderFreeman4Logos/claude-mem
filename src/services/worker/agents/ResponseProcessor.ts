@@ -16,6 +16,9 @@ import { parseObservations, parseSummary, type ParsedObservation, type ParsedSum
 import { updateCursorContextForProject } from '../../worker-service.js';
 import { updateFolderClaudeMdFiles } from '../../../utils/claude-md-utils.js';
 import { getWorkerPort } from '../../../shared/worker-utils.js';
+import { SettingsDefaultsManager } from '../../../shared/SettingsDefaultsManager.js';
+import path from 'path';
+import os from 'os';
 import type { ActiveSession } from '../../worker-types.js';
 import type { DatabaseManager } from '../DatabaseManager.js';
 import type { SessionManager } from '../SessionManager.js';
@@ -215,21 +218,29 @@ async function syncAndBroadcastObservations(
 
   // Update folder CLAUDE.md files for touched folders (fire-and-forget)
   // This runs per-observation batch to ensure folders are updated as work happens
-  const allFilePaths: string[] = [];
-  for (const obs of observations) {
-    allFilePaths.push(...(obs.files_modified || []));
-    allFilePaths.push(...(obs.files_read || []));
-  }
+  // Check if feature is enabled (disabled by default to avoid cluttering codebase)
+  const settings = SettingsDefaultsManager.loadFromFile(
+    path.join(os.homedir(), '.claude-mem', 'settings.json')
+  );
+  const folderClaudeMdEnabled = settings.CLAUDE_MEM_ENABLE_FOLDER_CLAUDE_MD === 'true';
 
-  if (allFilePaths.length > 0) {
-    updateFolderClaudeMdFiles(
-      allFilePaths,
-      session.project,
-      getWorkerPort(),
-      projectRoot
-    ).catch(error => {
-      logger.warn('FOLDER_INDEX', 'CLAUDE.md update failed (non-critical)', { project: session.project }, error as Error);
-    });
+  if (folderClaudeMdEnabled) {
+    const allFilePaths: string[] = [];
+    for (const obs of observations) {
+      allFilePaths.push(...(obs.files_modified || []));
+      allFilePaths.push(...(obs.files_read || []));
+    }
+
+    if (allFilePaths.length > 0) {
+      updateFolderClaudeMdFiles(
+        allFilePaths,
+        session.project,
+        getWorkerPort(),
+        projectRoot
+      ).catch(error => {
+        logger.warn('FOLDER_INDEX', 'CLAUDE.md update failed (non-critical)', { project: session.project }, error as Error);
+      });
+    }
   }
 }
 
