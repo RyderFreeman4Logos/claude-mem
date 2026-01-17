@@ -35,8 +35,8 @@ https*/
 
 # Auto-generated CLAUDE.md files (keep root CLAUDE.md only)
 **/CLAUDE.md
-!CLAUDE.md
-!.claude/CLAUDE.md
+!/CLAUDE.md
+!/.claude/CLAUDE.md
 
 # Draft and development directories
 @drafts/
