@@ -291,16 +291,29 @@ export class OpenRouterAgent {
         }));
       }
 
-      // Mark session complete
-      this.dbManager.getSessionStore().markSessionCompleted(session.sessionDbId);
-
+      // Check if queue is truly empty before marking session complete
+      const pendingCount = this.sessionManager.getPendingMessageStore().getPendingCount(session.sessionDbId);
       const sessionDuration = Date.now() - session.startTime;
-      logger.success('SDK', 'OpenRouter agent completed', {
-        sessionId: session.sessionDbId,
-        duration: `${(sessionDuration / 1000).toFixed(1)}s`,
-        historyLength: session.conversationHistory.length,
-        models: models.join(', ')
-      });
+
+      if (pendingCount === 0) {
+        // Only mark completed if queue is truly empty
+        this.dbManager.getSessionStore().markSessionCompleted(session.sessionDbId);
+        logger.success('SDK', 'OpenRouter agent completed', {
+          sessionId: session.sessionDbId,
+          duration: `${(sessionDuration / 1000).toFixed(1)}s`,
+          historyLength: session.conversationHistory.length,
+          models: models.join(', ')
+        });
+      } else {
+        // Queue not empty, keep session active
+        logger.info('SDK', 'OpenRouter agent finished but queue not empty, keeping session active', {
+          sessionId: session.sessionDbId,
+          duration: `${(sessionDuration / 1000).toFixed(1)}s`,
+          pendingCount,
+          historyLength: session.conversationHistory.length,
+          models: models.join(', ')
+        });
+      }
 
     } catch (error: unknown) {
       if (isAbortError(error)) {

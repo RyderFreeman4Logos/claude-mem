@@ -1187,20 +1187,50 @@ export class SessionStore {
   /**
    * Mark a session as completed
    * Updates status to 'completed' and sets completed_at timestamp
+   *
+   * IMPORTANT: This method includes an atomic queue check to prevent race conditions.
+   * The session will only be marked as completed if the queue is truly empty.
+   * This prevents the issue where messages are enqueued after the agent checks
+   * the queue but before marking the session as completed.
+   *
+   * @param sessionDbId - The session database ID
+   * @returns true if session was marked completed, false if queue was not empty
    */
-  markSessionCompleted(sessionDbId: number): void {
+  markSessionCompleted(sessionDbId: number): boolean {
     const now = new Date();
     const nowEpoch = now.getTime();
 
-    this.db.prepare(`
-      UPDATE sdk_sessions
-      SET status = 'completed',
-          completed_at = ?,
-          completed_at_epoch = ?
-      WHERE id = ?
-    `).run(now.toISOString(), nowEpoch, sessionDbId);
+    // Use a transaction to atomically check queue and mark completed
+    const markCompletedTx = this.db.transaction((sid: number) => {
+      // Check if queue is truly empty
+      const queueCheck = this.db.prepare(`
+        SELECT COUNT(*) as count FROM pending_messages
+        WHERE session_db_id = ? AND status IN ('pending', 'processing')
+      `).get(sid) as { count: number };
 
-    logger.debug('DB', 'Session marked as completed', { sessionDbId });
+      if (queueCheck.count === 0) {
+        // Queue is empty, safe to mark completed
+        this.db.prepare(`
+          UPDATE sdk_sessions
+          SET status = 'completed',
+              completed_at = ?,
+              completed_at_epoch = ?
+          WHERE id = ?
+        `).run(now.toISOString(), nowEpoch, sid);
+
+        logger.debug('DB', 'Session marked as completed', { sessionDbId: sid });
+        return true;
+      } else {
+        // Queue not empty, do not mark completed
+        logger.warn('DB', 'Attempted to mark session completed but queue not empty', {
+          sessionDbId: sid,
+          pendingCount: queueCheck.count
+        });
+        return false;
+      }
+    });
+
+    return markCompletedTx(sessionDbId) as boolean;
   }
 
   /**

@@ -129,6 +129,9 @@ export class WorkerService {
   private initializationComplete: Promise<void>;
   private resolveInitialization!: () => void;
 
+  // Orphaned session recovery timer
+  private orphanedSessionCheckTimer: NodeJS.Timeout | null = null;
+
   constructor() {
     // Initialize the promise that will resolve when background initialization completes
     this.initializationComplete = new Promise((resolve) => {
@@ -314,6 +317,9 @@ export class WorkerService {
       }).catch(error => {
         logger.error('SYSTEM', 'Auto-recovery of pending queues failed', {}, error as Error);
       });
+
+      // Start periodic orphaned session checker
+      this.startOrphanedSessionChecker();
     } catch (error) {
       logger.error('SYSTEM', 'Background initialization failed', {}, error as Error);
       throw error;
@@ -400,9 +406,77 @@ export class WorkerService {
   }
 
   /**
+   * Check for orphaned sessions (sessions with pending messages but no active generator)
+   * and start generators for them
+   */
+  private async checkOrphanedSessions(): Promise<void> {
+    try {
+      const { PendingMessageStore } = await import('./sqlite/PendingMessageStore.js');
+      const pendingStore = new PendingMessageStore(this.dbManager.getSessionStore().db, 3);
+      const orphanedSessionIds = pendingStore.getSessionsWithPendingMessages();
+
+      if (orphanedSessionIds.length === 0) return;
+
+      let recoveredCount = 0;
+      for (const sessionDbId of orphanedSessionIds) {
+        const existingSession = this.sessionManager.getSession(sessionDbId);
+
+        // Only start generator if session doesn't have one running
+        if (!existingSession?.generatorPromise) {
+          const session = this.sessionManager.initializeSession(sessionDbId);
+          const pendingCount = pendingStore.getPendingCount(sessionDbId);
+
+          logger.info('SYSTEM', `Recovering orphaned session ${sessionDbId}`, {
+            project: session.project,
+            pendingCount
+          });
+
+          this.startSessionProcessor(session, 'orphan-recovery');
+          recoveredCount++;
+        }
+      }
+
+      if (recoveredCount > 0) {
+        logger.info('SYSTEM', `Recovered ${recoveredCount} orphaned sessions`);
+      }
+    } catch (error) {
+      logger.error('SYSTEM', 'Failed to check orphaned sessions', {}, error as Error);
+    }
+  }
+
+  /**
+   * Start periodic orphaned session checker
+   * Checks every 30 seconds for sessions with pending messages but no active generator
+   */
+  private startOrphanedSessionChecker(): void {
+    // Check every 30 seconds
+    const CHECK_INTERVAL_MS = 30000;
+
+    this.orphanedSessionCheckTimer = setInterval(() => {
+      this.checkOrphanedSessions();
+    }, CHECK_INTERVAL_MS);
+
+    logger.info('SYSTEM', 'Started orphaned session checker', { intervalSeconds: CHECK_INTERVAL_MS / 1000 });
+  }
+
+  /**
+   * Stop periodic orphaned session checker
+   */
+  private stopOrphanedSessionChecker(): void {
+    if (this.orphanedSessionCheckTimer) {
+      clearInterval(this.orphanedSessionCheckTimer);
+      this.orphanedSessionCheckTimer = null;
+      logger.debug('SYSTEM', 'Stopped orphaned session checker');
+    }
+  }
+
+  /**
    * Shutdown the worker service
    */
   async shutdown(): Promise<void> {
+    // Stop orphaned session checker before shutdown
+    this.stopOrphanedSessionChecker();
+
     await performGracefulShutdown({
       server: this.server.getHttpServer(),
       sessionManager: this.sessionManager,
