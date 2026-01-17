@@ -37,3 +37,18 @@ https*/
 **/CLAUDE.md
 !CLAUDE.md
 !.claude/CLAUDE.md
+
+# Draft and development directories
+@drafts/
+@mandate-dev-drafts/
+claude/
+crates/
+drafts/
+llm/
+mandate-dev-drafts/
+mandate-enterprise/
+mandate-monorepo/
+mandate-tor-manager/
+tasks/
+ui/
+src/agents/
