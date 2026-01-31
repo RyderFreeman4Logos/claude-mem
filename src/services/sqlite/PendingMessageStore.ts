@@ -25,6 +25,28 @@ export interface PersistentPendingMessage {
 }
 
 /**
+ * Failed message record from dead letter queue
+ */
+export interface FailedMessage {
+  id: number;
+  original_id: number | null;
+  session_db_id: number;
+  content_session_id: string;
+  message_type: 'observation' | 'summarize';
+  tool_name: string | null;
+  tool_input: string | null;
+  tool_response: string | null;
+  cwd: string | null;
+  last_assistant_message: string | null;
+  prompt_number: number | null;
+  retry_count: number;
+  created_at_epoch: number;
+  failed_at_epoch: number;
+  fail_reason: string;
+  retry_history: string | null;
+}
+
+/**
  * PendingMessageStore - Persistent work queue for SDK messages
  *
  * Messages are persisted before processing using a two-phase commit pattern.
@@ -225,7 +247,7 @@ export class PendingMessageStore {
 
   /**
    * Get all queue messages (for UI display)
-   * Returns pending, processing, and failed messages (not processed - they're deleted)
+   * Returns pending and processing messages (failed messages are now in failed_messages table)
    * Joins with sdk_sessions to get project name
    */
   getQueueMessages(): (PersistentPendingMessage & { project: string | null })[] {
@@ -233,12 +255,11 @@ export class PendingMessageStore {
       SELECT pm.*, ss.project
       FROM pending_messages pm
       LEFT JOIN sdk_sessions ss ON pm.content_session_id = ss.content_session_id
-      WHERE pm.status IN ('pending', 'processing', 'failed')
+      WHERE pm.status IN ('pending', 'processing')
       ORDER BY
         CASE pm.status
-          WHEN 'failed' THEN 0
-          WHEN 'processing' THEN 1
-          WHEN 'pending' THEN 2
+          WHEN 'processing' THEN 0
+          WHEN 'pending' THEN 1
         END,
         pm.created_at_epoch ASC
     `);
@@ -260,13 +281,14 @@ export class PendingMessageStore {
 
   /**
    * Retry a specific message (reset to pending)
-   * Works for pending (re-queue), processing (reset stuck), and failed messages
+   * Works for pending (re-queue), processing (reset stuck) messages
+   * For failed messages, use retryFailedMessage() instead
    */
   retryMessage(messageId: number): boolean {
     const stmt = this.db.prepare(`
       UPDATE pending_messages
       SET status = 'pending', started_processing_at_epoch = NULL
-      WHERE id = ? AND status IN ('pending', 'processing', 'failed')
+      WHERE id = ? AND status IN ('pending', 'processing')
     `);
     const result = stmt.run(messageId);
     return result.changes > 0;
@@ -287,24 +309,71 @@ export class PendingMessageStore {
   }
 
   /**
-   * Mark all processing messages for a session as failed
+   * Mark all processing messages for a session as failed and move to dead letter queue
    * Used in error recovery when session generator crashes
-   * @returns Number of messages marked failed
+   * @returns Number of messages moved to dead letter queue
    */
   markSessionMessagesFailed(sessionDbId: number): number {
     const now = Date.now();
 
-    // Atomic update - all processing messages for session → failed
-    // Note: This bypasses retry logic since generator failures are session-level,
-    // not message-level. Individual message failures use markFailed() instead.
-    const stmt = this.db.prepare(`
-      UPDATE pending_messages
-      SET status = 'failed', failed_at_epoch = ?
+    // Get all processing messages for this session
+    const selectStmt = this.db.prepare(`
+      SELECT * FROM pending_messages
       WHERE session_db_id = ? AND status = 'processing'
     `);
+    const messagesToMove = selectStmt.all(sessionDbId) as PersistentPendingMessage[];
 
-    const result = stmt.run(now, sessionDbId);
-    return result.changes;
+    if (messagesToMove.length === 0) {
+      return 0;
+    }
+
+    // Move each message to failed_messages table
+    const insertStmt = this.db.prepare(`
+      INSERT INTO failed_messages (
+        original_id, session_db_id, content_session_id, message_type,
+        tool_name, tool_input, tool_response, cwd, last_assistant_message,
+        prompt_number, retry_count, created_at_epoch, failed_at_epoch,
+        fail_reason, retry_history
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    const deleteStmt = this.db.prepare('DELETE FROM pending_messages WHERE id = ?');
+
+    let movedCount = 0;
+    for (const msg of messagesToMove) {
+      try {
+        const retryHistory = JSON.stringify([{
+          attempted_at: msg.last_attempted_at_epoch,
+          failed_at: now,
+          reason: 'generator_crashed'
+        }]);
+
+        insertStmt.run(
+          msg.id,
+          msg.session_db_id,
+          msg.content_session_id,
+          msg.message_type,
+          msg.tool_name,
+          msg.tool_input,
+          msg.tool_response,
+          msg.cwd,
+          msg.last_assistant_message,
+          msg.prompt_number,
+          msg.retry_count,
+          msg.created_at_epoch,
+          now,
+          'generator_crashed',
+          retryHistory
+        );
+
+        deleteStmt.run(msg.id);
+        movedCount++;
+      } catch (error) {
+        logger.error('QUEUE', `Failed to move message ${msg.id} to dead letter queue`, {}, error as Error);
+      }
+    }
+
+    return movedCount;
   }
 
   /**
@@ -350,11 +419,9 @@ export class PendingMessageStore {
   /**
    * Mark message as failed (status: pending -> failed or back to pending for retry)
    * If retry_count < maxRetries, moves back to 'pending' for retry
-   * Otherwise marks as 'failed' permanently
+   * Otherwise moves to dead letter queue (failed_messages table)
    */
   markFailed(messageId: number): void {
-    const now = Date.now();
-
     // Get current retry count
     const msg = this.db.prepare('SELECT retry_count FROM pending_messages WHERE id = ?').get(messageId) as { retry_count: number } | undefined;
 
@@ -369,13 +436,8 @@ export class PendingMessageStore {
       `);
       stmt.run(messageId);
     } else {
-      // Max retries exceeded, mark as permanently failed
-      const stmt = this.db.prepare(`
-        UPDATE pending_messages
-        SET status = 'failed', completed_at_epoch = ?
-        WHERE id = ?
-      `);
-      stmt.run(now, messageId);
+      // Max retries exceeded, move to dead letter queue
+      this.moveToDeadLetterQueue(messageId, 'max_retries_exceeded');
     }
   }
 
@@ -495,24 +557,300 @@ export class PendingMessageStore {
   }
 
   /**
-   * Mark old pending messages as failed (orphan cleanup)
-   * Messages older than threshold are considered orphaned and marked as failed
+   * Mark old pending messages as failed and move to dead letter queue (orphan cleanup)
+   * Messages older than threshold are considered orphaned and moved to failed_messages table
    * @param maxAgeHours Messages older than this are considered orphaned
-   * @returns Number of messages marked as failed
+   * @param failReason Reason for failure (default: 'orphaned')
+   * @returns Number of messages moved to dead letter queue
    */
-  markOldMessagesAsFailed(maxAgeHours: number = 24): number {
+  markOldMessagesAsFailed(maxAgeHours: number = 24, failReason: string = 'orphaned'): number {
     const maxAgeMs = maxAgeHours * 60 * 60 * 1000;
     const cutoff = Date.now() - maxAgeMs;
     const now = Date.now();
 
-    const stmt = this.db.prepare(`
-      UPDATE pending_messages
-      SET status = 'failed', failed_at_epoch = ?
+    // Get messages to move
+    const selectStmt = this.db.prepare(`
+      SELECT * FROM pending_messages
       WHERE status IN ('pending', 'processing')
         AND created_at_epoch < ?
     `);
+    const messagesToMove = selectStmt.all(cutoff) as PersistentPendingMessage[];
 
-    const result = stmt.run(now, cutoff);
+    if (messagesToMove.length === 0) {
+      return 0;
+    }
+
+    // Move each message to failed_messages table
+    const insertStmt = this.db.prepare(`
+      INSERT INTO failed_messages (
+        original_id, session_db_id, content_session_id, message_type,
+        tool_name, tool_input, tool_response, cwd, last_assistant_message,
+        prompt_number, retry_count, created_at_epoch, failed_at_epoch,
+        fail_reason, retry_history
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    const deleteStmt = this.db.prepare('DELETE FROM pending_messages WHERE id = ?');
+
+    let movedCount = 0;
+    for (const msg of messagesToMove) {
+      try {
+        const retryHistory = JSON.stringify([{
+          attempted_at: msg.last_attempted_at_epoch,
+          failed_at: now,
+          reason: failReason
+        }]);
+
+        insertStmt.run(
+          msg.id,
+          msg.session_db_id,
+          msg.content_session_id,
+          msg.message_type,
+          msg.tool_name,
+          msg.tool_input,
+          msg.tool_response,
+          msg.cwd,
+          msg.last_assistant_message,
+          msg.prompt_number,
+          msg.retry_count,
+          msg.created_at_epoch,
+          now,
+          failReason,
+          retryHistory
+        );
+
+        deleteStmt.run(msg.id);
+        movedCount++;
+      } catch (error) {
+        logger.error('QUEUE', `Failed to move message ${msg.id} to dead letter queue`, {}, error as Error);
+      }
+    }
+
+    return movedCount;
+  }
+
+  /**
+   * Move a message to the dead letter queue
+   * @param messageId The ID of the message to move
+   * @param failReason The reason for failure
+   * @returns true if successful
+   */
+  moveToDeadLetterQueue(messageId: number, failReason: string = 'max_retries_exceeded'): boolean {
+    const now = Date.now();
+
+    // Get the message
+    const msg = this.db.prepare('SELECT * FROM pending_messages WHERE id = ?').get(messageId) as PersistentPendingMessage | undefined;
+    if (!msg) return false;
+
+    // Build retry history
+    const retryHistory = JSON.stringify([{
+      attempted_at: msg.last_attempted_at_epoch,
+      failed_at: now,
+      reason: failReason
+    }]);
+
+    // Insert into failed_messages
+    const insertStmt = this.db.prepare(`
+      INSERT INTO failed_messages (
+        original_id, session_db_id, content_session_id, message_type,
+        tool_name, tool_input, tool_response, cwd, last_assistant_message,
+        prompt_number, retry_count, created_at_epoch, failed_at_epoch,
+        fail_reason, retry_history
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    try {
+      insertStmt.run(
+        msg.id,
+        msg.session_db_id,
+        msg.content_session_id,
+        msg.message_type,
+        msg.tool_name,
+        msg.tool_input,
+        msg.tool_response,
+        msg.cwd,
+        msg.last_assistant_message,
+        msg.prompt_number,
+        msg.retry_count,
+        msg.created_at_epoch,
+        now,
+        failReason,
+        retryHistory
+      );
+
+      // Delete from pending_messages
+      const deleteStmt = this.db.prepare('DELETE FROM pending_messages WHERE id = ?');
+      deleteStmt.run(messageId);
+
+      logger.info('QUEUE', `Message ${messageId} moved to dead letter queue`, { failReason });
+      return true;
+    } catch (error) {
+      logger.error('QUEUE', `Failed to move message ${messageId} to dead letter queue`, {}, error as Error);
+      return false;
+    }
+  }
+
+  /**
+   * Get all failed messages from dead letter queue
+   * Joins with sdk_sessions to get project name
+   */
+  getFailedMessages(limit: number = 100, offset: number = 0): (FailedMessage & { project: string | null })[] {
+    const stmt = this.db.prepare(`
+      SELECT fm.*, ss.project
+      FROM failed_messages fm
+      LEFT JOIN sdk_sessions ss ON fm.content_session_id = ss.content_session_id
+      ORDER BY fm.failed_at_epoch DESC
+      LIMIT ? OFFSET ?
+    `);
+    return stmt.all(limit, offset) as (FailedMessage & { project: string | null })[];
+  }
+
+  /**
+   * Get count of failed messages in dead letter queue
+   */
+  getFailedMessageCount(): number {
+    const stmt = this.db.prepare('SELECT COUNT(*) as count FROM failed_messages');
+    const result = stmt.get() as { count: number };
+    return result.count;
+  }
+
+  /**
+   * Get a specific failed message by ID
+   */
+  getFailedMessageById(id: number): FailedMessage | null {
+    const stmt = this.db.prepare('SELECT * FROM failed_messages WHERE id = ?');
+    const result = stmt.get(id) as FailedMessage | undefined;
+    return result || null;
+  }
+
+  /**
+   * Retry a failed message - move it back to pending_messages
+   * @param failedMessageId The ID of the failed message to retry
+   * @returns Object with success status and new message ID if successful
+   */
+  retryFailedMessage(failedMessageId: number): { success: boolean; newMessageId?: number; error?: string } {
+    const now = Date.now();
+
+    // Get the failed message
+    const msg = this.getFailedMessageById(failedMessageId);
+    if (!msg) {
+      return { success: false, error: 'Failed message not found' };
+    }
+
+    // Parse retry history
+    let retryHistory: Array<{ retried_at: number; previous_fail_reason: string }> = [];
+    if (msg.retry_history) {
+      try {
+        retryHistory = JSON.parse(msg.retry_history);
+      } catch {
+        // Ignore parse error, start fresh
+      }
+    }
+
+    // Add this retry attempt to history
+    retryHistory.push({
+      retried_at: now,
+      previous_fail_reason: msg.fail_reason
+    });
+
+    // Check if message already exists in pending_messages (duplicate check)
+    const existingCheck = this.db.prepare(`
+      SELECT id FROM pending_messages
+      WHERE session_db_id = ?
+        AND message_type = ?
+        AND (
+          (prompt_number IS NOT NULL AND prompt_number = ?)
+          OR (prompt_number IS NULL AND ? IS NULL)
+        )
+      LIMIT 1
+    `);
+    const existing = existingCheck.get(
+      msg.session_db_id,
+      msg.message_type,
+      msg.prompt_number,
+      msg.prompt_number
+    ) as { id: number } | undefined;
+
+    if (existing) {
+      // Message already exists in pending, just delete from failed_messages
+      this.db.prepare('DELETE FROM failed_messages WHERE id = ?').run(failedMessageId);
+      return { success: true, newMessageId: existing.id, error: 'Message already exists in pending queue' };
+    }
+
+    // Insert back into pending_messages
+    const insertStmt = this.db.prepare(`
+      INSERT INTO pending_messages (
+        session_db_id, content_session_id, message_type,
+        tool_name, tool_input, tool_response, cwd,
+        last_assistant_message,
+        prompt_number, status, retry_count, created_at_epoch
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+    `);
+
+    try {
+      const result = insertStmt.run(
+        msg.session_db_id,
+        msg.content_session_id,
+        msg.message_type,
+        msg.tool_name,
+        msg.tool_input,
+        msg.tool_response,
+        msg.cwd,
+        msg.last_assistant_message,
+        msg.prompt_number,
+        msg.retry_count,
+        now // Use current time as new created_at
+      );
+
+      const newMessageId = result.lastInsertRowid as number;
+
+      // Delete from failed_messages
+      this.db.prepare('DELETE FROM failed_messages WHERE id = ?').run(failedMessageId);
+
+      logger.info('QUEUE', `Failed message ${failedMessageId} retried, new message ID: ${newMessageId}`);
+      return { success: true, newMessageId };
+    } catch (error) {
+      logger.error('QUEUE', `Failed to retry message ${failedMessageId}`, {}, error as Error);
+      return { success: false, error: (error as Error).message };
+    }
+  }
+
+  /**
+   * Retry all failed messages for a session
+   * @param sessionDbId The session ID
+   * @returns Number of messages retried
+   */
+  retryFailedMessagesForSession(sessionDbId: number): number {
+    const stmt = this.db.prepare('SELECT id FROM failed_messages WHERE session_db_id = ?');
+    const failedMessages = stmt.all(sessionDbId) as { id: number }[];
+
+    let retriedCount = 0;
+    for (const { id } of failedMessages) {
+      const result = this.retryFailedMessage(id);
+      if (result.success) {
+        retriedCount++;
+      }
+    }
+
+    return retriedCount;
+  }
+
+  /**
+   * Delete a failed message permanently
+   */
+  deleteFailedMessage(failedMessageId: number): boolean {
+    const stmt = this.db.prepare('DELETE FROM failed_messages WHERE id = ?');
+    const result = stmt.run(failedMessageId);
+    return result.changes > 0;
+  }
+
+  /**
+   * Clear all failed messages from dead letter queue
+   * @returns Number of messages deleted
+   */
+  clearFailedMessages(): number {
+    const stmt = this.db.prepare('DELETE FROM failed_messages');
+    const result = stmt.run();
     return result.changes;
   }
 
@@ -528,16 +866,11 @@ export class PendingMessageStore {
   }
 
   /**
-   * Clear all failed messages from the queue
+   * Clear all failed messages from the dead letter queue
    * @returns Number of messages deleted
    */
   clearFailed(): number {
-    const stmt = this.db.prepare(`
-      DELETE FROM pending_messages
-      WHERE status = 'failed'
-    `);
-    const result = stmt.run();
-    return result.changes;
+    return this.clearFailedMessages();
   }
 
   /**

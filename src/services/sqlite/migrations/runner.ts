@@ -32,6 +32,7 @@ export class MigrationRunner {
     this.repairSessionIdColumnRename();
     this.addFailedAtEpochColumn();
     this.addLastAttemptedAtColumn();
+    this.createFailedMessagesTable();
   }
 
   /**
@@ -647,5 +648,53 @@ export class MigrationRunner {
     }
 
     this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(21, new Date().toISOString());
+  }
+
+  /**
+   * Create failed_messages table for dead letter queue (migration 22)
+   * Stores messages that exceeded max retries or timed out
+   */
+  private createFailedMessagesTable(): void {
+    const applied = this.db.prepare('SELECT version FROM schema_versions WHERE version = ?').get(22) as SchemaVersion | undefined;
+    if (applied) return;
+
+    // Check if table already exists
+    const tables = this.db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='failed_messages'").all() as TableNameRow[];
+    if (tables.length > 0) {
+      this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(22, new Date().toISOString());
+      return;
+    }
+
+    logger.debug('DB', 'Creating failed_messages table for dead letter queue');
+
+    this.db.run(`
+      CREATE TABLE failed_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        original_id INTEGER,
+        session_db_id INTEGER NOT NULL,
+        content_session_id TEXT NOT NULL,
+        message_type TEXT NOT NULL,
+        tool_name TEXT,
+        tool_input TEXT,
+        tool_response TEXT,
+        cwd TEXT,
+        last_assistant_message TEXT,
+        prompt_number INTEGER,
+        retry_count INTEGER NOT NULL DEFAULT 0,
+        created_at_epoch INTEGER NOT NULL,
+        failed_at_epoch INTEGER NOT NULL,
+        fail_reason TEXT NOT NULL DEFAULT 'max_retries_exceeded',
+        retry_history TEXT,
+        FOREIGN KEY (session_db_id) REFERENCES sdk_sessions(id) ON DELETE CASCADE
+      )
+    `);
+
+    this.db.run('CREATE INDEX IF NOT EXISTS idx_failed_messages_session ON failed_messages(session_db_id)');
+    this.db.run('CREATE INDEX IF NOT EXISTS idx_failed_messages_failed_at ON failed_messages(failed_at_epoch DESC)');
+    this.db.run('CREATE INDEX IF NOT EXISTS idx_failed_messages_claude_session ON failed_messages(content_session_id)');
+
+    this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(22, new Date().toISOString());
+
+    logger.debug('DB', 'failed_messages table created successfully');
   }
 }

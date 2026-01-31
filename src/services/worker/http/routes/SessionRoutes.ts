@@ -253,6 +253,13 @@ export class SessionRoutes extends BaseRouteHandler {
     app.post('/api/sessions/init', this.handleSessionInitByClaudeId.bind(this));
     app.post('/api/sessions/observations', this.handleObservationsByClaudeId.bind(this));
     app.post('/api/sessions/summarize', this.handleSummarizeByClaudeId.bind(this));
+
+    // Dead letter queue endpoints
+    app.get('/api/dead-letter-queue', this.handleGetDeadLetterQueue.bind(this));
+    app.post('/api/dead-letter-queue/:id/retry', this.handleRetryFailedMessage.bind(this));
+    app.post('/api/dead-letter-queue/retry-all', this.handleRetryAllFailedMessages.bind(this));
+    app.delete('/api/dead-letter-queue/:id', this.handleDeleteFailedMessage.bind(this));
+    app.delete('/api/dead-letter-queue', this.handleClearDeadLetterQueue.bind(this));
   }
 
   /**
@@ -636,6 +643,131 @@ export class SessionRoutes extends BaseRouteHandler {
       sessionDbId,
       promptNumber,
       skipped: false
+    });
+  });
+
+  /**
+   * Get dead letter queue messages
+   * GET /api/dead-letter-queue
+   * Query params: limit, offset
+   */
+  private handleGetDeadLetterQueue = this.wrapHandler((req: Request, res: Response): void => {
+    const limit = parseInt(req.query.limit as string) || 100;
+    const offset = parseInt(req.query.offset as string) || 0;
+
+    const pendingStore = this.sessionManager.getPendingMessageStore();
+    const failedMessages = pendingStore.getFailedMessages(limit, offset);
+    const totalCount = pendingStore.getFailedMessageCount();
+
+    res.json({
+      messages: failedMessages,
+      pagination: {
+        total: totalCount,
+        limit,
+        offset,
+        hasMore: offset + failedMessages.length < totalCount
+      }
+    });
+  });
+
+  /**
+   * Retry a specific failed message
+   * POST /api/dead-letter-queue/:id/retry
+   */
+  private handleRetryFailedMessage = this.wrapHandler((req: Request, res: Response): void => {
+    const id = parseInt(req.params.id);
+    if (isNaN(id)) {
+      return this.badRequest(res, 'Invalid message ID');
+    }
+
+    const pendingStore = this.sessionManager.getPendingMessageStore();
+    const result = pendingStore.retryFailedMessage(id);
+
+    if (result.success) {
+      res.json({
+        success: true,
+        message: 'Message retried successfully',
+        newMessageId: result.newMessageId
+      });
+
+      // Trigger processing of pending queues
+      this.workerService.processPendingQueues(10).catch(error => {
+        logger.error('SESSION', 'Failed to process pending queues after retry', {}, error as Error);
+      });
+    } else {
+      res.status(400).json({
+        success: false,
+        error: result.error || 'Failed to retry message'
+      });
+    }
+  });
+
+  /**
+   * Retry all failed messages
+   * POST /api/dead-letter-queue/retry-all
+   */
+  private handleRetryAllFailedMessages = this.wrapHandler((req: Request, res: Response): void => {
+    const pendingStore = this.sessionManager.getPendingMessageStore();
+    const totalCount = pendingStore.getFailedMessageCount();
+
+    // Get all failed messages and retry them
+    const failedMessages = pendingStore.getFailedMessages(10000, 0);
+    let retriedCount = 0;
+
+    for (const msg of failedMessages) {
+      const result = pendingStore.retryFailedMessage(msg.id);
+      if (result.success) {
+        retriedCount++;
+      }
+    }
+
+    res.json({
+      success: true,
+      message: `Retried ${retriedCount} of ${totalCount} failed messages`,
+      retriedCount,
+      totalCount
+    });
+
+    // Trigger processing of pending queues
+    if (retriedCount > 0) {
+      this.workerService.processPendingQueues(10).catch(error => {
+        logger.error('SESSION', 'Failed to process pending queues after retry all', {}, error as Error);
+      });
+    }
+  });
+
+  /**
+   * Delete a specific failed message
+   * DELETE /api/dead-letter-queue/:id
+   */
+  private handleDeleteFailedMessage = this.wrapHandler((req: Request, res: Response): void => {
+    const id = parseInt(req.params.id);
+    if (isNaN(id)) {
+      return this.badRequest(res, 'Invalid message ID');
+    }
+
+    const pendingStore = this.sessionManager.getPendingMessageStore();
+    const deleted = pendingStore.deleteFailedMessage(id);
+
+    if (deleted) {
+      res.json({ success: true, message: 'Failed message deleted' });
+    } else {
+      res.status(404).json({ success: false, error: 'Failed message not found' });
+    }
+  });
+
+  /**
+   * Clear all failed messages from dead letter queue
+   * DELETE /api/dead-letter-queue
+   */
+  private handleClearDeadLetterQueue = this.wrapHandler((req: Request, res: Response): void => {
+    const pendingStore = this.sessionManager.getPendingMessageStore();
+    const deletedCount = pendingStore.clearFailedMessages();
+
+    res.json({
+      success: true,
+      message: `Cleared ${deletedCount} failed messages from dead letter queue`,
+      deletedCount
     });
   });
 }
