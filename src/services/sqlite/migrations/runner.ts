@@ -31,6 +31,7 @@ export class MigrationRunner {
     this.renameSessionIdColumns();
     this.repairSessionIdColumnRename();
     this.addFailedAtEpochColumn();
+    this.addLastAttemptedAtColumn();
   }
 
   /**
@@ -627,5 +628,24 @@ export class MigrationRunner {
     }
 
     this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(20, new Date().toISOString());
+  }
+
+  /**
+   * Add last_attempted_at_epoch column to pending_messages (migration 21)
+   * Used by claim() for exponential backoff tracking
+   */
+  private addLastAttemptedAtColumn(): void {
+    const applied = this.db.prepare('SELECT version FROM schema_versions WHERE version = ?').get(21) as SchemaVersion | undefined;
+    if (applied) return;
+
+    const tableInfo = this.db.query('PRAGMA table_info(pending_messages)').all() as TableColumnInfo[];
+    const hasColumn = tableInfo.some(col => col.name === 'last_attempted_at_epoch');
+
+    if (!hasColumn) {
+      this.db.run('ALTER TABLE pending_messages ADD COLUMN last_attempted_at_epoch INTEGER');
+      logger.debug('DB', 'Added last_attempted_at_epoch column to pending_messages table');
+    }
+
+    this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(21, new Date().toISOString());
   }
 }

@@ -11,29 +11,59 @@ export class SessionQueueProcessor {
 
   /**
    * Create an async iterator that yields messages as they become available.
-   * Uses atomic claim-and-delete to prevent duplicates.
-   * The queue is a pure buffer: claim it, delete it, process in memory.
-   * Waits for 'message' event when queue is empty.
+   * Uses two-phase commit pattern for crash-safe message processing:
+   * 1. claim(): Mark message as 'processing' (message stays in DB)
+   * 2. complete(): Delete message after successful processing
+   *
+   * If Worker crashes during processing, message remains in 'processing' state
+   * and will be reset to 'pending' on next Worker startup.
    */
   async *createIterator(sessionDbId: number, signal: AbortSignal): AsyncIterableIterator<PendingMessageWithId> {
-    while (!signal.aborted) {
-      try {
-        // Atomically claim AND DELETE next message from DB
-        // Message is now in memory only - no "processing" state tracking needed
-        const persistentMessage = this.store.claimAndDelete(sessionDbId);
+    let currentMessageId: number | null = null;
 
-        if (persistentMessage) {
-          // Yield the message for processing (it's already deleted from queue)
-          yield this.toPendingMessageWithId(persistentMessage);
-        } else {
-          // Queue empty - wait for wake-up event
-          await this.waitForMessage(signal);
+    try {
+      while (!signal.aborted) {
+        try {
+          // Complete previous message (if any) before claiming next one
+          // This ensures messages are only deleted after successful processing
+          if (currentMessageId !== null) {
+            this.store.complete(currentMessageId);
+            currentMessageId = null;
+          }
+
+          // Atomically claim next message (status -> 'processing')
+          const persistentMessage = this.store.claimAndDelete(sessionDbId);
+
+          if (persistentMessage) {
+            // Track this message so we can complete it after processing
+            currentMessageId = persistentMessage.id;
+
+            // Yield the message for processing (it's still in DB as 'processing')
+            yield this.toPendingMessageWithId(persistentMessage);
+          } else {
+            // Queue empty - wait for wake-up event
+            await this.waitForMessage(signal);
+          }
+        } catch (error) {
+          if (signal.aborted) return;
+          logger.error('SESSION', 'Error in queue processor loop', { sessionDbId }, error as Error);
+          // Small backoff to prevent tight loop on DB error
+          await new Promise(resolve => setTimeout(resolve, 1000));
         }
-      } catch (error) {
-        if (signal.aborted) return;
-        logger.error('SESSION', 'Error in queue processor loop', { sessionDbId }, error as Error);
-        // Small backoff to prevent tight loop on DB error
-        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+    } finally {
+      // Complete the last message when iterator is closed (e.g., session ended)
+      // This handles normal completion - crashes will leave message in 'processing'
+      // which will be recovered on next Worker startup
+      if (currentMessageId !== null) {
+        try {
+          this.store.complete(currentMessageId);
+        } catch (error) {
+          logger.error('SESSION', 'Failed to complete message on iterator close', {
+            sessionDbId,
+            messageId: currentMessageId
+          }, error as Error);
+        }
       }
     }
   }

@@ -53,6 +53,8 @@ export interface SettingsDefaults {
   CLAUDE_MEM_CONTEXT_SHOW_LAST_SUMMARY: string;
   CLAUDE_MEM_CONTEXT_SHOW_LAST_MESSAGE: string;
   CLAUDE_MEM_ENABLE_FOLDER_CLAUDE_MD: string;  // Enable auto-generation of CLAUDE.md files in project folders
+  // Orphan Message Cleanup
+  CLAUDE_MEM_ORPHAN_MAX_AGE_HOURS: string;  // Maximum age (in hours) for pending messages before they are considered orphaned and marked as failed
 }
 
 export class SettingsDefaultsManager {
@@ -105,6 +107,7 @@ export class SettingsDefaultsManager {
     CLAUDE_MEM_CONTEXT_SHOW_LAST_SUMMARY: 'true',
     CLAUDE_MEM_CONTEXT_SHOW_LAST_MESSAGE: 'false',
     CLAUDE_MEM_ENABLE_FOLDER_CLAUDE_MD: 'false',  // Disabled by default to avoid cluttering codebase
+    CLAUDE_MEM_ORPHAN_MAX_AGE_HOURS: '24',  // Default: 24 hours before pending messages are considered orphaned
   };
 
   /**

@@ -84,7 +84,7 @@ export async function processAgentResponse(
   });
 
   // ATOMIC TRANSACTION: Store observations + summary ONCE
-  // Messages are already deleted from queue on claim, so no completion tracking needed
+  // Messages are marked 'processing' on claim and completed after successful processing
   const result = sessionStore.storeObservations(
     session.memorySessionId,
     session.project,

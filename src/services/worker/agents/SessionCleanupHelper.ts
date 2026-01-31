@@ -5,18 +5,17 @@
  * - Reset earliest pending timestamp
  * - Broadcast processing status updates
  *
- * NOTE: With claim-and-delete queue pattern, messages are deleted on claim,
- * so there's no pendingProcessingIds tracking or processed message cleanup.
+ * NOTE: With two-phase commit queue pattern, messages are marked 'processing' on claim
+ * and completed by SessionQueueProcessor after successful processing.
  */
 
 import type { ActiveSession } from '../../worker-types.js';
-import { logger } from '../../../utils/logger.js';
 import type { WorkerRef } from './types.js';
 
 /**
  * Clean up session state after response processing
  *
- * With claim-and-delete queue pattern, this function simply:
+ * With two-phase commit queue pattern, this function:
  * 1. Resets the earliest pending timestamp
  * 2. Broadcasts updated processing status to SSE clients
  *

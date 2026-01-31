@@ -21,20 +21,23 @@ export interface PersistentPendingMessage {
   created_at_epoch: number;
   started_processing_at_epoch: number | null;
   completed_at_epoch: number | null;
+  last_attempted_at_epoch: number | null;
 }
 
 /**
  * PendingMessageStore - Persistent work queue for SDK messages
  *
- * Messages are persisted before processing using a claim-and-delete pattern.
- * This simplifies the lifecycle and eliminates duplicate processing bugs.
+ * Messages are persisted before processing using a two-phase commit pattern.
+ * This ensures messages survive Worker crashes and can be recovered on restart.
  *
  * Lifecycle:
  * 1. enqueue() - Message persisted with status 'pending'
- * 2. claimAndDelete() - Atomically claims and deletes message (process in memory)
+ * 2. claim() - Atomically claims message (status -> 'processing')
+ * 3. complete() - After successful processing, delete the message
  *
  * Recovery:
- * - getSessionsWithPendingMessages() - Find sessions that need recovery on startup
+ * - resetStuckMessages() - Reset 'processing' messages to 'pending' on startup
+ * - getSessionsWithPendingMessages() - Find sessions that need recovery
  */
 export class PendingMessageStore {
   private db: Database;
@@ -121,30 +124,43 @@ export class PendingMessageStore {
   }
 
   /**
-   * Atomically claim and DELETE the next pending message.
-   * Finds oldest pending -> returns it -> deletes from queue.
-   * The queue is a pure buffer: claim it, delete it, process in memory.
+   * Atomically claim the next pending message.
+   * Finds oldest pending -> updates status to 'processing' -> returns it.
+   * Message stays in database until complete() is called.
    * Uses a transaction to prevent race conditions.
    */
   claimAndDelete(sessionDbId: number): PersistentPendingMessage | null {
     const claimTx = this.db.transaction((sessionId: number) => {
       // Process most recent messages first (LIFO) to ensure latest context
       // is available for SessionStart injection after auto-compact
+      // Apply exponential backoff: skip messages that failed recently
+      const backoffCutoff = Date.now() - this.getRetryDelayForSession(sessionId);
+
       const peekStmt = this.db.prepare(`
         SELECT * FROM pending_messages
-        WHERE session_db_id = ? AND status = 'pending'
+        WHERE session_db_id = ?
+          AND status = 'pending'
+          AND (last_attempted_at_epoch IS NULL OR last_attempted_at_epoch < ?)
         ORDER BY created_at_epoch DESC
         LIMIT 1
       `);
-      const msg = peekStmt.get(sessionId) as PersistentPendingMessage | null;
+      const msg = peekStmt.get(sessionId, backoffCutoff) as PersistentPendingMessage | null;
 
       if (msg) {
-        // Delete immediately - no "processing" state needed
-        const deleteStmt = this.db.prepare('DELETE FROM pending_messages WHERE id = ?');
-        deleteStmt.run(msg.id);
+        // Update status to processing - message stays in database
+        const updateStmt = this.db.prepare(`
+          UPDATE pending_messages
+          SET status = 'processing',
+              started_processing_at_epoch = ?,
+              last_attempted_at_epoch = ?,
+              retry_count = retry_count + 1
+          WHERE id = ?
+        `);
+        const now = Date.now();
+        updateStmt.run(now, now, msg.id);
 
         // Log claim with minimal info (avoid logging full payload)
-        logger.info('QUEUE', `CLAIMED | sessionDbId=${sessionId} | messageId=${msg.id} | type=${msg.message_type}`, {
+        logger.info('QUEUE', `CLAIMED | sessionDbId=${sessionId} | messageId=${msg.id} | type=${msg.message_type} | retry=${msg.retry_count + 1}`, {
           sessionId: sessionId
         });
       }
@@ -152,6 +168,47 @@ export class PendingMessageStore {
     });
 
     return claimTx(sessionDbId) as PersistentPendingMessage | null;
+  }
+
+  /**
+   * Calculate retry delay based on retry count (exponential backoff).
+   * Returns delay in milliseconds.
+   */
+  private getRetryDelay(retryCount: number): number {
+    // Exponential backoff: 1s, 2s, 4s, 8s, 16s, max 60s
+    const baseDelay = 1000;
+    const maxDelay = 60000;
+    return Math.min(baseDelay * Math.pow(2, retryCount), maxDelay);
+  }
+
+  /**
+   * Calculate the cutoff time for message retry based on session's retry count.
+   * Returns the epoch timestamp before which messages should be skipped.
+   */
+  private getRetryDelayForSession(sessionDbId: number): number {
+    // Get the max retry count for pending messages in this session
+    const stmt = this.db.prepare(`
+      SELECT MAX(retry_count) as max_retries
+      FROM pending_messages
+      WHERE session_db_id = ? AND status = 'pending'
+    `);
+    const result = stmt.get(sessionDbId) as { max_retries: number } | undefined;
+    const maxRetries = result?.max_retries ?? 0;
+    // Use average delay based on max retries seen
+    return this.getRetryDelay(Math.max(0, maxRetries - 1));
+  }
+
+  /**
+   * Mark a message as successfully completed and delete it from the queue.
+   * Must be called after the message has been fully processed.
+   */
+  complete(messageId: number): void {
+    const stmt = this.db.prepare('DELETE FROM pending_messages WHERE id = ?');
+    const result = stmt.run(messageId);
+
+    if (result.changes > 0) {
+      logger.info('QUEUE', `COMPLETED | messageId=${messageId}`);
+    }
   }
 
   /**
@@ -366,14 +423,41 @@ export class PendingMessageStore {
 
   /**
    * Get all session IDs that have pending messages (for recovery on startup)
+   * Excludes messages that are older than the max age threshold (orphaned messages)
    */
-  getSessionsWithPendingMessages(): number[] {
+  getSessionsWithPendingMessages(maxAgeHours: number = 24): number[] {
+    const maxAgeMs = maxAgeHours * 60 * 60 * 1000;
+    const cutoff = Date.now() - maxAgeMs;
+
     const stmt = this.db.prepare(`
       SELECT DISTINCT session_db_id FROM pending_messages
       WHERE status IN ('pending', 'processing')
+        AND created_at_epoch > ?
     `);
-    const results = stmt.all() as { session_db_id: number }[];
+    const results = stmt.all(cutoff) as { session_db_id: number }[];
     return results.map(r => r.session_db_id);
+  }
+
+  /**
+   * Mark old pending messages as failed (orphan cleanup)
+   * Messages older than threshold are considered orphaned and marked as failed
+   * @param maxAgeHours Messages older than this are considered orphaned
+   * @returns Number of messages marked as failed
+   */
+  markOldMessagesAsFailed(maxAgeHours: number = 24): number {
+    const maxAgeMs = maxAgeHours * 60 * 60 * 1000;
+    const cutoff = Date.now() - maxAgeMs;
+    const now = Date.now();
+
+    const stmt = this.db.prepare(`
+      UPDATE pending_messages
+      SET status = 'failed', failed_at_epoch = ?
+      WHERE status IN ('pending', 'processing')
+        AND created_at_epoch < ?
+    `);
+
+    const result = stmt.run(now, cutoff);
+    return result.changes;
   }
 
   /**

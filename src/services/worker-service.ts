@@ -263,10 +263,28 @@ export class WorkerService {
       // Recover stuck messages from previous crashes
       const { PendingMessageStore } = await import('./sqlite/PendingMessageStore.js');
       const pendingStore = new PendingMessageStore(this.dbManager.getSessionStore().db, 3);
+
+      // Reset ALL processing messages from previous session (no threshold)
+      // This ensures tasks survive Worker crashes/restarts
+      const recoveredFromCrash = pendingStore.resetStuckMessages(0); // 0 = reset all processing messages
+      if (recoveredFromCrash > 0) {
+        logger.warn('SYSTEM', `Recovered ${recoveredFromCrash} messages from previous Worker session (will resume processing)`, {
+          note: 'These messages were being processed when Worker stopped'
+        });
+      }
+
+      // Mark old orphaned messages as failed (messages older than configured threshold)
+      const orphanMaxAgeHours = parseInt(settings.CLAUDE_MEM_ORPHAN_MAX_AGE_HOURS || '24', 10);
+      const orphanedCount = pendingStore.markOldMessagesAsFailed(orphanMaxAgeHours);
+      if (orphanedCount > 0) {
+        logger.warn('SYSTEM', `Marked ${orphanedCount} orphaned messages as failed (older than ${orphanMaxAgeHours}h)`);
+      }
+
+      // Reset messages stuck in processing for more than 5 minutes (newly stuck during this session)
       const STUCK_THRESHOLD_MS = 5 * 60 * 1000;
       const resetCount = pendingStore.resetStuckMessages(STUCK_THRESHOLD_MS);
       if (resetCount > 0) {
-        logger.info('SYSTEM', `Recovered ${resetCount} stuck messages from previous session`, { thresholdMinutes: 5 });
+        logger.info('SYSTEM', `Reset ${resetCount} messages stuck in processing for >5 minutes`);
       }
 
       // Initialize search services
@@ -361,8 +379,13 @@ export class WorkerService {
     startedSessionIds: number[];
   }> {
     const { PendingMessageStore } = await import('./sqlite/PendingMessageStore.js');
+    const { SettingsDefaultsManager } = await import('../shared/SettingsDefaultsManager.js');
+    const { USER_SETTINGS_PATH } = await import('../shared/paths.js');
     const pendingStore = new PendingMessageStore(this.dbManager.getSessionStore().db, 3);
-    const orphanedSessionIds = pendingStore.getSessionsWithPendingMessages();
+    // Only process sessions with messages newer than configured threshold (avoid orphaned sessions)
+    const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
+    const orphanMaxAgeHours = parseInt(settings.CLAUDE_MEM_ORPHAN_MAX_AGE_HOURS || '24', 10);
+    const orphanedSessionIds = pendingStore.getSessionsWithPendingMessages(orphanMaxAgeHours);
 
     const result = {
       totalPendingSessions: orphanedSessionIds.length,
@@ -412,8 +435,13 @@ export class WorkerService {
   private async checkOrphanedSessions(): Promise<void> {
     try {
       const { PendingMessageStore } = await import('./sqlite/PendingMessageStore.js');
+      const { SettingsDefaultsManager } = await import('../shared/SettingsDefaultsManager.js');
+      const { USER_SETTINGS_PATH } = await import('../shared/paths.js');
       const pendingStore = new PendingMessageStore(this.dbManager.getSessionStore().db, 3);
-      const orphanedSessionIds = pendingStore.getSessionsWithPendingMessages();
+      // Only check sessions with messages newer than configured threshold (avoid old orphaned sessions)
+      const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
+      const orphanMaxAgeHours = parseInt(settings.CLAUDE_MEM_ORPHAN_MAX_AGE_HOURS || '24', 10);
+      const orphanedSessionIds = pendingStore.getSessionsWithPendingMessages(orphanMaxAgeHours);
 
       if (orphanedSessionIds.length === 0) return;
 
