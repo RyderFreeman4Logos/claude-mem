@@ -1,6 +1,7 @@
 import { Database } from './sqlite-compat.js';
 import type { PendingMessage } from '../worker-types.js';
 import { logger } from '../../utils/logger.js';
+import { createHash } from 'crypto';
 
 /**
  * Persistent pending message record from database
@@ -22,6 +23,9 @@ export interface PersistentPendingMessage {
   started_processing_at_epoch: number | null;
   completed_at_epoch: number | null;
   last_attempted_at_epoch: number | null;
+  content_hash: string | null;
+  duplicate_count: number;
+  merged_metadata: string | null;
 }
 
 /**
@@ -71,51 +75,153 @@ export class PendingMessageStore {
   }
 
   /**
+   * Calculate content hash for a pending message.
+   * Used for deduplication - identical content produces identical hash.
+   */
+  private calculateContentHash(message: PendingMessage): string {
+    // Create a normalized object with only the fields that define message content
+    const normalizedContent = {
+      type: message.type,
+      tool_name: message.tool_name,
+      tool_input: message.tool_input,
+      tool_response: message.tool_response,
+      cwd: message.cwd,
+      last_assistant_message: message.last_assistant_message,
+      prompt_number: message.prompt_number
+    };
+
+    // Serialize to JSON with stable key ordering
+    const contentString = JSON.stringify(normalizedContent, Object.keys(normalizedContent).sort());
+
+    // Calculate SHA-256 hash and return first 16 characters (sufficient for dedup, saves space)
+    return createHash('sha256').update(contentString).digest('hex').substring(0, 16);
+  }
+
+  /**
+   * Merge metadata from duplicate messages.
+   * Collects timestamps and any additional metadata from duplicates.
+   */
+  private mergeMetadata(existingMetadata: string | null, newMessage: PendingMessage): string {
+    const merged = existingMetadata ? JSON.parse(existingMetadata) : { duplicates: [] };
+
+    merged.duplicates.push({
+      timestamp: Date.now(),
+      prompt_number: newMessage.prompt_number
+    });
+
+    // Keep only last 10 duplicate records to prevent unbounded growth
+    if (merged.duplicates.length > 10) {
+      merged.duplicates = merged.duplicates.slice(-10);
+    }
+
+    return JSON.stringify(merged);
+  }
+
+  /**
    * Enqueue a new message (persist before processing)
+   * Implements content-based deduplication using SHA-256 hash.
+   * If a message with identical content exists in pending/processing state,
+   * increments duplicate_count and merges metadata instead of creating a new entry.
    * @returns The database ID of the persisted message (existing or newly created)
    */
   enqueue(sessionDbId: number, contentSessionId: string, message: PendingMessage): number {
     const now = Date.now();
 
-    // Check for duplicate messages before inserting
-    let existingMessage: { id: number } | undefined;
+    // Calculate content hash for deduplication
+    const contentHash = this.calculateContentHash(message);
+
+    // Check for existing message with same content hash in pending/processing state
+    const existingCheckStmt = this.db.prepare(`
+      SELECT id, duplicate_count, merged_metadata FROM pending_messages
+      WHERE session_db_id = ?
+        AND content_hash = ?
+        AND status IN ('pending', 'processing')
+      LIMIT 1
+    `);
+    const existingMessage = existingCheckStmt.get(sessionDbId, contentHash) as
+      { id: number; duplicate_count: number; merged_metadata: string | null } | undefined;
+
+    if (existingMessage) {
+      // Duplicate detected - increment counter and update metadata
+      const newDuplicateCount = existingMessage.duplicate_count + 1;
+      const newMergedMetadata = this.mergeMetadata(existingMessage.merged_metadata, message);
+
+      const updateStmt = this.db.prepare(`
+        UPDATE pending_messages
+        SET duplicate_count = ?,
+            merged_metadata = ?,
+            created_at_epoch = ?
+        WHERE id = ?
+      `);
+      updateStmt.run(newDuplicateCount, newMergedMetadata, now, existingMessage.id);
+
+      logger.info('QUEUE', `Duplicate message detected and merged | messageId=${existingMessage.id} | duplicateCount=${newDuplicateCount}`, {
+        sessionDbId,
+        messageType: message.type,
+        contentHash,
+        existingMessageId: existingMessage.id
+      });
+
+      return existingMessage.id;
+    }
+
+    // Check for legacy duplicate detection (for backward compatibility)
+    // This handles the case where content_hash might be NULL for older records
+    let legacyExistingMessage: { id: number } | undefined;
 
     if (message.type === 'observation' && message.prompt_number !== undefined) {
-      // For observation messages: check (session_db_id, message_type='observation', prompt_number)
       const checkStmt = this.db.prepare(`
         SELECT id FROM pending_messages
         WHERE session_db_id = ?
           AND message_type = 'observation'
           AND prompt_number = ?
+          AND content_hash IS NULL
         LIMIT 1
       `);
-      existingMessage = checkStmt.get(sessionDbId, message.prompt_number) as { id: number } | undefined;
+      legacyExistingMessage = checkStmt.get(sessionDbId, message.prompt_number) as { id: number } | undefined;
 
-      if (existingMessage) {
-        logger.debug('QUEUE', 'Observation message already exists, skipping enqueue', {
+      if (legacyExistingMessage) {
+        logger.debug('QUEUE', 'Legacy observation message found, updating with hash', {
           sessionDbId,
           promptNumber: message.prompt_number,
-          existingMessageId: existingMessage.id
+          existingMessageId: legacyExistingMessage.id
         });
-        return existingMessage.id;
+        // Update the legacy record with hash and increment duplicate count
+        const updateLegacyStmt = this.db.prepare(`
+          UPDATE pending_messages
+          SET content_hash = ?,
+              duplicate_count = duplicate_count + 1,
+              created_at_epoch = ?
+          WHERE id = ?
+        `);
+        updateLegacyStmt.run(contentHash, now, legacyExistingMessage.id);
+        return legacyExistingMessage.id;
       }
     } else if (message.type === 'summarize') {
-      // For summarize messages: check (session_db_id, message_type='summarize', prompt_number=NULL)
       const checkStmt = this.db.prepare(`
         SELECT id FROM pending_messages
         WHERE session_db_id = ?
           AND message_type = 'summarize'
           AND prompt_number IS NULL
+          AND content_hash IS NULL
         LIMIT 1
       `);
-      existingMessage = checkStmt.get(sessionDbId) as { id: number } | undefined;
+      legacyExistingMessage = checkStmt.get(sessionDbId) as { id: number } | undefined;
 
-      if (existingMessage) {
-        logger.debug('QUEUE', 'Summarize message already exists, skipping enqueue', {
+      if (legacyExistingMessage) {
+        logger.debug('QUEUE', 'Legacy summarize message found, updating with hash', {
           sessionDbId,
-          existingMessageId: existingMessage.id
+          existingMessageId: legacyExistingMessage.id
         });
-        return existingMessage.id;
+        const updateLegacyStmt = this.db.prepare(`
+          UPDATE pending_messages
+          SET content_hash = ?,
+              duplicate_count = duplicate_count + 1,
+              created_at_epoch = ?
+          WHERE id = ?
+        `);
+        updateLegacyStmt.run(contentHash, now, legacyExistingMessage.id);
+        return legacyExistingMessage.id;
       }
     }
 
@@ -125,8 +231,9 @@ export class PendingMessageStore {
         session_db_id, content_session_id, message_type,
         tool_name, tool_input, tool_response, cwd,
         last_assistant_message,
-        prompt_number, status, retry_count, created_at_epoch
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?)
+        prompt_number, status, retry_count, created_at_epoch,
+        content_hash, duplicate_count, merged_metadata
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, 0, NULL)
     `);
 
     const result = stmt.run(
@@ -139,10 +246,19 @@ export class PendingMessageStore {
       message.cwd || null,
       message.last_assistant_message || null,
       message.prompt_number || null,
-      now
+      now,
+      contentHash
     );
 
-    return result.lastInsertRowid as number;
+    const newMessageId = result.lastInsertRowid as number;
+
+    logger.debug('QUEUE', `New message enqueued | messageId=${newMessageId} | type=${message.type} | hash=${contentHash}`, {
+      sessionDbId,
+      messageType: message.type,
+      contentHash
+    });
+
+    return newMessageId;
   }
 
   /**
@@ -777,14 +893,27 @@ export class PendingMessageStore {
       return { success: true, newMessageId: existing.id, error: 'Message already exists in pending queue' };
     }
 
-    // Insert back into pending_messages
+    // Calculate content hash for the failed message being retried
+    const pendingMessage: PendingMessage = {
+      type: msg.message_type,
+      tool_name: msg.tool_name || undefined,
+      tool_input: msg.tool_input ? JSON.parse(msg.tool_input) : undefined,
+      tool_response: msg.tool_response ? JSON.parse(msg.tool_response) : undefined,
+      cwd: msg.cwd || undefined,
+      last_assistant_message: msg.last_assistant_message || undefined,
+      prompt_number: msg.prompt_number || undefined
+    };
+    const contentHash = this.calculateContentHash(pendingMessage);
+
+    // Insert back into pending_messages with content hash
     const insertStmt = this.db.prepare(`
       INSERT INTO pending_messages (
         session_db_id, content_session_id, message_type,
         tool_name, tool_input, tool_response, cwd,
         last_assistant_message,
-        prompt_number, status, retry_count, created_at_epoch
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+        prompt_number, status, retry_count, created_at_epoch,
+        content_hash, duplicate_count, merged_metadata
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, 0, NULL)
     `);
 
     try {
@@ -799,7 +928,8 @@ export class PendingMessageStore {
         msg.last_assistant_message,
         msg.prompt_number,
         msg.retry_count,
-        now // Use current time as new created_at
+        now, // Use current time as new created_at
+        contentHash
       );
 
       const newMessageId = result.lastInsertRowid as number;

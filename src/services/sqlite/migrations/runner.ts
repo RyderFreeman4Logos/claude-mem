@@ -33,6 +33,7 @@ export class MigrationRunner {
     this.addFailedAtEpochColumn();
     this.addLastAttemptedAtColumn();
     this.createFailedMessagesTable();
+    this.addMessageDeduplicationColumns();
   }
 
   /**
@@ -696,5 +697,38 @@ export class MigrationRunner {
     this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(22, new Date().toISOString());
 
     logger.debug('DB', 'failed_messages table created successfully');
+  }
+
+  /**
+   * Add content_hash and duplicate_count columns for message deduplication (migration 23)
+   * Enables detection and merging of duplicate messages in the queue
+   */
+  private addMessageDeduplicationColumns(): void {
+    const applied = this.db.prepare('SELECT version FROM schema_versions WHERE version = ?').get(23) as SchemaVersion | undefined;
+    if (applied) return;
+
+    const tableInfo = this.db.query('PRAGMA table_info(pending_messages)').all() as TableColumnInfo[];
+    const hasContentHash = tableInfo.some(col => col.name === 'content_hash');
+    const hasDuplicateCount = tableInfo.some(col => col.name === 'duplicate_count');
+    const hasMergedMetadata = tableInfo.some(col => col.name === 'merged_metadata');
+
+    if (!hasContentHash) {
+      this.db.run('ALTER TABLE pending_messages ADD COLUMN content_hash TEXT');
+      this.db.run('CREATE INDEX IF NOT EXISTS idx_pending_messages_content_hash ON pending_messages(content_hash)');
+      logger.debug('DB', 'Added content_hash column to pending_messages table');
+    }
+
+    if (!hasDuplicateCount) {
+      this.db.run('ALTER TABLE pending_messages ADD COLUMN duplicate_count INTEGER NOT NULL DEFAULT 0');
+      logger.debug('DB', 'Added duplicate_count column to pending_messages table');
+    }
+
+    if (!hasMergedMetadata) {
+      this.db.run('ALTER TABLE pending_messages ADD COLUMN merged_metadata TEXT');
+      logger.debug('DB', 'Added merged_metadata column to pending_messages table');
+    }
+
+    this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(23, new Date().toISOString());
+    logger.debug('DB', 'Message deduplication columns added successfully');
   }
 }
