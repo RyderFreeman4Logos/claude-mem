@@ -398,6 +398,62 @@ export class PendingMessageStore {
   }
 
   /**
+   * Reset timed out messages (processing -> pending if processing longer than timeout)
+   * This is used for automatic timeout-based recovery during runtime.
+   *
+   * IMPORTANT: Excludes messages from active sessions to avoid resetting
+   * messages that are being legitimately processed by active generators.
+   *
+   * @param timeoutMs Messages processing longer than this are reset to pending
+   * @param activeSessionDbIds Array of session IDs that are currently active (should not be reset)
+   * @returns Object with count of reset messages and array of reset message IDs
+   */
+  resetTimedOutMessages(timeoutMs: number, activeSessionDbIds: number[] = []): { count: number; messageIds: number[] } {
+    const cutoff = Date.now() - timeoutMs;
+
+    // Build the query - exclude active sessions
+    let query = `
+      SELECT id FROM pending_messages
+      WHERE status = 'processing'
+        AND started_processing_at_epoch < ?
+    `;
+    const params: (number | string)[] = [cutoff];
+
+    if (activeSessionDbIds.length > 0) {
+      query += ` AND session_db_id NOT IN (${activeSessionDbIds.map(() => '?').join(',')})`;
+      params.push(...activeSessionDbIds);
+    }
+
+    // First, get the IDs of messages that will be reset (for logging)
+    const selectStmt = this.db.prepare(query);
+    const messagesToReset = selectStmt.all(...params) as { id: number }[];
+    const messageIds = messagesToReset.map(m => m.id);
+
+    if (messageIds.length === 0) {
+      return { count: 0, messageIds: [] };
+    }
+
+    // Reset the timed out messages (same WHERE clause)
+    let updateQuery = `
+      UPDATE pending_messages
+      SET status = 'pending', started_processing_at_epoch = NULL
+      WHERE status = 'processing'
+        AND started_processing_at_epoch < ?
+    `;
+    const updateParams: (number | string)[] = [cutoff];
+
+    if (activeSessionDbIds.length > 0) {
+      updateQuery += ` AND session_db_id NOT IN (${activeSessionDbIds.map(() => '?').join(',')})`;
+      updateParams.push(...activeSessionDbIds);
+    }
+
+    const updateStmt = this.db.prepare(updateQuery);
+    const result = updateStmt.run(...updateParams);
+
+    return { count: result.changes, messageIds };
+  }
+
+  /**
    * Get count of pending messages for a session
    */
   getPendingCount(sessionDbId: number): number {

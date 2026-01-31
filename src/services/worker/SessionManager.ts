@@ -314,6 +314,14 @@ export class SessionManager {
   }
 
   /**
+   * Get IDs of all active sessions
+   * Used to exclude active sessions from timeout-based message reset
+   */
+  getActiveSessionIds(): IterableIterator<number> {
+    return this.sessions.keys();
+  }
+
+  /**
    * Get total queue depth across all sessions (for activity indicator)
    */
   getTotalQueueDepth(): number {

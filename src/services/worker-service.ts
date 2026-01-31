@@ -132,6 +132,15 @@ export class WorkerService {
   // Orphaned session recovery timer
   private orphanedSessionCheckTimer: NodeJS.Timeout | null = null;
 
+  // Timed out messages check timer
+  private timedOutMessagesCheckTimer: NodeJS.Timeout | null = null;
+
+  // Default timeout for message processing (5 minutes)
+  private readonly DEFAULT_MESSAGE_TIMEOUT_MS = 5 * 60 * 1000;
+
+  // Check interval for timed out messages (30 seconds)
+  private readonly TIMEOUT_CHECK_INTERVAL_MS = 30 * 1000;
+
   constructor() {
     // Initialize the promise that will resolve when background initialization completes
     this.initializationComplete = new Promise((resolve) => {
@@ -338,6 +347,9 @@ export class WorkerService {
 
       // Start periodic orphaned session checker
       this.startOrphanedSessionChecker();
+
+      // Start periodic timed out messages checker
+      this.startTimedOutMessagesChecker();
     } catch (error) {
       logger.error('SYSTEM', 'Background initialization failed', {}, error as Error);
       throw error;
@@ -499,11 +511,74 @@ export class WorkerService {
   }
 
   /**
+   * Start periodic timed out messages checker
+   * Checks every 30 seconds for messages stuck in processing state longer than timeout
+   */
+  private startTimedOutMessagesChecker(): void {
+    this.timedOutMessagesCheckTimer = setInterval(() => {
+      this.checkAndResetTimedOutMessages();
+    }, this.TIMEOUT_CHECK_INTERVAL_MS);
+
+    logger.info('SYSTEM', 'Started timed out messages checker', {
+      intervalSeconds: this.TIMEOUT_CHECK_INTERVAL_MS / 1000,
+      timeoutMinutes: this.DEFAULT_MESSAGE_TIMEOUT_MS / 60000
+    });
+  }
+
+  /**
+   * Stop periodic timed out messages checker
+   */
+  private stopTimedOutMessagesChecker(): void {
+    if (this.timedOutMessagesCheckTimer) {
+      clearInterval(this.timedOutMessagesCheckTimer);
+      this.timedOutMessagesCheckTimer = null;
+      logger.debug('SYSTEM', 'Stopped timed out messages checker');
+    }
+  }
+
+  /**
+   * Check for timed out messages and reset them to pending
+   *
+   * IMPORTANT: Only resets messages from sessions that are NOT currently active
+   * to avoid disrupting legitimately long-running tasks.
+   */
+  private async checkAndResetTimedOutMessages(): Promise<void> {
+    try {
+      const { PendingMessageStore } = await import('./sqlite/PendingMessageStore.js');
+      const pendingStore = new PendingMessageStore(this.dbManager.getSessionStore().db, 3);
+
+      // Get list of active session IDs to exclude from timeout reset
+      // This prevents resetting messages from sessions with active generators
+      const activeSessionIds = Array.from(this.sessionManager.getActiveSessionIds());
+
+      const result = pendingStore.resetTimedOutMessages(this.DEFAULT_MESSAGE_TIMEOUT_MS, activeSessionIds);
+
+      if (result.count > 0) {
+        logger.warn('SYSTEM', `Reset ${result.count} timed out message(s) to pending`, {
+          messageIds: result.messageIds,
+          timeoutMinutes: this.DEFAULT_MESSAGE_TIMEOUT_MS / 60000,
+          excludedActiveSessions: activeSessionIds.length
+        });
+
+        // Trigger processing of pending queues since we now have pending messages
+        this.processPendingQueues(10).catch(error => {
+          logger.error('SYSTEM', 'Failed to process pending queues after timeout reset', {}, error as Error);
+        });
+      }
+    } catch (error) {
+      logger.error('SYSTEM', 'Failed to check and reset timed out messages', {}, error as Error);
+    }
+  }
+
+  /**
    * Shutdown the worker service
    */
   async shutdown(): Promise<void> {
     // Stop orphaned session checker before shutdown
     this.stopOrphanedSessionChecker();
+
+    // Stop timed out messages checker before shutdown
+    this.stopTimedOutMessagesChecker();
 
     await performGracefulShutdown({
       server: this.server.getHttpServer(),
