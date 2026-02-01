@@ -876,15 +876,26 @@ async function main() {
 
       writePidFile({ pid, port, startedAt: new Date().toISOString() });
 
-      const healthy = await waitForHealth(port, getPlatformTimeout(310000));
-      if (!healthy) {
+      const healthy = await waitForHealth(port, getPlatformTimeout(30000));
+      if (healthy) {
+        logger.info('SYSTEM', 'Worker started successfully');
+        exitWithStatus('ready');
+      }
+
+      // Health check timed out, but worker may still be initializing
+      const stillRunning = await isPortInUse(port);
+      if (stillRunning) {
+        logger.warn('SYSTEM', 'Worker health check timed out, but process is still running. MCP may still be initializing.');
+        console.log('\nWorker is starting in background (MCP connection may take a few minutes).');
+        console.log('Check status with: npm run worker:status');
+        console.log('View logs with: npm run worker:logs\n');
+        // Do NOT remove PID file - let worker continue initializing
+        exitWithStatus('ready', 'Worker starting in background');
+      } else {
         removePidFile();
         logger.error('SYSTEM', 'Worker failed to start (health check timeout)');
         exitWithStatus('error', 'Worker failed to start (health check timeout)');
       }
-
-      logger.info('SYSTEM', 'Worker started successfully');
-      exitWithStatus('ready');
     }
 
     case 'stop': {
@@ -920,16 +931,25 @@ async function main() {
 
       writePidFile({ pid, port, startedAt: new Date().toISOString() });
 
-      const healthy = await waitForHealth(port, getPlatformTimeout(310000));
-      if (!healthy) {
-        removePidFile();
-        logger.error('SYSTEM', 'Worker failed to restart');
-        // Exit gracefully: Windows Terminal won't keep tab open on exit 0
-        // The wrapper/plugin will handle restart logic if needed
+      const healthy = await waitForHealth(port, getPlatformTimeout(30000));
+      if (healthy) {
+        logger.info('SYSTEM', 'Worker restarted successfully');
         process.exit(0);
       }
 
-      logger.info('SYSTEM', 'Worker restarted successfully');
+      // Health check timed out, but worker may still be initializing
+      // Check if process is still running
+      const stillRunning = await isPortInUse(port);
+      if (stillRunning) {
+        logger.warn('SYSTEM', 'Worker health check timed out, but process is still running. MCP may still be initializing.');
+        console.log('\nWorker is starting in background (MCP connection may take a few minutes).');
+        console.log('Check status with: npm run worker:status');
+        console.log('View logs with: npm run worker:logs\n');
+        // Do NOT remove PID file - let worker continue initializing
+      } else {
+        removePidFile();
+        logger.error('SYSTEM', 'Worker failed to restart (process not running)');
+      }
       process.exit(0);
     }
 
