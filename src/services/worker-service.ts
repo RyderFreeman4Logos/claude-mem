@@ -876,7 +876,7 @@ async function main() {
 
       writePidFile({ pid, port, startedAt: new Date().toISOString() });
 
-      const healthy = await waitForHealth(port, getPlatformTimeout(30000));
+      const healthy = await waitForHealth(port, getPlatformTimeout(310000));
       if (!healthy) {
         removePidFile();
         logger.error('SYSTEM', 'Worker failed to start (health check timeout)');
@@ -920,7 +920,7 @@ async function main() {
 
       writePidFile({ pid, port, startedAt: new Date().toISOString() });
 
-      const healthy = await waitForHealth(port, getPlatformTimeout(30000));
+      const healthy = await waitForHealth(port, getPlatformTimeout(310000));
       if (!healthy) {
         removePidFile();
         logger.error('SYSTEM', 'Worker failed to restart');
