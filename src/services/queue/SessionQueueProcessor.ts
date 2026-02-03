@@ -19,25 +19,13 @@ export class SessionQueueProcessor {
    * and will be reset to 'pending' on next Worker startup.
    */
   async *createIterator(sessionDbId: number, signal: AbortSignal): AsyncIterableIterator<PendingMessageWithId> {
-    let currentMessageId: number | null = null;
-
     try {
       while (!signal.aborted) {
         try {
-          // Complete previous message (if any) before claiming next one
-          // This ensures messages are only deleted after successful processing
-          if (currentMessageId !== null) {
-            this.store.complete(currentMessageId);
-            currentMessageId = null;
-          }
-
           // Atomically claim next message (status -> 'processing')
           const persistentMessage = this.store.claimAndDelete(sessionDbId);
 
           if (persistentMessage) {
-            // Track this message so we can complete it after processing
-            currentMessageId = persistentMessage.id;
-
             // Yield the message for processing (it's still in DB as 'processing')
             yield this.toPendingMessageWithId(persistentMessage);
           } else {
@@ -52,19 +40,8 @@ export class SessionQueueProcessor {
         }
       }
     } finally {
-      // Complete the last message when iterator is closed (e.g., session ended)
-      // This handles normal completion - crashes will leave message in 'processing'
-      // which will be recovered on next Worker startup
-      if (currentMessageId !== null) {
-        try {
-          this.store.complete(currentMessageId);
-        } catch (error) {
-          logger.error('SESSION', 'Failed to complete message on iterator close', {
-            sessionDbId,
-            messageId: currentMessageId
-          }, error as Error);
-        }
-      }
+      // Messages are completed explicitly by the SDK agents after successful processing.
+      // If processing is interrupted, messages remain in 'processing' and will be recovered.
     }
   }
 
