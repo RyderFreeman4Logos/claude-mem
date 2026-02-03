@@ -10,8 +10,6 @@
  */
 
 import fs from 'fs';
-import path from 'path';
-import { homedir } from 'os';
 import { logger } from '../../utils/logger.js';
 import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
 import { USER_SETTINGS_PATH } from '../../shared/paths.js';
@@ -27,6 +25,8 @@ export class ConcurrencyManager {
   private lastDecreaseTime: number = 0;
   private decreaseLock: boolean = false;
   private settingsWatcher: fs.FSWatcher | null = null;
+  private suppressWatch: boolean = false;
+  private reloadTimer: NodeJS.Timeout | null = null;
 
   private constructor() {
     this.loadConcurrency();
@@ -60,15 +60,15 @@ export class ConcurrencyManager {
 
       if (!isNaN(configured) && configured >= MIN_CONCURRENCY) {
         this.currentConcurrency = configured;
-        logger.info('CONCURRENCY', `Loaded concurrency: ${this.currentConcurrency}`);
+        logger.info('SYSTEM', `Loaded concurrency: ${this.currentConcurrency}`);
       } else {
         this.currentConcurrency = DEFAULT_CONCURRENCY;
-        logger.warn('CONCURRENCY', `Invalid concurrency config, using default: ${DEFAULT_CONCURRENCY}`, {
+        logger.warn('SYSTEM', `Invalid concurrency config, using default: ${DEFAULT_CONCURRENCY}`, {
           configured: settings.CLAUDE_MEM_CONCURRENT_MESSAGES
         });
       }
     } catch (error) {
-      logger.error('CONCURRENCY', 'Failed to load concurrency, using default', error as Error);
+      logger.error('SYSTEM', 'Failed to load concurrency, using default', error as Error);
       this.currentConcurrency = DEFAULT_CONCURRENCY;
     }
   }
@@ -84,15 +84,23 @@ export class ConcurrencyManager {
       }
 
       this.settingsWatcher = fs.watch(USER_SETTINGS_PATH, (eventType) => {
-        if (eventType === 'change') {
-          logger.debug('CONCURRENCY', 'Settings file changed, reloading concurrency');
-          this.loadConcurrency();
+        if (eventType !== 'change') return;
+        if (this.suppressWatch) return;
+
+        if (this.reloadTimer) {
+          clearTimeout(this.reloadTimer);
         }
+
+        this.reloadTimer = setTimeout(() => {
+          this.reloadTimer = null;
+          logger.debug('SYSTEM', 'Settings file changed, reloading concurrency');
+          this.loadConcurrency();
+        }, 200);
       });
 
-      logger.info('CONCURRENCY', `Watching settings for hot reload: ${USER_SETTINGS_PATH}`);
+      logger.info('SYSTEM', `Watching settings for hot reload: ${USER_SETTINGS_PATH}`);
     } catch (error) {
-      logger.error('CONCURRENCY', 'Failed to watch settings file', error as Error);
+      logger.error('SYSTEM', 'Failed to watch settings file', error as Error);
     }
   }
 
@@ -107,7 +115,7 @@ export class ConcurrencyManager {
 
     if (timeSinceLastDecrease < DECREASE_COOLDOWN_MS) {
       const remainingCooldown = Math.ceil((DECREASE_COOLDOWN_MS - timeSinceLastDecrease) / 1000);
-      logger.warn('CONCURRENCY', `429 error detected but in cooldown (${remainingCooldown}s remaining)`, {
+      logger.warn('SYSTEM', `429 error detected but in cooldown (${remainingCooldown}s remaining)`, {
         currentConcurrency: this.currentConcurrency,
         lastDecrease: new Date(this.lastDecreaseTime).toISOString()
       });
@@ -116,7 +124,7 @@ export class ConcurrencyManager {
 
     // Acquire lock (prevent concurrent decreases)
     if (this.decreaseLock) {
-      logger.debug('CONCURRENCY', '429 error detected but decrease already in progress');
+      logger.debug('SYSTEM', '429 error detected but decrease already in progress');
       return;
     }
 
@@ -125,7 +133,7 @@ export class ConcurrencyManager {
     try {
       // Check if already at minimum
       if (this.currentConcurrency <= MIN_CONCURRENCY) {
-        logger.warn('CONCURRENCY', `Already at minimum concurrency (${MIN_CONCURRENCY}), cannot decrease further`);
+        logger.warn('SYSTEM', `Already at minimum concurrency (${MIN_CONCURRENCY}), cannot decrease further`);
         return;
       }
 
@@ -134,7 +142,7 @@ export class ConcurrencyManager {
       this.currentConcurrency = Math.max(MIN_CONCURRENCY, this.currentConcurrency - 1);
       this.lastDecreaseTime = now;
 
-      logger.warn('CONCURRENCY', `Auto-decreased concurrency due to 429 rate limit`, {
+      logger.warn('SYSTEM', `Auto-decreased concurrency due to 429 rate limit`, {
         from: oldConcurrency,
         to: this.currentConcurrency,
         nextDecreaseAvailableAt: new Date(now + DECREASE_COOLDOWN_MS).toISOString()
@@ -153,11 +161,7 @@ export class ConcurrencyManager {
    */
   private async updateSettingsFile(newConcurrency: number): Promise<void> {
     try {
-      // Temporarily stop watching to avoid triggering reload during our own write
-      if (this.settingsWatcher) {
-        this.settingsWatcher.close();
-        this.settingsWatcher = null;
-      }
+      this.suppressWatch = true;
 
       // Read current settings
       const settingsContent = fs.readFileSync(USER_SETTINGS_PATH, 'utf-8');
@@ -166,21 +170,25 @@ export class ConcurrencyManager {
       // Update concurrency
       settings.CLAUDE_MEM_CONCURRENT_MESSAGES = String(newConcurrency);
 
-      // Write back with pretty formatting
-      fs.writeFileSync(USER_SETTINGS_PATH, JSON.stringify(settings, null, 2) + '\n', 'utf-8');
+      // Write back with pretty formatting (atomic rename)
+      const tempPath = `${USER_SETTINGS_PATH}.tmp`;
+      fs.writeFileSync(tempPath, JSON.stringify(settings, null, 2) + '\n', 'utf-8');
+      fs.renameSync(tempPath, USER_SETTINGS_PATH);
 
-      logger.success('CONCURRENCY', `Updated settings.json with new concurrency: ${newConcurrency}`);
+      logger.success('SYSTEM', `Updated settings.json with new concurrency: ${newConcurrency}`);
 
       // Resume watching after a short delay (give file system time to settle)
       setTimeout(() => {
+        this.suppressWatch = false;
         this.startWatchingSettings();
       }, 1000);
 
     } catch (error) {
-      logger.error('CONCURRENCY', 'Failed to update settings.json', error as Error);
+      logger.error('SYSTEM', 'Failed to update settings.json', error as Error);
 
       // Resume watching even if update failed
       setTimeout(() => {
+        this.suppressWatch = false;
         this.startWatchingSettings();
       }, 1000);
     }
@@ -193,6 +201,11 @@ export class ConcurrencyManager {
     if (this.settingsWatcher) {
       this.settingsWatcher.close();
       this.settingsWatcher = null;
+    }
+
+    if (this.reloadTimer) {
+      clearTimeout(this.reloadTimer);
+      this.reloadTimer = null;
     }
   }
 }

@@ -571,17 +571,22 @@ export class WorkerService {
 
       const result = pendingStore.resetTimedOutMessages(this.DEFAULT_MESSAGE_TIMEOUT_MS, activeSessionIds);
 
-      if (result.count > 0) {
-        logger.warn('SYSTEM', `Reset ${result.count} timed out message(s) to pending`, {
-          messageIds: result.messageIds,
+      if (result.count > 0 || result.deadLetterCount > 0) {
+        logger.warn('SYSTEM', 'Handled timed out messages', {
+          resetCount: result.count,
+          resetMessageIds: result.messageIds,
+          deadLetterCount: result.deadLetterCount,
+          deadLetterIds: result.deadLetterIds,
           timeoutMinutes: this.DEFAULT_MESSAGE_TIMEOUT_MS / 60000,
           excludedActiveSessions: activeSessionIds.length
         });
 
-        // Trigger processing of pending queues since we now have pending messages
-        this.processPendingQueues(10).catch(error => {
-          logger.error('SYSTEM', 'Failed to process pending queues after timeout reset', {}, error as Error);
-        });
+        if (result.count > 0) {
+          // Trigger processing of pending queues since we now have pending messages
+          this.processPendingQueues(10).catch(error => {
+            logger.error('SYSTEM', 'Failed to process pending queues after timeout reset', {}, error as Error);
+          });
+        }
       }
     } catch (error) {
       logger.error('SYSTEM', 'Failed to check and reset timed out messages', {}, error as Error);
