@@ -10,15 +10,14 @@
  */
 
 import path from 'path';
-import * as fs from 'fs';
-import { spawn } from 'child_process';
-import { homedir } from 'os';
-import { existsSync, writeFileSync, readFileSync, mkdirSync } from 'fs';
-import * as readline from 'readline';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { getWorkerPort, getWorkerHost } from '../shared/worker-utils.js';
 import { logger } from '../utils/logger.js';
+
+// Version injected at build time by esbuild define
+declare const __DEFAULT_PACKAGE_VERSION__: string;
+const packageVersion = typeof __DEFAULT_PACKAGE_VERSION__ !== 'undefined' ? __DEFAULT_PACKAGE_VERSION__ : '0.0.0-dev';
 
 // Infrastructure imports
 import {
@@ -45,11 +44,7 @@ import { Server } from './server/Server.js';
 // Integration imports
 import {
   updateCursorContextForProject,
-  handleCursorCommand,
-  detectClaudeCode,
-  findCursorHooksDir,
-  installCursorHooks,
-  configureCursorMcp
+  handleCursorCommand
 } from './integrations/CursorHooksInstaller.js';
 
 // Service layer imports
@@ -74,8 +69,8 @@ import { SearchRoutes } from './worker/http/routes/SearchRoutes.js';
 import { SettingsRoutes } from './worker/http/routes/SettingsRoutes.js';
 import { LogsRoutes } from './worker/http/routes/LogsRoutes.js';
 
-// Re-export updateCursorContextForProject for SDK agents
-export { updateCursorContextForProject };
+// Process management for zombie cleanup (Issue #737)
+import { startOrphanReaper, reapOrphanedProcesses } from './worker/ProcessRegistry.js';
 
 /**
  * Build JSON status output for hook framework communication.
@@ -141,6 +136,9 @@ export class WorkerService {
   // Check interval for timed out messages (30 seconds)
   private readonly TIMEOUT_CHECK_INTERVAL_MS = 30 * 1000;
 
+  // Orphan reaper cleanup function (Issue #737)
+  private stopOrphanReaper: (() => void) | null = null;
+
   constructor() {
     // Initialize the promise that will resolve when background initialization completes
     this.initializationComplete = new Promise((resolve) => {
@@ -153,7 +151,6 @@ export class WorkerService {
     this.sseBroadcaster = new SSEBroadcaster();
     this.sdkAgent = new SDKAgent(this.dbManager, this.sessionManager);
     this.geminiAgent = new GeminiAgent(this.dbManager, this.sessionManager);
-    this.geminiAgent.setFallbackAgent(this.sdkAgent);
     this.openRouterAgent = new OpenRouterAgent(this.dbManager, this.sessionManager);
     this.openRouterAgent.setGeminiAgent(this.geminiAgent);  // Secondary fallback
     this.openRouterAgent.setFallbackAgent(this.sdkAgent);   // Final fallback
@@ -167,9 +164,10 @@ export class WorkerService {
     });
 
     // Initialize MCP client
+    // Empty capabilities object: this client only calls tools, doesn't expose any
     this.mcpClient = new Client({
       name: 'worker-search-proxy',
-      version: '1.0.0'
+      version: packageVersion
     }, { capabilities: {} });
 
     // Initialize HTTP server with core routes
@@ -242,6 +240,16 @@ export class WorkerService {
 
     // Start HTTP server FIRST - make port available immediately
     await this.server.listen(port, host);
+
+    // Worker writes its own PID - reliable on all platforms
+    // This happens after listen() succeeds, ensuring the worker is actually ready
+    // On Windows, the spawner's PID is cmd.exe (useless), so worker must write its own
+    writePidFile({
+      pid: process.pid,
+      port,
+      startedAt: new Date().toISOString()
+    });
+
     logger.info('SYSTEM', 'Worker started', { host, port, pid: process.pid });
 
     // Do slow initialization in background (non-blocking)
@@ -331,6 +339,16 @@ export class WorkerService {
       this.initializationCompleteFlag = true;
       this.resolveInitialization();
       logger.info('SYSTEM', 'Background initialization complete');
+
+      // Start orphan reaper to clean up zombie processes (Issue #737)
+      this.stopOrphanReaper = startOrphanReaper(() => {
+        const activeIds = new Set<number>();
+        for (const [id] of this.sessionManager['sessions']) {
+          activeIds.add(id);
+        }
+        return activeIds;
+      });
+      logger.info('SYSTEM', 'Started orphan reaper (runs every 5 minutes)');
 
       // Auto-recover orphaned queues (fire-and-forget with error logging)
       this.processPendingQueues(50).then(result => {
@@ -580,6 +598,12 @@ export class WorkerService {
     // Stop timed out messages checker before shutdown
     this.stopTimedOutMessagesChecker();
 
+    // Stop orphan reaper before shutdown (Issue #737)
+    if (this.stopOrphanReaper) {
+      this.stopOrphanReaper();
+      this.stopOrphanReaper = null;
+    }
+
     await performGracefulShutdown({
       server: this.server.getHttpServer(),
       sessionManager: this.sessionManager,
@@ -607,212 +631,6 @@ export class WorkerService {
       isProcessing,
       queueDepth
     });
-  }
-}
-
-// ============================================================================
-// Interactive Setup Wizard
-// ============================================================================
-
-async function runInteractiveSetup(): Promise<number> {
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout
-  });
-
-  const question = (prompt: string): Promise<string> => {
-    return new Promise(resolve => rl.question(prompt, resolve));
-  };
-
-  console.log(`
-╔══════════════════════════════════════════════════════════════════╗
-║           Claude-Mem Cursor Setup Wizard                         ║
-║                                                                  ║
-║  This wizard will guide you through setting up claude-mem        ║
-║  for use with Cursor IDE.                                        ║
-╚══════════════════════════════════════════════════════════════════╝
-`);
-
-  try {
-    console.log('Step 1: Checking environment...\n');
-
-    const hasClaudeCode = await detectClaudeCode();
-    const settingsPath = path.join(homedir(), '.claude-mem', 'settings.json');
-    let settings: Record<string, unknown> = {};
-
-    if (existsSync(settingsPath)) {
-      try {
-        settings = JSON.parse(readFileSync(settingsPath, 'utf-8'));
-      } catch (error) {
-        logger.debug('SETUP', 'Corrupt settings file, starting fresh', { path: settingsPath }, error as Error);
-      }
-    }
-
-    const currentProvider = settings['CLAUDE_MEM_PROVIDER'] as string || (hasClaudeCode ? 'claude-sdk' : 'none');
-
-    if (hasClaudeCode) {
-      console.log('Claude Code detected\n');
-    } else {
-      console.log('Claude Code not detected\n');
-    }
-
-    console.log(`Current provider: ${currentProvider}\n`);
-
-    console.log('Step 2: Choose AI Provider\n');
-    if (hasClaudeCode) {
-      console.log('  [1] Claude SDK (Recommended - uses your Claude Code subscription)');
-    } else {
-      console.log('  [1] Claude SDK (requires Claude Code subscription)');
-    }
-    console.log('  [2] Gemini (1500 free requests/day)');
-    console.log('  [3] OpenRouter (100+ models, some free)');
-    console.log('  [4] Keep current settings\n');
-
-    const providerChoice = await question('Enter choice [1-4]: ');
-
-    if (providerChoice === '1') {
-      settings['CLAUDE_MEM_PROVIDER'] = 'claude-sdk';
-      mkdirSync(path.dirname(settingsPath), { recursive: true });
-      writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
-      console.log('\nClaude SDK configured!\n');
-    } else if (providerChoice === '2') {
-      console.log('\nConfiguring Gemini...\n');
-      console.log('   Get your free API key at: https://aistudio.google.com/apikey\n');
-
-      const apiKey = await question('Enter your Gemini API key: ');
-      if (apiKey.trim()) {
-        settings['CLAUDE_MEM_PROVIDER'] = 'gemini';
-        settings['CLAUDE_MEM_GEMINI_API_KEY'] = apiKey.trim();
-        mkdirSync(path.dirname(settingsPath), { recursive: true });
-        writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
-        console.log('\nGemini configured successfully!\n');
-      } else {
-        console.log('\nNo API key provided. You can add it later in ~/.claude-mem/settings.json\n');
-      }
-    } else if (providerChoice === '3') {
-      console.log('\nConfiguring OpenRouter...\n');
-      console.log('   Get your API key at: https://openrouter.ai/keys\n');
-
-      const apiKey = await question('Enter your OpenRouter API key: ');
-      if (apiKey.trim()) {
-        settings['CLAUDE_MEM_PROVIDER'] = 'openrouter';
-        settings['CLAUDE_MEM_OPENROUTER_API_KEY'] = apiKey.trim();
-        mkdirSync(path.dirname(settingsPath), { recursive: true });
-        writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
-        console.log('\nOpenRouter configured successfully!\n');
-      } else {
-        console.log('\nNo API key provided. You can add it later in ~/.claude-mem/settings.json\n');
-      }
-    } else {
-      console.log('\nKeeping current settings.\n');
-    }
-
-    console.log('Step 3: Choose installation scope\n');
-    console.log('  [1] Project (current directory only) - Recommended');
-    console.log('  [2] User (all projects for current user)');
-    console.log('  [3] Skip hook installation\n');
-
-    const scopeChoice = await question('Enter choice [1-3]: ');
-
-    let installTarget: string | null = null;
-    if (scopeChoice === '1') {
-      installTarget = 'project';
-    } else if (scopeChoice === '2') {
-      installTarget = 'user';
-    } else {
-      console.log('\nSkipping hook installation.\n');
-    }
-
-    if (installTarget) {
-      console.log(`Step 4: Installing Cursor hooks (${installTarget})...\n`);
-
-      const cursorHooksDir = findCursorHooksDir();
-      if (!cursorHooksDir) {
-        console.error('Could not find cursor-hooks directory');
-        console.error('   Make sure you ran npm run build first.');
-        rl.close();
-        return 1;
-      }
-
-      const installResult = await installCursorHooks(cursorHooksDir, installTarget as 'project' | 'user');
-      if (installResult !== 0) {
-        rl.close();
-        return installResult;
-      }
-
-      console.log('\nStep 5: Configuring MCP server for memory search...\n');
-      const mcpResult = configureCursorMcp(installTarget as 'project' | 'user');
-      if (mcpResult !== 0) {
-        console.warn('MCP configuration failed, but hooks are installed.');
-        console.warn('   You can manually configure MCP later.\n');
-      } else {
-        console.log('');
-      }
-    }
-
-    console.log('\nStep 6: Starting claude-mem worker...\n');
-
-    const port = getWorkerPort();
-    const alreadyRunning = await waitForHealth(port, 1000);
-
-    if (alreadyRunning) {
-      console.log('Worker is already running!\n');
-    } else {
-      console.log('   Starting worker in background...');
-
-      const pid = spawnDaemon(__filename, port);
-      if (pid === undefined) {
-        console.error('Failed to start worker');
-        rl.close();
-        return 1;
-      }
-
-      writePidFile({ pid, port, startedAt: new Date().toISOString() });
-
-      const healthy = await waitForHealth(port, getPlatformTimeout(30000));
-      if (!healthy) {
-        removePidFile();
-        console.error('Worker failed to start');
-        rl.close();
-        return 1;
-      }
-
-      console.log('Worker started successfully!\n');
-    }
-
-    console.log(`
-╔══════════════════════════════════════════════════════════════════╗
-║                    Setup Complete!                               ║
-╚══════════════════════════════════════════════════════════════════╝
-
-What's installed:
-  - Cursor hooks - Automatically capture sessions
-  - Context injection - Past work injected into new chats
-  - MCP search server - Ask "what did I work on last week?"
-
-Next steps:
-  1. Restart Cursor to load the hooks and MCP server
-  2. Start chatting - your sessions will be remembered!
-  3. Use natural language to search: "find where I fixed the auth bug"
-
-Useful commands:
-  npm run cursor:status     Check installation status
-  npm run worker:status     Check worker status
-  npm run worker:logs       View worker logs
-
-Memory viewer:
-  http://localhost:${port}
-
-Documentation:
-  https://docs.claude-mem.ai/cursor
-`);
-
-    rl.close();
-    return 0;
-  } catch (error) {
-    rl.close();
-    console.error(`\nSetup failed: ${(error as Error).message}`);
-    return 1;
   }
 }
 
@@ -874,7 +692,8 @@ async function main() {
         exitWithStatus('error', 'Failed to spawn worker daemon');
       }
 
-      writePidFile({ pid, port, startedAt: new Date().toISOString() });
+      // PID file is written by the worker itself after listen() succeeds
+      // This is race-free and works correctly on Windows where cmd.exe PID is useless
 
       const healthy = await waitForHealth(port, getPlatformTimeout(30000));
       if (healthy) {
@@ -929,7 +748,8 @@ async function main() {
         process.exit(0);
       }
 
-      writePidFile({ pid, port, startedAt: new Date().toISOString() });
+      // PID file is written by the worker itself after listen() succeeds
+      // This is race-free and works correctly on Windows where cmd.exe PID is useless
 
       const healthy = await waitForHealth(port, getPlatformTimeout(30000));
       if (healthy) {
