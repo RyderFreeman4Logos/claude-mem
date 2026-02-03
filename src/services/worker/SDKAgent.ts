@@ -65,8 +65,15 @@ export class SDKAgent {
       'TodoWrite'       // No todo management
     ];
 
+    const pendingStore = this.sessionManager.getPendingMessageStore();
+    const pendingMessageQueue: Array<{ id: number; originalTimestamp: number }> = [];
+
     // Create message generator (event-driven)
-    const messageGenerator = this.createMessageGenerator(session, cwdTracker);
+    const messageGenerator = this.createMessageGenerator(
+      session,
+      cwdTracker,
+      (id, originalTimestamp) => pendingMessageQueue.push({ id, originalTimestamp })
+    );
 
     // CRITICAL: Only resume if:
     // 1. memorySessionId exists (was captured from a previous SDK response)
@@ -74,27 +81,29 @@ export class SDKAgent {
     // On worker restart or crash recovery, memorySessionId may exist from a previous
     // SDK session but we must NOT resume because the SDK context was lost.
     // NEVER use contentSessionId for resume - that would inject messages into the user's transcript!
-    const hasRealMemorySessionId = !!session.memorySessionId;
+    const memorySessionId = session.memorySessionId ?? undefined;
+    const hasRealMemorySessionId = !!memorySessionId;
+    const resumeId = hasRealMemorySessionId ? memorySessionId : undefined;
 
     logger.info('SDK', 'Starting SDK query', {
       sessionDbId: session.sessionDbId,
       contentSessionId: session.contentSessionId,
-      memorySessionId: session.memorySessionId,
+      memorySessionId,
       hasRealMemorySessionId,
-      resume_parameter: hasRealMemorySessionId ? session.memorySessionId : '(none - fresh start)',
+      resume_parameter: resumeId ?? '(none - fresh start)',
       lastPromptNumber: session.lastPromptNumber
     });
 
     // Debug-level alignment logs for detailed tracing
     if (session.lastPromptNumber > 1) {
       const willResume = hasRealMemorySessionId;
-      logger.debug('SDK', `[ALIGNMENT] Resume Decision | contentSessionId=${session.contentSessionId} | memorySessionId=${session.memorySessionId} | prompt#=${session.lastPromptNumber} | hasRealMemorySessionId=${hasRealMemorySessionId} | willResume=${willResume} | resumeWith=${willResume ? session.memorySessionId : 'NONE'}`);
+      logger.debug('SDK', `[ALIGNMENT] Resume Decision | contentSessionId=${session.contentSessionId} | memorySessionId=${memorySessionId} | prompt#=${session.lastPromptNumber} | hasRealMemorySessionId=${hasRealMemorySessionId} | willResume=${willResume} | resumeWith=${willResume ? memorySessionId : 'NONE'}`);
     } else {
       // INIT prompt - never resume even if memorySessionId exists (stale from previous session)
       const hasStaleMemoryId = hasRealMemorySessionId;
       logger.debug('SDK', `[ALIGNMENT] First Prompt (INIT) | contentSessionId=${session.contentSessionId} | prompt#=${session.lastPromptNumber} | hasStaleMemoryId=${hasStaleMemoryId} | action=START_FRESH | Will capture new memorySessionId from SDK response`);
       if (hasStaleMemoryId) {
-        logger.warn('SDK', `Skipping resume for INIT prompt despite existing memorySessionId=${session.memorySessionId} - SDK context was lost (worker restart or crash recovery)`);
+        logger.warn('SDK', `Skipping resume for INIT prompt despite existing memorySessionId=${memorySessionId} - SDK context was lost (worker restart or crash recovery)`);
       }
     }
 
@@ -113,7 +122,7 @@ export class SDKAgent {
         // Only resume if BOTH: (1) we have a memorySessionId AND (2) this isn't the first prompt
         // On worker restart, memorySessionId may exist from a previous SDK session but we
         // need to start fresh since the SDK context was lost
-        ...(hasRealMemorySessionId && session.lastPromptNumber > 1 && { resume: session.memorySessionId }),
+        ...(resumeId && session.lastPromptNumber > 1 && { resume: resumeId }),
         disallowedTools,
         abortController: session.abortController,
         pathToClaudeCodeExecutable: claudePath,
@@ -200,18 +209,35 @@ export class SDKAgent {
           }, truncatedResponse);
         }
 
-        // Parse and process response using shared ResponseProcessor
-        await processAgentResponse(
-          textContent,
-          session,
-          this.dbManager,
-          this.sessionManager,
-          worker,
-          discoveryTokens,
-          originalTimestamp,
-          'SDK',
-          cwdTracker.lastCwd
-        );
+        const pendingMessage = pendingMessageQueue.shift();
+
+        try {
+          // Parse and process response using shared ResponseProcessor
+          await processAgentResponse(
+            textContent,
+            session,
+            this.dbManager,
+            this.sessionManager,
+            worker,
+            discoveryTokens,
+            pendingMessage?.originalTimestamp ?? originalTimestamp,
+            'SDK',
+            cwdTracker.lastCwd
+          );
+
+          if (pendingMessage) {
+            pendingStore.complete(pendingMessage.id);
+          }
+        } catch (error) {
+          if (pendingMessage) {
+            pendingStore.markFailed(pendingMessage.id);
+          }
+
+          logger.error('SDK', 'SDK message processing failed', {
+            sessionId: session.sessionDbId,
+            messageId: pendingMessage?.id ?? 'unknown'
+          }, error as Error);
+        }
       }
 
       // Log result messages
@@ -265,7 +291,8 @@ export class SDKAgent {
    */
   private async *createMessageGenerator(
     session: ActiveSession,
-    cwdTracker: { lastCwd: string | undefined }
+    cwdTracker: { lastCwd: string | undefined },
+    onPendingMessage: (id: number, originalTimestamp: number) => void
   ): AsyncIterableIterator<SDKUserMessage> {
     // Load active mode
     const mode = ModeManager.getInstance().getActiveMode();
@@ -322,6 +349,9 @@ export class SDKAgent {
           cwd: message.cwd
         });
 
+        // Track pending message ID for completion and timestamp accuracy
+        onPendingMessage(message._persistentId, message._originalTimestamp);
+
         // Add to shared conversation history for provider interop
         session.conversationHistory.push({ role: 'user', content: obsPrompt });
 
@@ -343,6 +373,9 @@ export class SDKAgent {
           user_prompt: session.userPrompt,
           last_assistant_message: message.last_assistant_message || ''
         }, mode);
+
+        // Track pending message ID for completion and timestamp accuracy
+        onPendingMessage(message._persistentId, message._originalTimestamp);
 
         // Add to shared conversation history for provider interop
         session.conversationHistory.push({ role: 'user', content: summaryPrompt });

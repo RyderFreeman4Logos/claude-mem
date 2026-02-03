@@ -216,7 +216,7 @@ export class SessionManager {
       const messageId = this.getPendingStore().enqueue(sessionDbId, session.contentSessionId, message);
       const queueDepth = this.getPendingStore().getPendingCount(sessionDbId);
       const toolSummary = logger.formatTool(data.tool_name, data.tool_input);
-      logger.info('QUEUE', `ENQUEUED | sessionDbId=${sessionDbId} | messageId=${messageId} | type=observation | tool=${toolSummary} | depth=${queueDepth}`, {
+      logger.info('SESSION', `ENQUEUED | sessionDbId=${sessionDbId} | messageId=${messageId} | type=observation | tool=${toolSummary} | depth=${queueDepth}`, {
         sessionId: sessionDbId
       });
     } catch (error) {
@@ -255,7 +255,7 @@ export class SessionManager {
     try {
       const messageId = this.getPendingStore().enqueue(sessionDbId, session.contentSessionId, message);
       const queueDepth = this.getPendingStore().getPendingCount(sessionDbId);
-      logger.info('QUEUE', `ENQUEUED | sessionDbId=${sessionDbId} | messageId=${messageId} | type=summarize | depth=${queueDepth}`, {
+      logger.info('SESSION', `ENQUEUED | sessionDbId=${sessionDbId} | messageId=${messageId} | type=summarize | depth=${queueDepth}`, {
         sessionId: sessionDbId
       });
     } catch (error) {
@@ -399,7 +399,7 @@ export class SessionManager {
 
     const processor = new SessionQueueProcessor(this.getPendingStore(), emitter);
 
-    // Use the robust iterator - messages are deleted on claim (no tracking needed)
+    // Use the robust iterator - messages are marked processing on claim and completed by SDK agents
     for await (const message of processor.createIterator(sessionDbId, session.abortController.signal)) {
       // Track earliest timestamp for accurate observation timestamps
       // This ensures backlog messages get their original timestamps, not current time

@@ -173,51 +173,22 @@ export class GeminiAgent {
         });
       }
 
-      // Process pending messages with dynamic concurrency
+      // Process pending messages sequentially to preserve full context
       // Track cwd from messages for CLAUDE.md generation
       let lastCwd: string | undefined;
+      const pendingStore = this.sessionManager.getPendingMessageStore();
 
-      // Get concurrency setting (hot-reloadable)
-      const concurrencyManager = ConcurrencyManager.getInstance();
-      const concurrentMessages = concurrencyManager.getConcurrency();
-      logger.info('SDK', 'Processing with dynamic concurrency', {
-        concurrentMessages,
-        sessionId: session.sessionDbId
-      });
-
-      // Collect messages into batches and process concurrently
-      const messageIterator = this.sessionManager.getMessageIterator(session.sessionDbId);
-
-      while (true) {
-        // Collect up to concurrentMessages messages
-        const batch: Array<{
-          message: Awaited<ReturnType<typeof messageIterator.next>>['value'];
-          originalTimestamp: number | null;
-          cwd?: string;
-        }> = [];
-
-        for (let i = 0; i < concurrentMessages; i++) {
-          const result = await messageIterator.next();
-          if (result.done) break;
-
-          const message = result.value;
-          if (message.cwd) {
-            lastCwd = message.cwd;
-          }
-
-          batch.push({
-            message,
-            originalTimestamp: session.earliestPendingTimestamp,
-            cwd: message.cwd || lastCwd
-          });
+      for await (const message of this.sessionManager.getMessageIterator(session.sessionDbId)) {
+        // Capture cwd from each message for worktree support
+        if (message.cwd) {
+          lastCwd = message.cwd;
         }
 
-        if (batch.length === 0) break;
+        // Capture earliest timestamp BEFORE processing (will be cleared after)
+        // This ensures backlog messages get their original timestamps, not current time
+        const originalTimestamp = session.earliestPendingTimestamp;
 
-        logger.debug('SDK', 'Processing batch', { batchSize: batch.length, sessionId: session.sessionDbId });
-
-        // Process batch in parallel
-        await Promise.all(batch.map(async ({ message, originalTimestamp, cwd }) => {
+        try {
           if (message.type === 'observation') {
             // Update last prompt number
             if (message.prompt_number !== undefined) {
@@ -234,14 +205,9 @@ export class GeminiAgent {
               cwd: message.cwd
             });
 
-            // For concurrent processing, use minimal context (init + current message only)
-            // This allows true parallelism without history conflicts
-            const minimalHistory: ConversationMessage[] = [
-              ...session.conversationHistory.slice(0, 2),  // Keep init prompt + response
-              { role: 'user', content: obsPrompt }
-            ];
-
-            const obsResponse = await this.queryGeminiMultiTurn(minimalHistory, apiKey, model, rateLimitingEnabled);
+            // Add to conversation history and query Gemini with full context
+            session.conversationHistory.push({ role: 'user', content: obsPrompt });
+            const obsResponse = await this.queryGeminiMultiTurn(session.conversationHistory, apiKey, model, rateLimitingEnabled);
 
             let tokensUsed = 0;
             if (obsResponse.content) {
@@ -260,9 +226,8 @@ export class GeminiAgent {
               tokensUsed,
               originalTimestamp,
               'Gemini',
-              cwd
+              lastCwd
             );
-
           } else if (message.type === 'summarize') {
             // Build summary prompt
             const summaryPrompt = buildSummaryPrompt({
@@ -273,13 +238,9 @@ export class GeminiAgent {
               last_assistant_message: message.last_assistant_message || ''
             }, mode);
 
-            // For concurrent processing, use minimal context
-            const minimalHistory: ConversationMessage[] = [
-              ...session.conversationHistory.slice(0, 2),  // Keep init prompt + response
-              { role: 'user', content: summaryPrompt }
-            ];
-
-            const summaryResponse = await this.queryGeminiMultiTurn(minimalHistory, apiKey, model, rateLimitingEnabled);
+            // Add to conversation history and query Gemini with full context
+            session.conversationHistory.push({ role: 'user', content: summaryPrompt });
+            const summaryResponse = await this.queryGeminiMultiTurn(session.conversationHistory, apiKey, model, rateLimitingEnabled);
 
             let tokensUsed = 0;
             if (summaryResponse.content) {
@@ -298,10 +259,21 @@ export class GeminiAgent {
               tokensUsed,
               originalTimestamp,
               'Gemini',
-              cwd
+              lastCwd
             );
           }
-        }));
+
+          // Mark message completed after successful processing
+          pendingStore.complete(message._persistentId);
+        } catch (error) {
+          logger.error('SDK', 'Gemini message processing failed', {
+            sessionId: session.sessionDbId,
+            messageId: message._persistentId,
+            messageType: message.type
+          }, error as Error);
+
+          pendingStore.markFailed(message._persistentId);
+        }
       }
 
       // Check if queue is truly empty before marking session complete
