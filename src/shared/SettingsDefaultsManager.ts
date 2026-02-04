@@ -57,6 +57,10 @@ export interface SettingsDefaults {
   CLAUDE_MEM_ORPHAN_MAX_AGE_HOURS: string;  // Maximum age (in hours) for pending messages before they are considered orphaned and marked as failed
 }
 
+interface LoadFromFileOptions {
+  watchFile?: boolean;
+}
+
 export class SettingsDefaultsManager {
   // Cache for settings to avoid repeated file I/O
   private static settingsCache: Map<string, { settings: SettingsDefaults; timestamp: number }> = new Map();
@@ -147,7 +151,7 @@ export class SettingsDefaultsManager {
    *
    * Now with caching and file watching for automatic updates
    */
-  static loadFromFile(settingsPath: string): SettingsDefaults {
+  static loadFromFile(settingsPath: string, options: LoadFromFileOptions = {}): SettingsDefaults {
     // Check cache first
     const cached = this.settingsCache.get(settingsPath);
     const now = Date.now();
@@ -165,8 +169,10 @@ export class SettingsDefaultsManager {
       timestamp: now
     });
 
-    // Setup file watcher if not already watching
-    this.setupFileWatcher(settingsPath);
+    // Setup file watcher if requested and not already watching
+    if (options.watchFile !== false) {
+      this.setupFileWatcher(settingsPath);
+    }
 
     return settings;
   }
