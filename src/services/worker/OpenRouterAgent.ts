@@ -98,23 +98,35 @@ export class OpenRouterAgent {
    */
   async startSession(session: ActiveSession, worker?: WorkerRef): Promise<void> {
     try {
-      // Initialize memorySessionId if not already set
-      // OpenRouter cannot capture session_id from responses (unlike SDK),
-      // so we generate a unique ID proactively
+      // Initialize memorySessionId if not already set.
+      // Prefer existing DB value (preserves FK integrity for historical sessions).
+      // OpenRouter cannot capture session_id from responses (unlike SDK), so for
+      // brand-new sessions we generate a unique ID proactively.
       if (!session.memorySessionId) {
-        const uniqueMemoryId = `openrouter-${session.contentSessionId}-${Date.now()}`;
-        session.memorySessionId = uniqueMemoryId;
+        const existingSession = this.dbManager.getSessionStore().getSessionById(session.sessionDbId);
+        const existingMemoryId = existingSession?.memory_session_id;
 
-        // Persist to database
-        await this.dbManager.getSessionStore().updateMemorySessionId(
-          session.sessionDbId,
-          uniqueMemoryId
-        );
+        if (existingMemoryId) {
+          session.memorySessionId = existingMemoryId;
+          logger.info('SDK', 'Reusing existing memorySessionId for OpenRouter session', {
+            sessionDbId: session.sessionDbId,
+            memorySessionId: existingMemoryId
+          });
+        } else {
+          const uniqueMemoryId = `openrouter-${session.contentSessionId}-${Date.now()}`;
+          session.memorySessionId = uniqueMemoryId;
 
-        logger.info('SDK', 'Generated memorySessionId for OpenRouter session', {
-          sessionDbId: session.sessionDbId,
-          memorySessionId: uniqueMemoryId
-        });
+          // Persist to database
+          await this.dbManager.getSessionStore().updateMemorySessionId(
+            session.sessionDbId,
+            uniqueMemoryId
+          );
+
+          logger.info('SDK', 'Generated memorySessionId for OpenRouter session', {
+            sessionDbId: session.sessionDbId,
+            memorySessionId: uniqueMemoryId
+          });
+        }
       }
 
       // Get OpenRouter configuration

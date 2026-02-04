@@ -52,8 +52,8 @@ import { DatabaseManager } from './worker/DatabaseManager.js';
 import { SessionManager } from './worker/SessionManager.js';
 import { SSEBroadcaster } from './worker/SSEBroadcaster.js';
 import { SDKAgent } from './worker/SDKAgent.js';
-import { GeminiAgent } from './worker/GeminiAgent.js';
-import { OpenRouterAgent } from './worker/OpenRouterAgent.js';
+import { GeminiAgent, isGeminiAvailable, isGeminiSelected } from './worker/GeminiAgent.js';
+import { OpenRouterAgent, isOpenRouterAvailable, isOpenRouterSelected } from './worker/OpenRouterAgent.js';
 import { PaginationHelper } from './worker/PaginationHelper.js';
 import { SettingsManager } from './worker/SettingsManager.js';
 import { SearchManager } from './worker/SearchManager.js';
@@ -377,6 +377,26 @@ export class WorkerService {
   /**
    * Start a session processor
    */
+  private getRecoveryAgent(): { agent: SDKAgent | GeminiAgent | OpenRouterAgent; provider: 'claude' | 'gemini' | 'openrouter' } {
+    if (isOpenRouterSelected()) {
+      if (isOpenRouterAvailable()) {
+        return { agent: this.openRouterAgent, provider: 'openrouter' };
+      }
+      logger.warn('SYSTEM', 'OpenRouter selected but unavailable, falling back to Claude SDK for recovery');
+      return { agent: this.sdkAgent, provider: 'claude' };
+    }
+
+    if (isGeminiSelected()) {
+      if (isGeminiAvailable()) {
+        return { agent: this.geminiAgent, provider: 'gemini' };
+      }
+      logger.warn('SYSTEM', 'Gemini selected but unavailable, falling back to Claude SDK for recovery');
+      return { agent: this.sdkAgent, provider: 'claude' };
+    }
+
+    return { agent: this.sdkAgent, provider: 'claude' };
+  }
+
   private startSessionProcessor(
     session: ReturnType<typeof this.sessionManager.getSession>,
     source: string
@@ -384,17 +404,37 @@ export class WorkerService {
     if (!session) return;
 
     const sid = session.sessionDbId;
-    logger.info('SYSTEM', `Starting generator (${source})`, { sessionId: sid });
+    const { agent, provider } = this.getRecoveryAgent();
 
-    session.generatorPromise = this.sdkAgent.startSession(session, this)
+    // If the previous lifecycle aborted this controller, a restarted generator would
+    // immediately exit and never consume queued messages.
+    if (session.abortController.signal.aborted) {
+      logger.warn('SYSTEM', 'Resetting aborted controller before recovery start', {
+        sessionId: sid,
+        source,
+        provider
+      });
+      session.abortController = new AbortController();
+    }
+
+    session.currentProvider = provider;
+
+    logger.info('SYSTEM', `Starting generator (${source})`, {
+      sessionId: sid,
+      provider
+    });
+
+    session.generatorPromise = agent.startSession(session, this)
       .catch(error => {
         logger.error('SDK', 'Session generator failed', {
           sessionId: session.sessionDbId,
-          project: session.project
+          project: session.project,
+          provider
         }, error as Error);
       })
       .finally(() => {
         session.generatorPromise = null;
+        session.currentProvider = null;
         this.broadcastProcessingStatus();
       });
   }

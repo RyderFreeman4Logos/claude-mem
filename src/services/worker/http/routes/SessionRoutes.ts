@@ -122,6 +122,17 @@ export class SessionRoutes extends BaseRouteHandler {
   ): void {
     if (!session) return;
 
+    // If previous lifecycle aborted this controller, a new generator would immediately
+    // exit without consuming queue messages. Reset before (re)start.
+    if (session.abortController.signal.aborted) {
+      logger.warn('SESSION', 'Resetting aborted controller before generator start', {
+        sessionId: session.sessionDbId,
+        source,
+        provider
+      });
+      session.abortController = new AbortController();
+    }
+
     const agent = provider === 'openrouter' ? this.openRouterAgent : (provider === 'gemini' ? this.geminiAgent : this.sdkAgent);
     const agentName = provider === 'openrouter' ? 'OpenRouter' : (provider === 'gemini' ? 'Gemini' : 'Claude SDK');
 

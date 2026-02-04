@@ -127,6 +127,32 @@ export class GeminiAgent {
    */
   async startSession(session: ActiveSession, worker?: WorkerRef): Promise<void> {
     try {
+      // Initialize memorySessionId if not already set.
+      // Prefer existing DB value (preserves FK integrity for historical sessions).
+      // For brand-new sessions, generate one proactively because Gemini does not
+      // provide a server-side session ID we can capture like Claude SDK does.
+      if (!session.memorySessionId) {
+        const existingSession = this.dbManager.getSessionStore().getSessionById(session.sessionDbId);
+        const existingMemoryId = existingSession?.memory_session_id;
+
+        if (existingMemoryId) {
+          session.memorySessionId = existingMemoryId;
+          logger.info('SDK', 'Reusing existing memorySessionId for Gemini session', {
+            sessionDbId: session.sessionDbId,
+            memorySessionId: existingMemoryId
+          });
+        } else {
+          const uniqueMemoryId = `gemini-${session.contentSessionId}-${Date.now()}`;
+          session.memorySessionId = uniqueMemoryId;
+          this.dbManager.getSessionStore().updateMemorySessionId(session.sessionDbId, uniqueMemoryId);
+
+          logger.info('SDK', 'Generated memorySessionId for Gemini session', {
+            sessionDbId: session.sessionDbId,
+            memorySessionId: uniqueMemoryId
+          });
+        }
+      }
+
       // Get Gemini configuration
       const { apiKey, model, rateLimitingEnabled } = this.getGeminiConfig();
 
