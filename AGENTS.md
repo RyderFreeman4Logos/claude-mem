@@ -1,1 +1,1 @@
-/home/obj/s/llm/coding/rules/short/AGENTS.md
+/home/obj/s/llm/coding/rules/AGENTS.md

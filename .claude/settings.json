@@ -1,10 +1,30 @@
 {
-  "env": {},
-  "permissions": {
-    "deny": [
-      "Read(./package-lock.json)",
-      "Read(./node_modules/**)",
-      "Read(./.DS_Store)"
+  "enabledPlugins": {
+    "rust-skills@rust-skills": true,
+    "dev-browser@dev-browser-marketplace": false
+  },
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/obj/s/llm/config/claude/hooks/remind-commit.sh",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/obj/s/llm/config/claude/hooks/remind-commit.sh",
+            "timeout": 30
+          }
+        ]
+      }
     ]
   }
 }
