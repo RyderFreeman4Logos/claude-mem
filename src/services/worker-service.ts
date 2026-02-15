@@ -13,6 +13,7 @@ import path from 'path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { getWorkerPort, getWorkerHost } from '../shared/worker-utils.js';
+import { getAuthMethodDescription } from '../shared/EnvManager.js';
 import { logger } from '../utils/logger.js';
 
 // Version injected at build time by esbuild define
@@ -39,7 +40,7 @@ import {
 import { performGracefulShutdown } from './infrastructure/GracefulShutdown.js';
 
 // Server imports
-import { Server } from './server/Server.js';
+import { Server, type AiStatus } from './server/Server.js';
 
 // Integration imports
 import {
@@ -175,7 +176,9 @@ export class WorkerService {
       getInitializationComplete: () => this.initializationCompleteFlag,
       getMcpReady: () => this.mcpReady,
       onShutdown: () => this.shutdown(),
-      onRestart: () => this.shutdown()
+      onRestart: () => this.shutdown(),
+      workerPath: process.argv[1] || 'worker-service',
+      getAiStatus: () => this.getAiStatus(),
     });
 
     // Register route handlers
@@ -375,8 +378,32 @@ export class WorkerService {
   }
 
   /**
-   * Start a session processor
+   * Build AI provider status for health endpoint
    */
+  private getAiStatus(): AiStatus {
+    if (isOpenRouterSelected()) {
+      return {
+        provider: 'openrouter',
+        authMethod: isOpenRouterAvailable() ? 'API key' : 'unavailable (fallback to claude)',
+        lastInteraction: null,
+      };
+    }
+
+    if (isGeminiSelected()) {
+      return {
+        provider: 'gemini',
+        authMethod: isGeminiAvailable() ? 'API key' : 'unavailable (fallback to claude)',
+        lastInteraction: null,
+      };
+    }
+
+    return {
+      provider: 'claude',
+      authMethod: getAuthMethodDescription(),
+      lastInteraction: null,
+    };
+  }
+
   private getRecoveryAgent(): { agent: SDKAgent | GeminiAgent | OpenRouterAgent; provider: 'claude' | 'gemini' | 'openrouter' } {
     if (isOpenRouterSelected()) {
       if (isOpenRouterAvailable()) {
@@ -397,6 +424,9 @@ export class WorkerService {
     return { agent: this.sdkAgent, provider: 'claude' };
   }
 
+  /**
+   * Start a session processor
+   */
   private startSessionProcessor(
     session: ReturnType<typeof this.sessionManager.getSession>,
     source: string

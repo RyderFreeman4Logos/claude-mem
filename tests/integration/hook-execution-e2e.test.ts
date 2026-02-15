@@ -26,6 +26,11 @@ import type { ServerOptions } from '../../src/services/server/Server.js';
 
 // Suppress logger output during tests
 let loggerSpies: ReturnType<typeof spyOn>[] = [];
+const TEST_AI_STATUS = {
+  provider: 'claude',
+  authMethod: 'test-auth',
+  lastInteraction: null,
+};
 
 describe('Hook Execution E2E', () => {
   let server: Server;
@@ -45,6 +50,8 @@ describe('Hook Execution E2E', () => {
       getMcpReady: () => true,
       onShutdown: mock(() => Promise.resolve()),
       onRestart: mock(() => Promise.resolve()),
+      workerPath: 'test-worker-service',
+      getAiStatus: () => TEST_AI_STATUS,
     };
 
     testPort = 40000 + Math.floor(Math.random() * 10000);
@@ -96,6 +103,8 @@ describe('Hook Execution E2E', () => {
         getMcpReady: () => false,
         onShutdown: mock(() => Promise.resolve()),
         onRestart: mock(() => Promise.resolve()),
+        workerPath: 'test-worker-service',
+        getAiStatus: () => TEST_AI_STATUS,
       };
 
       server = new Server(uninitializedOptions);
@@ -157,6 +166,8 @@ describe('Hook Execution E2E', () => {
         getMcpReady: () => true,
         onShutdown: mock(() => Promise.resolve()),
         onRestart: mock(() => Promise.resolve()),
+        workerPath: 'test-worker-service',
+        getAiStatus: () => TEST_AI_STATUS,
       };
 
       server = new Server(dynamicOptions);

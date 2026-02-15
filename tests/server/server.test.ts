@@ -14,6 +14,11 @@ import type { RouteHandler, ServerOptions } from '../../src/services/server/Serv
 
 // Spy on logger methods to suppress output during tests
 let loggerSpies: ReturnType<typeof spyOn>[] = [];
+const TEST_AI_STATUS = {
+  provider: 'claude',
+  authMethod: 'test-auth',
+  lastInteraction: null,
+};
 
 describe('Server', () => {
   let server: Server;
@@ -32,6 +37,8 @@ describe('Server', () => {
       getMcpReady: () => true,
       onShutdown: mock(() => Promise.resolve()),
       onRestart: mock(() => Promise.resolve()),
+      workerPath: 'test-worker-service',
+      getAiStatus: () => TEST_AI_STATUS,
     };
   });
 
@@ -269,6 +276,8 @@ describe('Server', () => {
         getMcpReady: () => true,
         onShutdown: mock(() => Promise.resolve()),
         onRestart: mock(() => Promise.resolve()),
+        workerPath: 'test-worker-service',
+        getAiStatus: () => TEST_AI_STATUS,
       };
 
       server = new Server(dynamicOptions);
@@ -326,6 +335,8 @@ describe('Server', () => {
         getMcpReady: () => false,
         onShutdown: mock(() => Promise.resolve()),
         onRestart: mock(() => Promise.resolve()),
+        workerPath: 'test-worker-service',
+        getAiStatus: () => TEST_AI_STATUS,
       };
 
       server = new Server(uninitializedOptions);
