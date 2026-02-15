@@ -20,8 +20,9 @@ export interface SettingsDefaults {
   CLAUDE_MEM_SKIP_TOOLS: string;
   // AI Provider Configuration
   CLAUDE_MEM_PROVIDER: string;  // 'claude' | 'gemini' | 'openrouter'
+  CLAUDE_MEM_CLAUDE_AUTH_METHOD: string;  // 'cli' | 'api' - how Claude provider authenticates
   CLAUDE_MEM_GEMINI_API_KEY: string;
-  CLAUDE_MEM_GEMINI_MODEL: string;  // 'gemini-3-flash' | 'gemini-3-pro' | 'gemini-2.5-flash' (deprecated)
+  CLAUDE_MEM_GEMINI_MODEL: string;  // 'gemini-2.5-flash-lite' | 'gemini-2.5-flash' | 'gemini-3-flash-preview'
   CLAUDE_MEM_GEMINI_RATE_LIMITING_ENABLED: string;  // 'true' | 'false' - enable rate limiting for free tier
   CLAUDE_MEM_OPENROUTER_API_KEY: string;
   CLAUDE_MEM_OPENROUTER_MODEL: string;
@@ -53,6 +54,19 @@ export interface SettingsDefaults {
   CLAUDE_MEM_CONTEXT_SHOW_LAST_SUMMARY: string;
   CLAUDE_MEM_CONTEXT_SHOW_LAST_MESSAGE: string;
   CLAUDE_MEM_ENABLE_FOLDER_CLAUDE_MD: string;  // Enable auto-generation of CLAUDE.md files in project folders
+  CLAUDE_MEM_FOLDER_CLAUDEMD_ENABLED: string;  // Backward-compatible alias for folder CLAUDE.md toggle
+  // Exclusion Settings
+  CLAUDE_MEM_EXCLUDED_PROJECTS: string;  // Comma-separated glob patterns for excluded project paths
+  CLAUDE_MEM_FOLDER_MD_EXCLUDE: string;  // JSON array of folder paths to exclude from CLAUDE.md generation
+  // Chroma Vector Database Configuration
+  CLAUDE_MEM_CHROMA_MODE: string;      // 'local' | 'remote'
+  CLAUDE_MEM_CHROMA_HOST: string;
+  CLAUDE_MEM_CHROMA_PORT: string;
+  CLAUDE_MEM_CHROMA_SSL: string;
+  // Future cloud support
+  CLAUDE_MEM_CHROMA_API_KEY: string;
+  CLAUDE_MEM_CHROMA_TENANT: string;
+  CLAUDE_MEM_CHROMA_DATABASE: string;
   // Orphan Message Cleanup
   CLAUDE_MEM_ORPHAN_MAX_AGE_HOURS: string;  // Maximum age (in hours) for pending messages before they are considered orphaned and marked as failed
 }
@@ -78,8 +92,9 @@ export class SettingsDefaultsManager {
     CLAUDE_MEM_SKIP_TOOLS: 'ListMcpResourcesTool,SlashCommand,Skill,TodoWrite,AskUserQuestion',
     // AI Provider Configuration
     CLAUDE_MEM_PROVIDER: 'claude',  // Default to Claude
+    CLAUDE_MEM_CLAUDE_AUTH_METHOD: 'cli',  // Default to CLI subscription billing
     CLAUDE_MEM_GEMINI_API_KEY: '',  // Empty by default, can be set via UI or env
-    CLAUDE_MEM_GEMINI_MODEL: 'gemini-3-flash',  // Default to latest Gemini 3 Flash model
+    CLAUDE_MEM_GEMINI_MODEL: 'gemini-2.5-flash-lite',  // Default Gemini model (highest free tier RPM)
     CLAUDE_MEM_GEMINI_RATE_LIMITING_ENABLED: 'true',  // Rate limiting ON by default for free tier users
     CLAUDE_MEM_OPENROUTER_API_KEY: '',  // Empty by default, can be set via UI or env
     CLAUDE_MEM_OPENROUTER_MODEL: 'xiaomi/mimo-v2-flash:free',  // Default OpenRouter model (free tier)
@@ -111,6 +126,19 @@ export class SettingsDefaultsManager {
     CLAUDE_MEM_CONTEXT_SHOW_LAST_SUMMARY: 'true',
     CLAUDE_MEM_CONTEXT_SHOW_LAST_MESSAGE: 'false',
     CLAUDE_MEM_ENABLE_FOLDER_CLAUDE_MD: 'false',  // Disabled by default to avoid cluttering codebase
+    CLAUDE_MEM_FOLDER_CLAUDEMD_ENABLED: 'false',  // Backward-compatible alias for folder toggle
+    // Exclusion Settings
+    CLAUDE_MEM_EXCLUDED_PROJECTS: '',  // Comma-separated glob patterns for excluded project paths
+    CLAUDE_MEM_FOLDER_MD_EXCLUDE: '[]',  // JSON array of folder paths to exclude from CLAUDE.md generation
+    // Chroma Vector Database Configuration
+    CLAUDE_MEM_CHROMA_MODE: 'local',  // 'local' starts local Chroma, 'remote' connects to existing server
+    CLAUDE_MEM_CHROMA_HOST: '127.0.0.1',
+    CLAUDE_MEM_CHROMA_PORT: '8000',
+    CLAUDE_MEM_CHROMA_SSL: 'false',
+    // Future cloud support
+    CLAUDE_MEM_CHROMA_API_KEY: '',
+    CLAUDE_MEM_CHROMA_TENANT: 'default_tenant',
+    CLAUDE_MEM_CHROMA_DATABASE: 'default_database',
     CLAUDE_MEM_ORPHAN_MAX_AGE_HOURS: '24',  // Default: 24 hours before pending messages are considered orphaned
   };
 
@@ -141,7 +169,20 @@ export class SettingsDefaultsManager {
    */
   static getBool(key: keyof SettingsDefaults): boolean {
     const value = this.get(key);
-    return value === 'true';
+    return value === 'true' || (value as unknown) === true;
+  }
+
+  /**
+   * Apply environment variable overrides with highest priority.
+   */
+  private static applyEnvOverrides(settings: SettingsDefaults): SettingsDefaults {
+    const result = { ...settings };
+    for (const key of Object.keys(this.DEFAULTS) as Array<keyof SettingsDefaults>) {
+      if (process.env[key] !== undefined) {
+        result[key] = process.env[key]!;
+      }
+    }
+    return result;
   }
 
   /**
@@ -157,7 +198,7 @@ export class SettingsDefaultsManager {
     const now = Date.now();
 
     if (cached && (now - cached.timestamp) < this.CACHE_TTL_MS) {
-      return cached.settings;
+      return this.applyEnvOverrides(cached.settings);
     }
 
     // Load from file
@@ -174,7 +215,7 @@ export class SettingsDefaultsManager {
       this.setupFileWatcher(settingsPath);
     }
 
-    return settings;
+    return this.applyEnvOverrides(settings);
   }
 
   /**
@@ -224,6 +265,16 @@ export class SettingsDefaultsManager {
         if (flatSettings[key] !== undefined) {
           result[key] = flatSettings[key];
         }
+      }
+
+      // Backward/forward compatibility for folder CLAUDE.md toggle key rename.
+      if (flatSettings.CLAUDE_MEM_ENABLE_FOLDER_CLAUDE_MD !== undefined
+          && flatSettings.CLAUDE_MEM_FOLDER_CLAUDEMD_ENABLED === undefined) {
+        result.CLAUDE_MEM_FOLDER_CLAUDEMD_ENABLED = flatSettings.CLAUDE_MEM_ENABLE_FOLDER_CLAUDE_MD;
+      }
+      if (flatSettings.CLAUDE_MEM_FOLDER_CLAUDEMD_ENABLED !== undefined
+          && flatSettings.CLAUDE_MEM_ENABLE_FOLDER_CLAUDE_MD === undefined) {
+        result.CLAUDE_MEM_ENABLE_FOLDER_CLAUDE_MD = flatSettings.CLAUDE_MEM_FOLDER_CLAUDEMD_ENABLED;
       }
 
       return result;

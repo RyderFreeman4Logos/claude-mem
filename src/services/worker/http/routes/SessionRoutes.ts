@@ -227,6 +227,8 @@ export class SessionRoutes extends BaseRouteHandler {
               // (race condition: new observation may have started between generatorPromise=null and here)
               if (session.abortController === myController) {
                 session.abortController.abort();
+                // Reset restart counter after a clean completion path.
+                session.consecutiveRestarts = 0;
                 logger.debug('SESSION', 'Aborted controller after natural completion', {
                   sessionId: sessionDbId
                 });
@@ -264,6 +266,7 @@ export class SessionRoutes extends BaseRouteHandler {
     app.post('/api/sessions/init', this.handleSessionInitByClaudeId.bind(this));
     app.post('/api/sessions/observations', this.handleObservationsByClaudeId.bind(this));
     app.post('/api/sessions/summarize', this.handleSummarizeByClaudeId.bind(this));
+    app.post('/api/sessions/complete', this.handleCompleteByClaudeId.bind(this));
 
     // Dead letter queue endpoints
     app.get('/api/dead-letter-queue', this.handleGetDeadLetterQueue.bind(this));
@@ -569,6 +572,31 @@ export class SessionRoutes extends BaseRouteHandler {
     this.eventBroadcaster.broadcastSummarizeQueued();
 
     res.json({ status: 'queued' });
+  });
+
+  /**
+   * Complete session by contentSessionId (session-complete hook uses this)
+   * POST /api/sessions/complete
+   * Body: { contentSessionId }
+   */
+  private handleCompleteByClaudeId = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
+    const { contentSessionId } = req.body;
+
+    if (!contentSessionId) {
+      return this.badRequest(res, 'Missing contentSessionId');
+    }
+
+    const store = this.dbManager.getSessionStore();
+    const sessionDbId = store.createSDKSession(contentSessionId, '', '');
+    const activeSession = this.sessionManager.getSession(sessionDbId);
+
+    if (!activeSession) {
+      res.json({ status: 'skipped', reason: 'not_active' });
+      return;
+    }
+
+    await this.completionHandler.completeByDbId(sessionDbId);
+    res.json({ status: 'completed', sessionDbId });
   });
 
   /**

@@ -11,12 +11,15 @@ dist/
 .claude/settings.local.json
 .claude/agents/
 .claude/skills/
+.claude/plans/
+.claude/worktrees/
 plugin/data/
 plugin/data.backup/
 package-lock.json
 bun.lock
 private/
 datasets/
+Auto Run Docs/
 
 # Generated UI files (built from viewer-template.html)
 src/ui/viewer.html
@@ -52,3 +55,6 @@ mandate-tor-manager/
 tasks/
 ui/
 src/agents/
+
+# Ignore WebStorm project files (for dinosaur IDE users)
+.idea/

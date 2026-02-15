@@ -389,6 +389,14 @@ export class PendingMessageStore {
   }
 
   /**
+   * Backward-compatible alias used by newer tests/callers.
+   * Confirms successful processing by deleting the queued message.
+   */
+  confirmProcessed(messageId: number): void {
+    this.complete(messageId);
+  }
+
+  /**
    * Get all pending messages for session (ordered by creation time)
    */
   getAllPending(sessionDbId: number): PersistentPendingMessage[] {
@@ -612,6 +620,13 @@ export class PendingMessageStore {
 
     const result = stmt.run(cutoff);
     return result.changes;
+  }
+
+  /**
+   * Backward-compatible alias for stale message reset.
+   */
+  resetStaleProcessingMessages(thresholdMs: number = 5 * 60 * 1000): number {
+    return this.resetStuckMessages(thresholdMs);
   }
 
   /**

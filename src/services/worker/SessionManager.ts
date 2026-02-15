@@ -400,7 +400,15 @@ export class SessionManager {
     const processor = new SessionQueueProcessor(this.getPendingStore(), emitter);
 
     // Use the robust iterator - messages are marked processing on claim and completed by SDK agents
-    for await (const message of processor.createIterator(sessionDbId, session.abortController.signal)) {
+    // onIdleTimeout aborts the controller to ensure underlying subprocesses are cleaned up.
+    for await (const message of processor.createIterator({
+      sessionDbId,
+      signal: session.abortController.signal,
+      onIdleTimeout: () => {
+        logger.info('SESSION', 'Triggering abort due to idle timeout to kill subprocess', { sessionDbId });
+        session.abortController.abort();
+      }
+    })) {
       // Track earliest timestamp for accurate observation timestamps
       // This ensures backlog messages get their original timestamps, not current time
       if (session.earliestPendingTimestamp === null) {

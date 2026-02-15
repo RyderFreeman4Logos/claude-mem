@@ -17,6 +17,7 @@ import { logger } from '../../utils/logger.js';
 import { buildInitPrompt, buildObservationPrompt, buildSummaryPrompt, buildContinuationPrompt } from '../../sdk/prompts.js';
 import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
 import { USER_SETTINGS_PATH, OBSERVER_SESSIONS_DIR, ensureDir } from '../../shared/paths.js';
+import { buildIsolatedEnv, getAuthMethodDescription } from '../../shared/EnvManager.js';
 import type { ActiveSession, SDKUserMessage } from '../worker-types.js';
 import { ModeManager } from '../domain/ModeManager.js';
 import { processAgentResponse, type WorkerRef } from './agents/index.js';
@@ -78,26 +79,41 @@ export class SDKAgent {
     // CRITICAL: Only resume if:
     // 1. memorySessionId exists (was captured from a previous SDK response)
     // 2. lastPromptNumber > 1 (this is a continuation within the same SDK session)
+    // 3. forceInit is NOT set (stale session recovery clears this)
     // On worker restart or crash recovery, memorySessionId may exist from a previous
     // SDK session but we must NOT resume because the SDK context was lost.
     // NEVER use contentSessionId for resume - that would inject messages into the user's transcript!
     const memorySessionId = session.memorySessionId ?? undefined;
     const hasRealMemorySessionId = !!memorySessionId;
-    const resumeId = hasRealMemorySessionId ? memorySessionId : undefined;
+    const shouldResume = hasRealMemorySessionId && session.lastPromptNumber > 1 && !session.forceInit;
+
+    if (session.forceInit) {
+      logger.info('SDK', 'forceInit flag set, starting fresh SDK session', {
+        sessionDbId: session.sessionDbId,
+        previousMemorySessionId: session.memorySessionId
+      });
+      session.forceInit = false;
+    }
+
+    // Build isolated environment from ~/.claude-mem/.env
+    // Prevents accidental credential pickup from random project .env files.
+    const isolatedEnv = buildIsolatedEnv();
+    const authMethod = getAuthMethodDescription();
 
     logger.info('SDK', 'Starting SDK query', {
       sessionDbId: session.sessionDbId,
       contentSessionId: session.contentSessionId,
       memorySessionId,
       hasRealMemorySessionId,
-      resume_parameter: resumeId ?? '(none - fresh start)',
-      lastPromptNumber: session.lastPromptNumber
+      shouldResume,
+      resume_parameter: shouldResume ? memorySessionId : '(none - fresh start)',
+      lastPromptNumber: session.lastPromptNumber,
+      authMethod
     });
 
     // Debug-level alignment logs for detailed tracing
     if (session.lastPromptNumber > 1) {
-      const willResume = hasRealMemorySessionId;
-      logger.debug('SDK', `[ALIGNMENT] Resume Decision | contentSessionId=${session.contentSessionId} | memorySessionId=${memorySessionId} | prompt#=${session.lastPromptNumber} | hasRealMemorySessionId=${hasRealMemorySessionId} | willResume=${willResume} | resumeWith=${willResume ? memorySessionId : 'NONE'}`);
+      logger.debug('SDK', `[ALIGNMENT] Resume Decision | contentSessionId=${session.contentSessionId} | memorySessionId=${memorySessionId} | prompt#=${session.lastPromptNumber} | hasRealMemorySessionId=${hasRealMemorySessionId} | shouldResume=${shouldResume} | resumeWith=${shouldResume ? memorySessionId : 'NONE'}`);
     } else {
       // INIT prompt - never resume even if memorySessionId exists (stale from previous session)
       const hasStaleMemoryId = hasRealMemorySessionId;
@@ -119,35 +135,38 @@ export class SDKAgent {
         // Isolate observer sessions - they'll appear under project "observer-sessions"
         // instead of polluting user's actual project resume lists
         cwd: OBSERVER_SESSIONS_DIR,
-        // Only resume if BOTH: (1) we have a memorySessionId AND (2) this isn't the first prompt
-        // On worker restart, memorySessionId may exist from a previous SDK session but we
-        // need to start fresh since the SDK context was lost
-        ...(resumeId && session.lastPromptNumber > 1 && { resume: resumeId }),
+        // Only resume if shouldResume is true (memorySessionId exists, not first prompt, not forceInit)
+        ...(shouldResume && { resume: memorySessionId }),
         disallowedTools,
         abortController: session.abortController,
         pathToClaudeCodeExecutable: claudePath,
         // Custom spawn function captures PIDs to fix zombie process accumulation
-        spawnClaudeCodeProcess: createPidCapturingSpawn(session.sessionDbId)
+        spawnClaudeCodeProcess: createPidCapturingSpawn(session.sessionDbId),
+        env: isolatedEnv
       }
     });
 
     // Process SDK messages
     for await (const message of queryResult) {
-      // Capture memory session ID from first SDK message (any type has session_id)
-      // This enables resume for subsequent generator starts within the same user session
-      if (!session.memorySessionId && message.session_id) {
+      // Capture or update memory session ID from SDK message.
+      // SDK can return a different session_id on resume; always trust SDK output.
+      if (message.session_id && message.session_id !== session.memorySessionId) {
+        const previousId = session.memorySessionId;
         session.memorySessionId = message.session_id;
-        // Persist to database for cross-restart recovery
-        this.dbManager.getSessionStore().updateMemorySessionId(
+        this.dbManager.getSessionStore().ensureMemorySessionIdRegistered(
           session.sessionDbId,
           message.session_id
         );
         // Verify the update by reading back from DB
         const verification = this.dbManager.getSessionStore().getSessionById(session.sessionDbId);
         const dbVerified = verification?.memory_session_id === message.session_id;
-        logger.info('SESSION', `MEMORY_ID_CAPTURED | sessionDbId=${session.sessionDbId} | memorySessionId=${message.session_id} | dbVerified=${dbVerified}`, {
+        const logMessage = previousId
+          ? `MEMORY_ID_CHANGED | sessionDbId=${session.sessionDbId} | from=${previousId} | to=${message.session_id} | dbVerified=${dbVerified}`
+          : `MEMORY_ID_CAPTURED | sessionDbId=${session.sessionDbId} | memorySessionId=${message.session_id} | dbVerified=${dbVerified}`;
+        logger.info('SESSION', logMessage, {
           sessionId: session.sessionDbId,
-          memorySessionId: message.session_id
+          memorySessionId: message.session_id,
+          previousId
         });
         if (!dbVerified) {
           logger.error('SESSION', `MEMORY_ID_MISMATCH | sessionDbId=${session.sessionDbId} | expected=${message.session_id} | got=${verification?.memory_session_id}`, {
@@ -155,7 +174,7 @@ export class SDKAgent {
           });
         }
         // Debug-level alignment log for detailed tracing
-        logger.debug('SDK', `[ALIGNMENT] Captured | contentSessionId=${session.contentSessionId} → memorySessionId=${message.session_id} | Future prompts will resume with this ID`);
+        logger.debug('SDK', `[ALIGNMENT] ${previousId ? 'Updated' : 'Captured'} | contentSessionId=${session.contentSessionId} → memorySessionId=${message.session_id} | Future prompts will resume with this ID`);
       }
 
       // Handle assistant messages
@@ -164,6 +183,15 @@ export class SDKAgent {
         const textContent = Array.isArray(content)
           ? content.filter((c: any) => c.type === 'text').map((c: any) => c.text).join('\n')
           : typeof content === 'string' ? content : '';
+
+        // Check for fatal context overflow patterns to prevent infinite retry loops
+        if (textContent.includes('prompt is too long') || textContent.includes('context window')) {
+          logger.error('SDK', 'Context overflow detected - terminating session', {
+            sessionId: session.sessionDbId
+          });
+          session.abortController.abort();
+          return;
+        }
 
         const responseSize = textContent.length;
 
@@ -212,6 +240,14 @@ export class SDKAgent {
         const pendingMessage = pendingMessageQueue.shift();
 
         try {
+          // Detect explicit fatal failures returned as text responses.
+          if (typeof textContent === 'string' && textContent.includes('Prompt is too long')) {
+            throw new Error('Claude session context overflow: prompt is too long');
+          }
+          if (typeof textContent === 'string' && textContent.includes('Invalid API key')) {
+            throw new Error('Invalid API key: check your API key configuration in ~/.claude-mem/settings.json or ~/.claude-mem/.env');
+          }
+
           // Parse and process response using shared ResponseProcessor
           await processAgentResponse(
             textContent,

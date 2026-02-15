@@ -17,8 +17,7 @@ import { updateCursorContextForProject } from '../../integrations/CursorHooksIns
 import { updateFolderClaudeMdFiles } from '../../../utils/claude-md-utils.js';
 import { getWorkerPort } from '../../../shared/worker-utils.js';
 import { SettingsDefaultsManager } from '../../../shared/SettingsDefaultsManager.js';
-import path from 'path';
-import os from 'os';
+import { USER_SETTINGS_PATH } from '../../../shared/paths.js';
 import type { ActiveSession } from '../../worker-types.js';
 import type { DatabaseManager } from '../DatabaseManager.js';
 import type { SessionManager } from '../SessionManager.js';
@@ -219,10 +218,11 @@ async function syncAndBroadcastObservations(
   // Update folder CLAUDE.md files for touched folders (fire-and-forget)
   // This runs per-observation batch to ensure folders are updated as work happens
   // Check if feature is enabled (disabled by default to avoid cluttering codebase)
-  const settings = SettingsDefaultsManager.loadFromFile(
-    path.join(os.homedir(), '.claude-mem', 'settings.json')
-  );
-  const folderClaudeMdEnabled = settings.CLAUDE_MEM_ENABLE_FOLDER_CLAUDE_MD === 'true';
+  const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
+  const folderToggle =
+    settings.CLAUDE_MEM_FOLDER_CLAUDEMD_ENABLED ??
+    settings.CLAUDE_MEM_ENABLE_FOLDER_CLAUDE_MD;
+  const folderClaudeMdEnabled = folderToggle === 'true' || folderToggle === true;
 
   if (folderClaudeMdEnabled) {
     const allFilePaths: string[] = [];
