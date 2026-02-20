@@ -153,7 +153,9 @@ export class SessionManager {
       cumulativeOutputTokens: 0,
       earliestPendingTimestamp: null,
       conversationHistory: [],  // Initialize empty - will be populated by agents
-      currentProvider: null  // Will be set when generator starts
+      currentProvider: null,  // Will be set when generator starts
+      consecutiveRestarts: 0,  // Track consecutive restart attempts to prevent infinite loops
+      processingMessageIds: []  // CLAIM-CONFIRM: Track message IDs for confirmProcessed()
     };
 
     logger.debug('SESSION', 'Creating new session object (memorySessionId cleared to prevent stale resume)', {
@@ -216,7 +218,7 @@ export class SessionManager {
       const messageId = this.getPendingStore().enqueue(sessionDbId, session.contentSessionId, message);
       const queueDepth = this.getPendingStore().getPendingCount(sessionDbId);
       const toolSummary = logger.formatTool(data.tool_name, data.tool_input);
-      logger.info('SESSION', `ENQUEUED | sessionDbId=${sessionDbId} | messageId=${messageId} | type=observation | tool=${toolSummary} | depth=${queueDepth}`, {
+      logger.info('QUEUE', `ENQUEUED | sessionDbId=${sessionDbId} | messageId=${messageId} | type=observation | tool=${toolSummary} | depth=${queueDepth}`, {
         sessionId: sessionDbId
       });
     } catch (error) {
@@ -255,7 +257,7 @@ export class SessionManager {
     try {
       const messageId = this.getPendingStore().enqueue(sessionDbId, session.contentSessionId, message);
       const queueDepth = this.getPendingStore().getPendingCount(sessionDbId);
-      logger.info('SESSION', `ENQUEUED | sessionDbId=${sessionDbId} | messageId=${messageId} | type=summarize | depth=${queueDepth}`, {
+      logger.info('QUEUE', `ENQUEUED | sessionDbId=${sessionDbId} | messageId=${messageId} | type=summarize | depth=${queueDepth}`, {
         sessionId: sessionDbId
       });
     } catch (error) {
@@ -318,6 +320,61 @@ export class SessionManager {
   }
 
   /**
+   * Remove session from in-memory maps and notify without awaiting generator.
+   * Used when SDK resume fails and we give up (no fallback): avoids deadlock
+   * from deleteSession() awaiting the same generator promise we're inside.
+   */
+  removeSessionImmediate(sessionDbId: number): void {
+    const session = this.sessions.get(sessionDbId);
+    if (!session) return;
+
+    this.sessions.delete(sessionDbId);
+    this.sessionQueues.delete(sessionDbId);
+
+    logger.info('SESSION', 'Session removed (orphaned after SDK termination)', {
+      sessionId: sessionDbId,
+      project: session.project
+    });
+
+    if (this.onSessionDeletedCallback) {
+      this.onSessionDeletedCallback();
+    }
+  }
+
+  private static readonly MAX_SESSION_IDLE_MS = 15 * 60 * 1000; // 15 minutes
+
+  /**
+   * Reap sessions with no active generator and no pending work that have been idle too long.
+   * This unblocks the orphan reaper which skips processes for "active" sessions. (Issue #1168)
+   */
+  async reapStaleSessions(): Promise<number> {
+    const now = Date.now();
+    const staleSessionIds: number[] = [];
+
+    for (const [sessionDbId, session] of this.sessions) {
+      // Skip sessions with active generators
+      if (session.generatorPromise) continue;
+
+      // Skip sessions with pending work
+      const pendingCount = this.getPendingStore().getPendingCount(sessionDbId);
+      if (pendingCount > 0) continue;
+
+      // No generator + no pending work + old enough = stale
+      const sessionAge = now - session.startTime;
+      if (sessionAge > SessionManager.MAX_SESSION_IDLE_MS) {
+        staleSessionIds.push(sessionDbId);
+      }
+    }
+
+    for (const sessionDbId of staleSessionIds) {
+      logger.warn('SESSION', `Reaping stale session ${sessionDbId} (no activity for >${Math.round(SessionManager.MAX_SESSION_IDLE_MS / 60000)}m)`, { sessionDbId });
+      await this.deleteSession(sessionDbId);
+    }
+
+    return staleSessionIds.length;
+  }
+
+  /**
    * Shutdown all active sessions
    */
   async shutdownAll(): Promise<void> {
@@ -337,14 +394,6 @@ export class SessionManager {
    */
   getActiveSessionCount(): number {
     return this.sessions.size;
-  }
-
-  /**
-   * Get IDs of all active sessions
-   * Used to exclude active sessions from timeout-based message reset
-   */
-  getActiveSessionIds(): IterableIterator<number> {
-    return this.sessions.keys();
   }
 
   /**
@@ -399,13 +448,15 @@ export class SessionManager {
 
     const processor = new SessionQueueProcessor(this.getPendingStore(), emitter);
 
-    // Use the robust iterator - messages are marked processing on claim and completed by SDK agents
-    // onIdleTimeout aborts the controller to ensure underlying subprocesses are cleaned up.
+    // Use the robust iterator - messages are deleted on claim (no tracking needed)
+    // CRITICAL: Pass onIdleTimeout callback that triggers abort to kill the subprocess
+    // Without this, the iterator returns but the Claude subprocess stays alive as a zombie
     for await (const message of processor.createIterator({
       sessionDbId,
       signal: session.abortController.signal,
       onIdleTimeout: () => {
         logger.info('SESSION', 'Triggering abort due to idle timeout to kill subprocess', { sessionDbId });
+        session.idleTimedOut = true;
         session.abortController.abort();
       }
     })) {

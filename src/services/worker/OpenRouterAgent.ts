@@ -9,31 +9,27 @@
  * - Parse XML responses (same format as Claude/Gemini)
  * - Sync to database and Chroma
  * - Support dynamic model selection across providers
- * - Handle 429 rate limits with automatic model fallback within OpenRouter
- *
- * Model Fallback Strategy:
- * - Configure multiple models in CLAUDE_MEM_OPENROUTER_MODEL (comma-separated, priority order)
- * - On 429/quota errors, automatically try next model in the list
- * - Only falls back to Gemini/Claude providers after ALL OpenRouter models fail
- * - Non-recoverable errors (auth, network) immediately propagate without trying other models
  */
 
-import { DatabaseManager } from './DatabaseManager.js';
-import { SessionManager } from './SessionManager.js';
-import { logger } from '../../utils/logger.js';
-import { buildInitPrompt, buildObservationPrompt, buildSummaryPrompt, buildContinuationPrompt } from '../../sdk/prompts.js';
+import { buildContinuationPrompt, buildInitPrompt, buildObservationPrompt, buildSummaryPrompt } from '../../sdk/prompts.js';
+import { getCredential } from '../../shared/EnvManager.js';
 import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
 import { USER_SETTINGS_PATH } from '../../shared/paths.js';
-import type { ActiveSession, ConversationMessage } from '../worker-types.js';
+import { logger } from '../../utils/logger.js';
 import { ModeManager } from '../domain/ModeManager.js';
+import type { ActiveSession, ConversationMessage } from '../worker-types.js';
+import { DatabaseManager } from './DatabaseManager.js';
+import { SessionManager } from './SessionManager.js';
 import {
+  isAbortError,
   processAgentResponse,
   shouldFallbackToClaude,
-  isAbortError,
-  type WorkerRef,
-  type FallbackAgent
+  type FallbackAgent,
+  type WorkerRef
 } from './agents/index.js';
-import { isGeminiAvailable } from './GeminiAgent.js';
+
+// OpenRouter API endpoint
+const OPENROUTER_API_URL = 'https://openrouter.ai/api/v1/chat/completions';
 
 // Context window management constants (defaults, overridable via settings)
 const DEFAULT_MAX_CONTEXT_MESSAGES = 20;  // Maximum messages to keep in conversation history
@@ -68,7 +64,6 @@ interface OpenRouterResponse {
 export class OpenRouterAgent {
   private dbManager: DatabaseManager;
   private sessionManager: SessionManager;
-  private geminiAgent: FallbackAgent | null = null;
   private fallbackAgent: FallbackAgent | null = null;
 
   constructor(dbManager: DatabaseManager, sessionManager: SessionManager) {
@@ -77,15 +72,7 @@ export class OpenRouterAgent {
   }
 
   /**
-   * Set the Gemini agent for secondary fallback
-   * Must be set after construction to avoid circular dependency
-   */
-  setGeminiAgent(agent: FallbackAgent): void {
-    this.geminiAgent = agent;
-  }
-
-  /**
-   * Set the fallback agent (Claude SDK) for when all other providers fail
+   * Set the fallback agent (Claude SDK) for when OpenRouter API fails
    * Must be set after construction to avoid circular dependency
    */
   setFallbackAgent(agent: FallbackAgent): void {
@@ -98,42 +85,19 @@ export class OpenRouterAgent {
    */
   async startSession(session: ActiveSession, worker?: WorkerRef): Promise<void> {
     try {
-      // Initialize memorySessionId if not already set.
-      // Prefer existing DB value (preserves FK integrity for historical sessions).
-      // OpenRouter cannot capture session_id from responses (unlike SDK), so for
-      // brand-new sessions we generate a unique ID proactively.
-      if (!session.memorySessionId) {
-        const existingSession = this.dbManager.getSessionStore().getSessionById(session.sessionDbId);
-        const existingMemoryId = existingSession?.memory_session_id;
-
-        if (existingMemoryId) {
-          session.memorySessionId = existingMemoryId;
-          logger.info('SDK', 'Reusing existing memorySessionId for OpenRouter session', {
-            sessionDbId: session.sessionDbId,
-            memorySessionId: existingMemoryId
-          });
-        } else {
-          const uniqueMemoryId = `openrouter-${session.contentSessionId}-${Date.now()}`;
-          session.memorySessionId = uniqueMemoryId;
-
-          // Persist to database
-          await this.dbManager.getSessionStore().updateMemorySessionId(
-            session.sessionDbId,
-            uniqueMemoryId
-          );
-
-          logger.info('SDK', 'Generated memorySessionId for OpenRouter session', {
-            sessionDbId: session.sessionDbId,
-            memorySessionId: uniqueMemoryId
-          });
-        }
-      }
-
       // Get OpenRouter configuration
-      const { apiKey, models, baseUrl, siteUrl, appName } = this.getOpenRouterConfig();
+      const { apiKey, model, siteUrl, appName } = this.getOpenRouterConfig();
 
       if (!apiKey) {
         throw new Error('OpenRouter API key not configured. Set CLAUDE_MEM_OPENROUTER_API_KEY in settings or OPENROUTER_API_KEY environment variable.');
+      }
+
+      // Generate synthetic memorySessionId (OpenRouter is stateless, doesn't return session IDs)
+      if (!session.memorySessionId) {
+        const syntheticMemorySessionId = `openrouter-${session.contentSessionId}-${Date.now()}`;
+        session.memorySessionId = syntheticMemorySessionId;
+        this.dbManager.getSessionStore().updateMemorySessionId(session.sessionDbId, syntheticMemorySessionId);
+        logger.info('SESSION', `MEMORY_ID_GENERATED | sessionDbId=${session.sessionDbId} | provider=OpenRouter`);
       }
 
       // Load active mode
@@ -144,13 +108,13 @@ export class OpenRouterAgent {
         ? buildInitPrompt(session.project, session.contentSessionId, session.userPrompt, mode)
         : buildContinuationPrompt(session.userPrompt, session.lastPromptNumber, session.contentSessionId, mode);
 
-      // Add to conversation history and query OpenRouter with full context (with automatic fallback)
+      // Add to conversation history and query OpenRouter with full context
       session.conversationHistory.push({ role: 'user', content: initPrompt });
-      const initResponse = await this.queryOpenRouterWithFallback(session.conversationHistory, apiKey, models, baseUrl, siteUrl, appName);
+      const initResponse = await this.queryOpenRouterMultiTurn(session.conversationHistory, apiKey, model, siteUrl, appName);
 
       if (initResponse.content) {
         // Add response to conversation history
-        session.conversationHistory.push({ role: 'assistant', content: initResponse.content });
+        // session.conversationHistory.push({ role: 'assistant', content: initResponse.content });
 
         // Track token usage
         const tokensUsed = initResponse.tokensUsed || 0;
@@ -172,150 +136,127 @@ export class OpenRouterAgent {
       } else {
         logger.error('SDK', 'Empty OpenRouter init response - session may lack context', {
           sessionId: session.sessionDbId,
-          models: models.join(', ')
+          model
         });
       }
 
       // Track lastCwd from messages for CLAUDE.md generation
       let lastCwd: string | undefined;
-      const pendingStore = this.sessionManager.getPendingMessageStore();
 
-      // Process pending messages sequentially to preserve full context
+      // Process pending messages
       for await (const message of this.sessionManager.getMessageIterator(session.sessionDbId)) {
+        // CLAIM-CONFIRM: Track message ID for confirmProcessed() after successful storage
+        // The message is now in 'processing' status in DB until ResponseProcessor calls confirmProcessed()
+        session.processingMessageIds.push(message._persistentId);
+
         // Capture cwd from messages for proper worktree support
         if (message.cwd) {
           lastCwd = message.cwd;
         }
-
         // Capture earliest timestamp BEFORE processing (will be cleared after)
         const originalTimestamp = session.earliestPendingTimestamp;
 
-        try {
-          if (message.type === 'observation') {
-            // Update last prompt number
-            if (message.prompt_number !== undefined) {
-              session.lastPromptNumber = message.prompt_number;
-            }
-
-            // Avoid expensive LLM calls when session linkage is not ready.
-            if (!session.memorySessionId) {
-              throw new Error('Cannot process observations: memorySessionId not yet captured. This session may need to be reinitialized.');
-            }
-
-            // Build observation prompt
-            const obsPrompt = buildObservationPrompt({
-              id: 0,
-              tool_name: message.tool_name!,
-              tool_input: JSON.stringify(message.tool_input),
-              tool_output: JSON.stringify(message.tool_response),
-              created_at_epoch: originalTimestamp ?? Date.now(),
-              cwd: message.cwd
-            });
-
-            // Add to conversation history and query OpenRouter with full context (with fallback)
-            session.conversationHistory.push({ role: 'user', content: obsPrompt });
-            const obsResponse = await this.queryOpenRouterWithFallback(session.conversationHistory, apiKey, models, baseUrl, siteUrl, appName);
-
-            let tokensUsed = 0;
-            if (obsResponse.content) {
-              tokensUsed = obsResponse.tokensUsed || 0;
-              session.cumulativeInputTokens += Math.floor(tokensUsed * 0.7);
-              session.cumulativeOutputTokens += Math.floor(tokensUsed * 0.3);
-            }
-
-            // Process response using shared ResponseProcessor
-            await processAgentResponse(
-              obsResponse.content || '',
-              session,
-              this.dbManager,
-              this.sessionManager,
-              worker,
-              tokensUsed,
-              originalTimestamp,
-              'OpenRouter',
-              lastCwd
-            );
-
-          } else if (message.type === 'summarize') {
-            // Avoid expensive LLM calls when session linkage is not ready.
-            if (!session.memorySessionId) {
-              throw new Error('Cannot process summary: memorySessionId not yet captured. This session may need to be reinitialized.');
-            }
-
-            // Build summary prompt
-            const summaryPrompt = buildSummaryPrompt({
-              id: session.sessionDbId,
-              memory_session_id: session.memorySessionId,
-              project: session.project,
-              user_prompt: session.userPrompt,
-              last_assistant_message: message.last_assistant_message || ''
-            }, mode);
-
-            // Add to conversation history and query OpenRouter with full context (with fallback)
-            session.conversationHistory.push({ role: 'user', content: summaryPrompt });
-            const summaryResponse = await this.queryOpenRouterWithFallback(session.conversationHistory, apiKey, models, baseUrl, siteUrl, appName);
-
-            let tokensUsed = 0;
-            if (summaryResponse.content) {
-              tokensUsed = summaryResponse.tokensUsed || 0;
-              session.cumulativeInputTokens += Math.floor(tokensUsed * 0.7);
-              session.cumulativeOutputTokens += Math.floor(tokensUsed * 0.3);
-            }
-
-            // Process response using shared ResponseProcessor
-            await processAgentResponse(
-              summaryResponse.content || '',
-              session,
-              this.dbManager,
-              this.sessionManager,
-              worker,
-              tokensUsed,
-              originalTimestamp,
-              'OpenRouter',
-              lastCwd
-            );
+        if (message.type === 'observation') {
+          // Update last prompt number
+          if (message.prompt_number !== undefined) {
+            session.lastPromptNumber = message.prompt_number;
           }
 
-          // Mark message completed after successful processing
-          pendingStore.complete(message._persistentId);
-        } catch (error) {
-          logger.error('SDK', 'OpenRouter message processing failed', {
-            sessionId: session.sessionDbId,
-            messageId: message._persistentId,
-            messageType: message.type
-          }, error as Error);
+          // CRITICAL: Check memorySessionId BEFORE making expensive LLM call
+          // This prevents wasting tokens when we won't be able to store the result anyway
+          if (!session.memorySessionId) {
+            throw new Error('Cannot process observations: memorySessionId not yet captured. This session may need to be reinitialized.');
+          }
 
-          pendingStore.markFailed(message._persistentId);
+          // Build observation prompt
+          const obsPrompt = buildObservationPrompt({
+            id: 0,
+            tool_name: message.tool_name!,
+            tool_input: JSON.stringify(message.tool_input),
+            tool_output: JSON.stringify(message.tool_response),
+            created_at_epoch: originalTimestamp ?? Date.now(),
+            cwd: message.cwd
+          });
+
+          // Add to conversation history and query OpenRouter with full context
+          session.conversationHistory.push({ role: 'user', content: obsPrompt });
+          const obsResponse = await this.queryOpenRouterMultiTurn(session.conversationHistory, apiKey, model, siteUrl, appName);
+
+          let tokensUsed = 0;
+          if (obsResponse.content) {
+            // Add response to conversation history
+            // session.conversationHistory.push({ role: 'assistant', content: obsResponse.content });
+
+            tokensUsed = obsResponse.tokensUsed || 0;
+            session.cumulativeInputTokens += Math.floor(tokensUsed * 0.7);
+            session.cumulativeOutputTokens += Math.floor(tokensUsed * 0.3);
+          }
+
+          // Process response using shared ResponseProcessor
+          await processAgentResponse(
+            obsResponse.content || '',
+            session,
+            this.dbManager,
+            this.sessionManager,
+            worker,
+            tokensUsed,
+            originalTimestamp,
+            'OpenRouter',
+            lastCwd
+          );
+
+        } else if (message.type === 'summarize') {
+          // CRITICAL: Check memorySessionId BEFORE making expensive LLM call
+          if (!session.memorySessionId) {
+            throw new Error('Cannot process summary: memorySessionId not yet captured. This session may need to be reinitialized.');
+          }
+
+          // Build summary prompt
+          const summaryPrompt = buildSummaryPrompt({
+            id: session.sessionDbId,
+            memory_session_id: session.memorySessionId,
+            project: session.project,
+            user_prompt: session.userPrompt,
+            last_assistant_message: message.last_assistant_message || ''
+          }, mode);
+
+          // Add to conversation history and query OpenRouter with full context
+          session.conversationHistory.push({ role: 'user', content: summaryPrompt });
+          const summaryResponse = await this.queryOpenRouterMultiTurn(session.conversationHistory, apiKey, model, siteUrl, appName);
+
+          let tokensUsed = 0;
+          if (summaryResponse.content) {
+            // Add response to conversation history
+            // session.conversationHistory.push({ role: 'assistant', content: summaryResponse.content });
+
+            tokensUsed = summaryResponse.tokensUsed || 0;
+            session.cumulativeInputTokens += Math.floor(tokensUsed * 0.7);
+            session.cumulativeOutputTokens += Math.floor(tokensUsed * 0.3);
+          }
+
+          // Process response using shared ResponseProcessor
+          await processAgentResponse(
+            summaryResponse.content || '',
+            session,
+            this.dbManager,
+            this.sessionManager,
+            worker,
+            tokensUsed,
+            originalTimestamp,
+            'OpenRouter',
+            lastCwd
+          );
         }
       }
 
-      // Check if queue is truly empty before marking session complete.
-      // Some unit tests provide lightweight store mocks without getPendingCount.
-      const finalPendingStore = this.sessionManager.getPendingMessageStore();
-      const pendingCount = typeof finalPendingStore.getPendingCount === 'function'
-        ? finalPendingStore.getPendingCount(session.sessionDbId)
-        : 0;
+      // Mark session complete
       const sessionDuration = Date.now() - session.startTime;
-
-      if (pendingCount === 0) {
-        // Only mark completed if queue is truly empty
-        this.dbManager.getSessionStore().markSessionCompleted(session.sessionDbId);
-        logger.success('SDK', 'OpenRouter agent completed', {
-          sessionId: session.sessionDbId,
-          duration: `${(sessionDuration / 1000).toFixed(1)}s`,
-          historyLength: session.conversationHistory.length,
-          models: models.join(', ')
-        });
-      } else {
-        // Queue not empty, keep session active
-        logger.info('SDK', 'OpenRouter agent finished but queue not empty, keeping session active', {
-          sessionId: session.sessionDbId,
-          duration: `${(sessionDuration / 1000).toFixed(1)}s`,
-          pendingCount,
-          historyLength: session.conversationHistory.length,
-          models: models.join(', ')
-        });
-      }
+      logger.success('SDK', 'OpenRouter agent completed', {
+        sessionId: session.sessionDbId,
+        duration: `${(sessionDuration / 1000).toFixed(1)}s`,
+        historyLength: session.conversationHistory.length,
+        model
+      });
 
     } catch (error: unknown) {
       if (isAbortError(error)) {
@@ -323,54 +264,17 @@ export class OpenRouterAgent {
         throw error;
       }
 
-      const errorMessage = error instanceof Error ? error.message : String(error);
+      // Check if we should fall back to Claude
+      if (shouldFallbackToClaude(error) && this.fallbackAgent) {
+        logger.warn('SDK', 'OpenRouter API failed, falling back to Claude SDK', {
+          sessionDbId: session.sessionDbId,
+          error: error instanceof Error ? error.message : String(error),
+          historyLength: session.conversationHistory.length
+        });
 
-      // Multi-level fallback: OpenRouter → Gemini → Claude SDK
-      if (shouldFallbackToClaude(error)) {
-        // Try Gemini first if available
-        if (isGeminiAvailable() && this.geminiAgent) {
-          logger.warn('SDK', 'All OpenRouter models failed, falling back to Gemini', {
-            sessionDbId: session.sessionDbId,
-            error: errorMessage,
-            historyLength: session.conversationHistory.length
-          });
-
-          try {
-            // Fall back to Gemini - it will use the same session with shared conversationHistory
-            return await this.geminiAgent.startSession(session, worker);
-          } catch (geminiError: unknown) {
-            const geminiErrorMsg = geminiError instanceof Error ? geminiError.message : String(geminiError);
-            logger.warn('SDK', 'Gemini fallback also failed, falling back to Claude SDK', {
-              sessionDbId: session.sessionDbId,
-              geminiError: geminiErrorMsg,
-              originalError: errorMessage
-            });
-
-            // If Gemini also fails, try Claude SDK as last resort
-            if (this.fallbackAgent) {
-              return this.fallbackAgent.startSession(session, worker);
-            }
-
-            // No more fallback options
-            logger.failure('SDK', 'All providers failed (OpenRouter, Gemini, Claude SDK)', {
-              sessionDbId: session.sessionDbId
-            }, geminiError as Error);
-            throw geminiError;
-          }
-        }
-
-        // No Gemini available, try Claude SDK directly
-        if (this.fallbackAgent) {
-          logger.warn('SDK', 'OpenRouter API failed, falling back to Claude SDK', {
-            sessionDbId: session.sessionDbId,
-            error: errorMessage,
-            historyLength: session.conversationHistory.length
-          });
-
-          // Fall back to Claude - it will use the same session with shared conversationHistory
-          // Note: With claim-and-delete queue pattern, messages are already deleted on claim
-          return this.fallbackAgent.startSession(session, worker);
-        }
+        // Fall back to Claude - it will use the same session with shared conversationHistory
+        // Note: With claim-and-delete queue pattern, messages are already deleted on claim
+        return this.fallbackAgent.startSession(session, worker);
       }
 
       logger.failure('SDK', 'OpenRouter agent error', { sessionDbId: session.sessionDbId }, error as Error);
@@ -412,11 +316,7 @@ export class OpenRouterAgent {
       const msg = history[i];
       const msgTokens = this.estimateTokens(msg.content);
 
-      // CRITICAL: Always keep at least the most recent message to avoid empty API requests
-      // Even if it exceeds token limit, we need something to send
-      const isFirstMessage = truncated.length === 0;
-
-      if (!isFirstMessage && (truncated.length >= MAX_CONTEXT_MESSAGES || tokenCount + msgTokens > MAX_ESTIMATED_TOKENS)) {
+      if (truncated.length >= MAX_CONTEXT_MESSAGES || tokenCount + msgTokens > MAX_ESTIMATED_TOKENS) {
         logger.warn('SDK', 'Context window truncated to prevent runaway costs', {
           originalMessages: history.length,
           keptMessages: truncated.length,
@@ -429,14 +329,6 @@ export class OpenRouterAgent {
 
       truncated.unshift(msg);  // Add to beginning
       tokenCount += msgTokens;
-
-      // Warn if single message exceeds token limit (but still keep it)
-      if (isFirstMessage && msgTokens > MAX_ESTIMATED_TOKENS) {
-        logger.warn('SDK', 'Single message exceeds token limit, keeping anyway to avoid empty request', {
-          messageTokens: msgTokens,
-          tokenLimit: MAX_ESTIMATED_TOKENS
-        });
-      }
     }
 
     return truncated;
@@ -453,118 +345,6 @@ export class OpenRouterAgent {
   }
 
   /**
-   * Query OpenRouter with automatic fallback to next model on quota/rate limit errors
-   * Tries models in order until one succeeds or all fail
-   */
-  private async queryOpenRouterWithFallback(
-    history: ConversationMessage[],
-    apiKey: string,
-    models: string[],
-    baseUrl: string,
-    siteUrl?: string,
-    appName?: string
-  ): Promise<{ content: string; tokensUsed?: number }> {
-    const errors: Array<{ model: string; error: string }> = [];
-
-    for (let i = 0; i < models.length; i++) {
-      const model = models[i];
-      try {
-        logger.debug('SDK', `Trying OpenRouter model ${i + 1}/${models.length}: ${model}`);
-
-        const result = await this.queryOpenRouterMultiTurn(
-          history,
-          apiKey,
-          model,
-          baseUrl,
-          siteUrl,
-          appName
-        );
-
-        // Success - log if we had to fall back
-        if (i > 0) {
-          logger.success('SDK', `OpenRouter model fallback successful`, {
-            failedModels: errors.map(e => e.model).join(', '),
-            failedReasons: errors.map(e => {
-              const msg = e.error.toLowerCase();
-              if (msg.includes('429') || msg.includes('rate limit')) return '429';
-              if (msg.includes('quota') || msg.includes('credit')) return 'quota';
-              if (msg.includes('empty response')) return 'empty';
-              return 'unknown';
-            }).join(', '),
-            successModel: model,
-            attemptNumber: i + 1,
-            totalModels: models.length
-          });
-        } else {
-          logger.debug('SDK', `OpenRouter first model succeeded`, {
-            model,
-            totalModels: models.length
-          });
-        }
-
-        return result;
-
-      } catch (error: unknown) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        errors.push({ model, error: errorMessage });
-
-        // Detect 429 rate limit errors specifically
-        const is429Error = errorMessage.includes('429') ||
-                          errorMessage.toLowerCase().includes('rate limit') ||
-                          errorMessage.toLowerCase().includes('too many requests');
-
-        // Other quota-related errors (credits exhausted, etc.)
-        const isQuotaError = errorMessage.toLowerCase().includes('quota') ||
-                            errorMessage.toLowerCase().includes('insufficient') ||
-                            errorMessage.toLowerCase().includes('credit');
-
-        // Empty response should also trigger fallback (model issue, not request issue)
-        const isEmptyResponse = errorMessage.toLowerCase().includes('empty response');
-
-        // Determine if we should try the next model in OpenRouter
-        const shouldFallbackToNextModel = is429Error || isQuotaError || isEmptyResponse;
-
-        if (shouldFallbackToNextModel && i < models.length - 1) {
-          // Recoverable error - try next OpenRouter model
-          const reason = is429Error ? '429 rate limit' :
-                        isQuotaError ? 'quota exhausted' :
-                        'empty response';
-
-          logger.warn('SDK', `OpenRouter model failed (${reason}), trying next model in priority list`, {
-            failedModel: model,
-            nextModel: models[i + 1],
-            attemptNumber: i + 1,
-            totalModels: models.length,
-            error: errorMessage.substring(0, 200)  // Truncate for readability
-          });
-          continue;
-        }
-
-        // Last model or non-recoverable error
-        if (i === models.length - 1) {
-          // All OpenRouter models exhausted
-          logger.error('SDK', 'All OpenRouter models in priority list failed', {
-            attemptedModels: models.join(', '),
-            totalAttempts: models.length,
-            errors: errors.map(e => `${e.model}: ${e.error.substring(0, 100)}`).join(' | ')
-          });
-          throw new Error(`All OpenRouter models failed. Last error: ${errorMessage}`);
-        }
-
-        // Non-recoverable error (authentication, network, etc.) - throw immediately without trying other models
-        logger.error('SDK', 'OpenRouter encountered non-recoverable error, not trying other models', {
-          failedModel: model,
-          error: errorMessage.substring(0, 200)
-        });
-        throw error;
-      }
-    }
-
-    // Should never reach here, but TypeScript needs it
-    throw new Error('OpenRouter fallback logic error: exhausted all models without result');
-  }
-
-  /**
    * Query OpenRouter via REST API with full conversation history (multi-turn)
    * Sends the entire conversation context for coherent responses
    */
@@ -572,18 +352,11 @@ export class OpenRouterAgent {
     history: ConversationMessage[],
     apiKey: string,
     model: string,
-    baseUrl: string,
     siteUrl?: string,
     appName?: string
   ): Promise<{ content: string; tokensUsed?: number }> {
     // Truncate history to prevent runaway costs
     const truncatedHistory = this.truncateHistory(history);
-
-    // CRITICAL: Validate we have messages to send (defensive check)
-    if (truncatedHistory.length === 0) {
-      throw new Error('Cannot send API request with empty message history - truncation was too aggressive');
-    }
-
     const messages = this.conversationToOpenAIMessages(truncatedHistory);
     const totalChars = truncatedHistory.reduce((sum, m) => sum + m.content.length, 0);
     const estimatedTokens = this.estimateTokens(truncatedHistory.map(m => m.content).join(''));
@@ -594,7 +367,7 @@ export class OpenRouterAgent {
       estimatedTokens
     });
 
-    const response = await fetch(baseUrl, {
+    const response = await fetch(OPENROUTER_API_URL, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${apiKey}`,
@@ -607,7 +380,6 @@ export class OpenRouterAgent {
         messages,
         temperature: 0.3,  // Lower temperature for structured extraction
         max_tokens: 4096,
-        tool_choice: 'none',  // Explicitly disable tool calls to prevent Gemini from attempting function calls
       }),
     });
 
@@ -624,24 +396,8 @@ export class OpenRouterAgent {
     }
 
     if (!data.choices?.[0]?.message?.content) {
-      // Log full response for debugging empty responses
-      const debugInfo = {
-        model,
-        responseKeys: Object.keys(data),
-        choicesLength: data.choices?.length ?? 0,
-        firstChoice: data.choices?.[0] ? {
-          hasMessage: !!data.choices[0].message,
-          messageKeys: data.choices[0].message ? Object.keys(data.choices[0].message) : [],
-          content: data.choices[0].message?.content?.substring(0, 100) || '<empty>',
-          role: data.choices[0].message?.role,
-          finishReason: data.choices[0].finish_reason
-        } : null,
-        usage: data.usage,
-        responseSize: JSON.stringify(data).length
-      };
-      logger.error('SDK', 'Empty response from OpenRouter', debugInfo);
-      // Throw error to trigger fallback to next model
-      throw new Error(`Empty response from model ${model}: ${JSON.stringify(debugInfo)}`);
+      logger.error('SDK', 'Empty response from OpenRouter');
+      return { content: '' };
     }
 
     const content = data.choices[0].message.content;
@@ -677,51 +433,35 @@ export class OpenRouterAgent {
 
   /**
    * Get OpenRouter configuration from settings or environment
-   * Supports multiple models separated by comma for automatic fallback within OpenRouter
-   * Models are tried in order of priority (first to last) on 429/quota errors
+   * Issue #733: Uses centralized ~/.claude-mem/.env for credentials, not random project .env files
    */
-  private getOpenRouterConfig(): { apiKey: string; models: string[]; baseUrl: string; siteUrl?: string; appName?: string } {
+  private getOpenRouterConfig(): { apiKey: string; model: string; siteUrl?: string; appName?: string } {
     const settingsPath = USER_SETTINGS_PATH;
     const settings = SettingsDefaultsManager.loadFromFile(settingsPath);
 
-    // API key: check settings first, then environment variable
-    const apiKey = settings.CLAUDE_MEM_OPENROUTER_API_KEY || process.env.OPENROUTER_API_KEY || '';
+    // API key: check settings first, then centralized claude-mem .env (NOT process.env)
+    // This prevents Issue #733 where random project .env files could interfere
+    const apiKey = settings.CLAUDE_MEM_OPENROUTER_API_KEY || getCredential('OPENROUTER_API_KEY') || '';
 
-    // Models: parse comma-separated list from settings or use default
-    // Models will be tried in order on 429/quota errors (first = highest priority)
-    const modelString = settings.CLAUDE_MEM_OPENROUTER_MODEL || 'xiaomi/mimo-v2-flash:free';
-    let models = modelString.split(',').map(m => m.trim()).filter(m => m.length > 0);
-
-    // If no valid models configured, use default
-    if (models.length === 0) {
-      models = ['gemini-3-flash-preview'];
-      logger.warn('SDK', 'No OpenRouter models configured, using default: gemini-3-flash-preview');
-    } else if (models.length > 1) {
-      logger.info('SDK', 'OpenRouter configured with model priority list', {
-        models: models.join(' → '),
-        count: models.length,
-        note: 'Will try models in order on 429/quota errors'
-      });
-    }
-
-    // Base URL: from settings or default
-    const baseUrl = settings.CLAUDE_MEM_OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1/chat/completions';
+    // Model: from settings or default
+    const model = settings.CLAUDE_MEM_OPENROUTER_MODEL || 'xiaomi/mimo-v2-flash:free';
 
     // Optional analytics headers
     const siteUrl = settings.CLAUDE_MEM_OPENROUTER_SITE_URL || '';
     const appName = settings.CLAUDE_MEM_OPENROUTER_APP_NAME || 'claude-mem';
 
-    return { apiKey, models, baseUrl, siteUrl, appName };
+    return { apiKey, model, siteUrl, appName };
   }
 }
 
 /**
  * Check if OpenRouter is available (has API key configured)
+ * Issue #733: Uses centralized ~/.claude-mem/.env, not random project .env files
  */
 export function isOpenRouterAvailable(): boolean {
   const settingsPath = USER_SETTINGS_PATH;
   const settings = SettingsDefaultsManager.loadFromFile(settingsPath);
-  return !!(settings.CLAUDE_MEM_OPENROUTER_API_KEY || process.env.OPENROUTER_API_KEY);
+  return !!(settings.CLAUDE_MEM_OPENROUTER_API_KEY || getCredential('OPENROUTER_API_KEY'));
 }
 
 /**

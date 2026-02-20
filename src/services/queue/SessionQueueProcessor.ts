@@ -20,16 +20,14 @@ export class SessionQueueProcessor {
 
   /**
    * Create an async iterator that yields messages as they become available.
-   * Uses two-phase commit pattern for crash-safe message processing:
-   * 1. claim(): Mark message as 'processing' (message stays in DB)
-   * 2. complete(): Delete message after successful processing
-   *
-   * If Worker crashes during processing, message remains in 'processing' state
-   * and will be reset to 'pending' on next Worker startup.
+   * Uses atomic claim-confirm to prevent duplicates.
+   * Messages are claimed (marked processing) and stay in DB until confirmProcessed().
+   * Self-heals stale processing messages before each claim.
+   * Waits for 'message' event when queue is empty.
    *
    * CRITICAL: Calls onIdleTimeout callback after 3 minutes of inactivity.
-   * The callback should trigger abortController.abort() to kill the subprocess.
-   * Just returning from the iterator is NOT enough - the subprocess stays alive.
+   * The callback should trigger abortController.abort() to kill the SDK subprocess.
+   * Just returning from the iterator is NOT enough - the subprocess stays alive!
    */
   async *createIterator(options: CreateIteratorOptions): AsyncIterableIterator<PendingMessageWithId> {
     const { sessionDbId, signal, onIdleTimeout } = options;
@@ -37,19 +35,21 @@ export class SessionQueueProcessor {
 
     while (!signal.aborted) {
       try {
-        // Atomically claim next message (status -> 'processing')
-        const persistentMessage = this.store.claimAndDelete(sessionDbId);
+        // Atomically claim next pending message (marks as 'processing')
+        // Self-heals any stale processing messages before claiming
+        const persistentMessage = this.store.claimNextMessage(sessionDbId);
 
         if (persistentMessage) {
           // Reset activity time when we successfully yield a message
           lastActivityTime = Date.now();
-          // Yield the message for processing (it's still in DB as 'processing')
+          // Yield the message for processing (it's marked as 'processing' in DB)
           yield this.toPendingMessageWithId(persistentMessage);
         } else {
           // Queue empty - wait for wake-up event or timeout
           const receivedMessage = await this.waitForMessage(signal, IDLE_TIMEOUT_MS);
 
           if (!receivedMessage && !signal.aborted) {
+            // Timeout occurred - check if we've been idle too long
             const idleDuration = Date.now() - lastActivityTime;
             if (idleDuration >= IDLE_TIMEOUT_MS) {
               logger.info('SESSION', 'Idle timeout reached, triggering abort to kill subprocess', {
@@ -60,7 +60,7 @@ export class SessionQueueProcessor {
               onIdleTimeout?.();
               return;
             }
-            // Reset timer on spurious wakeup
+            // Reset timer on spurious wakeup - queue is empty but duration check failed
             lastActivityTime = Date.now();
           }
         }
@@ -94,17 +94,17 @@ export class SessionQueueProcessor {
 
       const onMessage = () => {
         cleanup();
-        resolve(true);
+        resolve(true); // Message received
       };
 
       const onAbort = () => {
         cleanup();
-        resolve(false);
+        resolve(false); // Aborted, let loop check signal.aborted
       };
 
       const onTimeout = () => {
         cleanup();
-        resolve(false);
+        resolve(false); // Timeout occurred
       };
 
       const cleanup = () => {

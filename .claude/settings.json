@@ -4,27 +4,5 @@
     "dev-browser@dev-browser-marketplace": false
   },
   "hooks": {
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/home/obj/s/llm/config/claude/hooks/remind-commit.sh",
-            "timeout": 30
-          }
-        ]
-      }
-    ],
-    "SubagentStop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/home/obj/s/llm/config/claude/hooks/remind-commit.sh",
-            "timeout": 30
-          }
-        ]
-      }
-    ]
   }
 }

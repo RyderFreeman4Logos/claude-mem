@@ -21,7 +21,7 @@ import { buildIsolatedEnv, getAuthMethodDescription } from '../../shared/EnvMana
 import type { ActiveSession, SDKUserMessage } from '../worker-types.js';
 import { ModeManager } from '../domain/ModeManager.js';
 import { processAgentResponse, type WorkerRef } from './agents/index.js';
-import { createPidCapturingSpawn, getProcessBySession, ensureProcessExit } from './ProcessRegistry.js';
+import { createPidCapturingSpawn, getProcessBySession, ensureProcessExit, waitForSlot } from './ProcessRegistry.js';
 
 // Import Agent SDK (assumes it's installed)
 // @ts-ignore - Agent SDK types may not be available
@@ -66,15 +66,8 @@ export class SDKAgent {
       'TodoWrite'       // No todo management
     ];
 
-    const pendingStore = this.sessionManager.getPendingMessageStore();
-    const pendingMessageQueue: Array<{ id: number; originalTimestamp: number }> = [];
-
     // Create message generator (event-driven)
-    const messageGenerator = this.createMessageGenerator(
-      session,
-      cwdTracker,
-      (id, originalTimestamp) => pendingMessageQueue.push({ id, originalTimestamp })
-    );
+    const messageGenerator = this.createMessageGenerator(session, cwdTracker);
 
     // CRITICAL: Only resume if:
     // 1. memorySessionId exists (was captured from a previous SDK response)
@@ -83,10 +76,10 @@ export class SDKAgent {
     // On worker restart or crash recovery, memorySessionId may exist from a previous
     // SDK session but we must NOT resume because the SDK context was lost.
     // NEVER use contentSessionId for resume - that would inject messages into the user's transcript!
-    const memorySessionId = session.memorySessionId ?? undefined;
-    const hasRealMemorySessionId = !!memorySessionId;
+    const hasRealMemorySessionId = !!session.memorySessionId;
     const shouldResume = hasRealMemorySessionId && session.lastPromptNumber > 1 && !session.forceInit;
 
+    // Clear forceInit after using it
     if (session.forceInit) {
       logger.info('SDK', 'forceInit flag set, starting fresh SDK session', {
         sessionDbId: session.sessionDbId,
@@ -95,31 +88,37 @@ export class SDKAgent {
       session.forceInit = false;
     }
 
+    // Wait for agent pool slot (configurable via CLAUDE_MEM_MAX_CONCURRENT_AGENTS)
+    const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
+    const maxConcurrent = parseInt(settings.CLAUDE_MEM_MAX_CONCURRENT_AGENTS, 10) || 2;
+    await waitForSlot(maxConcurrent);
+
     // Build isolated environment from ~/.claude-mem/.env
-    // Prevents accidental credential pickup from random project .env files.
+    // This prevents Issue #733: random ANTHROPIC_API_KEY from project .env files
+    // being used instead of the configured auth method (CLI subscription or explicit API key)
     const isolatedEnv = buildIsolatedEnv();
     const authMethod = getAuthMethodDescription();
 
     logger.info('SDK', 'Starting SDK query', {
       sessionDbId: session.sessionDbId,
       contentSessionId: session.contentSessionId,
-      memorySessionId,
+      memorySessionId: session.memorySessionId,
       hasRealMemorySessionId,
       shouldResume,
-      resume_parameter: shouldResume ? memorySessionId : '(none - fresh start)',
+      resume_parameter: shouldResume ? session.memorySessionId : '(none - fresh start)',
       lastPromptNumber: session.lastPromptNumber,
       authMethod
     });
 
     // Debug-level alignment logs for detailed tracing
     if (session.lastPromptNumber > 1) {
-      logger.debug('SDK', `[ALIGNMENT] Resume Decision | contentSessionId=${session.contentSessionId} | memorySessionId=${memorySessionId} | prompt#=${session.lastPromptNumber} | hasRealMemorySessionId=${hasRealMemorySessionId} | shouldResume=${shouldResume} | resumeWith=${shouldResume ? memorySessionId : 'NONE'}`);
+      logger.debug('SDK', `[ALIGNMENT] Resume Decision | contentSessionId=${session.contentSessionId} | memorySessionId=${session.memorySessionId} | prompt#=${session.lastPromptNumber} | hasRealMemorySessionId=${hasRealMemorySessionId} | shouldResume=${shouldResume} | resumeWith=${shouldResume ? session.memorySessionId : 'NONE'}`);
     } else {
       // INIT prompt - never resume even if memorySessionId exists (stale from previous session)
       const hasStaleMemoryId = hasRealMemorySessionId;
       logger.debug('SDK', `[ALIGNMENT] First Prompt (INIT) | contentSessionId=${session.contentSessionId} | prompt#=${session.lastPromptNumber} | hasStaleMemoryId=${hasStaleMemoryId} | action=START_FRESH | Will capture new memorySessionId from SDK response`);
       if (hasStaleMemoryId) {
-        logger.warn('SDK', `Skipping resume for INIT prompt despite existing memorySessionId=${memorySessionId} - SDK context was lost (worker restart or crash recovery)`);
+        logger.warn('SDK', `Skipping resume for INIT prompt despite existing memorySessionId=${session.memorySessionId} - SDK context was lost (worker restart or crash recovery)`);
       }
     }
 
@@ -128,6 +127,7 @@ export class SDKAgent {
     // Use custom spawn to capture PIDs for zombie process cleanup (Issue #737)
     // Use dedicated cwd to isolate observer sessions from user's `claude --resume` list
     ensureDir(OBSERVER_SESSIONS_DIR);
+    // CRITICAL: Pass isolated env to prevent Issue #733 (API key pollution from project .env files)
     const queryResult = query({
       prompt: messageGenerator,
       options: {
@@ -136,114 +136,125 @@ export class SDKAgent {
         // instead of polluting user's actual project resume lists
         cwd: OBSERVER_SESSIONS_DIR,
         // Only resume if shouldResume is true (memorySessionId exists, not first prompt, not forceInit)
-        ...(shouldResume && { resume: memorySessionId }),
+        ...(shouldResume && { resume: session.memorySessionId }),
         disallowedTools,
         abortController: session.abortController,
         pathToClaudeCodeExecutable: claudePath,
         // Custom spawn function captures PIDs to fix zombie process accumulation
         spawnClaudeCodeProcess: createPidCapturingSpawn(session.sessionDbId),
-        env: isolatedEnv
+        env: isolatedEnv  // Use isolated credentials from ~/.claude-mem/.env, not process.env
       }
     });
 
-    // Process SDK messages
-    for await (const message of queryResult) {
-      // Capture or update memory session ID from SDK message.
-      // SDK can return a different session_id on resume; always trust SDK output.
-      if (message.session_id && message.session_id !== session.memorySessionId) {
-        const previousId = session.memorySessionId;
-        session.memorySessionId = message.session_id;
-        this.dbManager.getSessionStore().ensureMemorySessionIdRegistered(
-          session.sessionDbId,
-          message.session_id
-        );
-        // Verify the update by reading back from DB
-        const verification = this.dbManager.getSessionStore().getSessionById(session.sessionDbId);
-        const dbVerified = verification?.memory_session_id === message.session_id;
-        const logMessage = previousId
-          ? `MEMORY_ID_CHANGED | sessionDbId=${session.sessionDbId} | from=${previousId} | to=${message.session_id} | dbVerified=${dbVerified}`
-          : `MEMORY_ID_CAPTURED | sessionDbId=${session.sessionDbId} | memorySessionId=${message.session_id} | dbVerified=${dbVerified}`;
-        logger.info('SESSION', logMessage, {
-          sessionId: session.sessionDbId,
-          memorySessionId: message.session_id,
-          previousId
-        });
-        if (!dbVerified) {
-          logger.error('SESSION', `MEMORY_ID_MISMATCH | sessionDbId=${session.sessionDbId} | expected=${message.session_id} | got=${verification?.memory_session_id}`, {
-            sessionId: session.sessionDbId
+    // Process SDK messages — cleanup in finally ensures subprocess termination
+    // even if the loop throws (e.g., context overflow, invalid API key)
+    try {
+      for await (const message of queryResult) {
+        // Capture or update memory session ID from SDK message
+        // IMPORTANT: The SDK may return a DIFFERENT session_id on resume than what we sent!
+        // We must always sync the DB to match what the SDK actually uses.
+        //
+        // MULTI-TERMINAL COLLISION FIX (FK constraint bug):
+        // Use ensureMemorySessionIdRegistered() instead of updateMemorySessionId() because:
+        // 1. It's idempotent - safe to call multiple times
+        // 2. It verifies the update happened (SELECT before UPDATE)
+        // 3. Consistent with ResponseProcessor's usage pattern
+        // This ensures FK constraint compliance BEFORE any observations are stored.
+        if (message.session_id && message.session_id !== session.memorySessionId) {
+          const previousId = session.memorySessionId;
+          session.memorySessionId = message.session_id;
+          // Persist to database IMMEDIATELY for FK constraint compliance
+          // This must happen BEFORE any observations referencing this ID are stored
+          this.dbManager.getSessionStore().ensureMemorySessionIdRegistered(
+            session.sessionDbId,
+            message.session_id
+          );
+          // Verify the update by reading back from DB
+          const verification = this.dbManager.getSessionStore().getSessionById(session.sessionDbId);
+          const dbVerified = verification?.memory_session_id === message.session_id;
+          const logMessage = previousId
+            ? `MEMORY_ID_CHANGED | sessionDbId=${session.sessionDbId} | from=${previousId} | to=${message.session_id} | dbVerified=${dbVerified}`
+            : `MEMORY_ID_CAPTURED | sessionDbId=${session.sessionDbId} | memorySessionId=${message.session_id} | dbVerified=${dbVerified}`;
+          logger.info('SESSION', logMessage, {
+            sessionId: session.sessionDbId,
+            memorySessionId: message.session_id,
+            previousId
           });
-        }
-        // Debug-level alignment log for detailed tracing
-        logger.debug('SDK', `[ALIGNMENT] ${previousId ? 'Updated' : 'Captured'} | contentSessionId=${session.contentSessionId} → memorySessionId=${message.session_id} | Future prompts will resume with this ID`);
-      }
-
-      // Handle assistant messages
-      if (message.type === 'assistant') {
-        const content = message.message.content;
-        const textContent = Array.isArray(content)
-          ? content.filter((c: any) => c.type === 'text').map((c: any) => c.text).join('\n')
-          : typeof content === 'string' ? content : '';
-
-        // Check for fatal context overflow patterns to prevent infinite retry loops
-        if (textContent.includes('prompt is too long') || textContent.includes('context window')) {
-          logger.error('SDK', 'Context overflow detected - terminating session', {
-            sessionId: session.sessionDbId
-          });
-          session.abortController.abort();
-          return;
+          if (!dbVerified) {
+            logger.error('SESSION', `MEMORY_ID_MISMATCH | sessionDbId=${session.sessionDbId} | expected=${message.session_id} | got=${verification?.memory_session_id}`, {
+              sessionId: session.sessionDbId
+            });
+          }
+          // Debug-level alignment log for detailed tracing
+          logger.debug('SDK', `[ALIGNMENT] ${previousId ? 'Updated' : 'Captured'} | contentSessionId=${session.contentSessionId} → memorySessionId=${message.session_id} | Future prompts will resume with this ID`);
         }
 
-        const responseSize = textContent.length;
+        // Handle assistant messages
+        if (message.type === 'assistant') {
+          const content = message.message.content;
+          const textContent = Array.isArray(content)
+            ? content.filter((c: any) => c.type === 'text').map((c: any) => c.text).join('\n')
+            : typeof content === 'string' ? content : '';
 
-        // Capture token state BEFORE updating (for delta calculation)
-        const tokensBeforeResponse = session.cumulativeInputTokens + session.cumulativeOutputTokens;
-
-        // Extract and track token usage
-        const usage = message.message.usage;
-        if (usage) {
-          session.cumulativeInputTokens += usage.input_tokens || 0;
-          session.cumulativeOutputTokens += usage.output_tokens || 0;
-
-          // Cache creation counts as discovery, cache read doesn't
-          if (usage.cache_creation_input_tokens) {
-            session.cumulativeInputTokens += usage.cache_creation_input_tokens;
+          // Check for context overflow - prevents infinite retry loops
+          if (textContent.includes('prompt is too long') ||
+              textContent.includes('context window')) {
+            logger.error('SDK', 'Context overflow detected - terminating session');
+            session.abortController.abort();
+            return;
           }
 
-          logger.debug('SDK', 'Token usage captured', {
-            sessionId: session.sessionDbId,
-            inputTokens: usage.input_tokens,
-            outputTokens: usage.output_tokens,
-            cacheCreation: usage.cache_creation_input_tokens || 0,
-            cacheRead: usage.cache_read_input_tokens || 0,
-            cumulativeInput: session.cumulativeInputTokens,
-            cumulativeOutput: session.cumulativeOutputTokens
-          });
-        }
+          const responseSize = textContent.length;
 
-        // Calculate discovery tokens (delta for this response only)
-        const discoveryTokens = (session.cumulativeInputTokens + session.cumulativeOutputTokens) - tokensBeforeResponse;
+          // Capture token state BEFORE updating (for delta calculation)
+          const tokensBeforeResponse = session.cumulativeInputTokens + session.cumulativeOutputTokens;
 
-        // Process response (empty or not) and mark messages as processed
-        // Capture earliest timestamp BEFORE processing (will be cleared after)
-        const originalTimestamp = session.earliestPendingTimestamp;
+          // Extract and track token usage
+          const usage = message.message.usage;
+          if (usage) {
+            session.cumulativeInputTokens += usage.input_tokens || 0;
+            session.cumulativeOutputTokens += usage.output_tokens || 0;
 
-        if (responseSize > 0) {
-          const truncatedResponse = responseSize > 100
-            ? textContent.substring(0, 100) + '...'
-            : textContent;
-          logger.dataOut('SDK', `Response received (${responseSize} chars)`, {
-            sessionId: session.sessionDbId,
-            promptNumber: session.lastPromptNumber
-          }, truncatedResponse);
-        }
+            // Cache creation counts as discovery, cache read doesn't
+            if (usage.cache_creation_input_tokens) {
+              session.cumulativeInputTokens += usage.cache_creation_input_tokens;
+            }
 
-        const pendingMessage = pendingMessageQueue.shift();
+            logger.debug('SDK', 'Token usage captured', {
+              sessionId: session.sessionDbId,
+              inputTokens: usage.input_tokens,
+              outputTokens: usage.output_tokens,
+              cacheCreation: usage.cache_creation_input_tokens || 0,
+              cacheRead: usage.cache_read_input_tokens || 0,
+              cumulativeInput: session.cumulativeInputTokens,
+              cumulativeOutput: session.cumulativeOutputTokens
+            });
+          }
 
-        try {
-          // Detect explicit fatal failures returned as text responses.
+          // Calculate discovery tokens (delta for this response only)
+          const discoveryTokens = (session.cumulativeInputTokens + session.cumulativeOutputTokens) - tokensBeforeResponse;
+
+          // Process response (empty or not) and mark messages as processed
+          // Capture earliest timestamp BEFORE processing (will be cleared after)
+          const originalTimestamp = session.earliestPendingTimestamp;
+
+          if (responseSize > 0) {
+            const truncatedResponse = responseSize > 100
+              ? textContent.substring(0, 100) + '...'
+              : textContent;
+            logger.dataOut('SDK', `Response received (${responseSize} chars)`, {
+              sessionId: session.sessionDbId,
+              promptNumber: session.lastPromptNumber
+            }, truncatedResponse);
+          }
+
+          // Detect fatal context overflow and terminate gracefully (issue #870)
           if (typeof textContent === 'string' && textContent.includes('Prompt is too long')) {
             throw new Error('Claude session context overflow: prompt is too long');
           }
+
+          // Detect invalid API key — SDK returns this as response text, not an error.
+          // Throw so it surfaces in health endpoint and prevents silent failures.
           if (typeof textContent === 'string' && textContent.includes('Invalid API key')) {
             throw new Error('Invalid API key: check your API key configuration in ~/.claude-mem/settings.json or ~/.claude-mem/.env');
           }
@@ -256,29 +267,22 @@ export class SDKAgent {
             this.sessionManager,
             worker,
             discoveryTokens,
-            pendingMessage?.originalTimestamp ?? originalTimestamp,
+            originalTimestamp,
             'SDK',
             cwdTracker.lastCwd
           );
+        }
 
-          if (pendingMessage) {
-            pendingStore.complete(pendingMessage.id);
-          }
-        } catch (error) {
-          if (pendingMessage) {
-            pendingStore.markFailed(pendingMessage.id);
-          }
-
-          logger.error('SDK', 'SDK message processing failed', {
-            sessionId: session.sessionDbId,
-            messageId: pendingMessage?.id ?? 'unknown'
-          }, error as Error);
+        // Log result messages
+        if (message.type === 'result' && message.subtype === 'success') {
+          // Usage telemetry is captured at SDK level
         }
       }
-
-      // Log result messages
-      if (message.type === 'result' && message.subtype === 'success') {
-        // Usage telemetry is captured at SDK level
+    } finally {
+      // Ensure subprocess is terminated after query completes (or on error)
+      const tracked = getProcessBySession(session.sessionDbId);
+      if (tracked && !tracked.process.killed && tracked.process.exitCode === null) {
+        await ensureProcessExit(tracked, 5000);
       }
     }
 
@@ -327,8 +331,7 @@ export class SDKAgent {
    */
   private async *createMessageGenerator(
     session: ActiveSession,
-    cwdTracker: { lastCwd: string | undefined },
-    onPendingMessage: (id: number, originalTimestamp: number) => void
+    cwdTracker: { lastCwd: string | undefined }
   ): AsyncIterableIterator<SDKUserMessage> {
     // Load active mode
     const mode = ModeManager.getInstance().getActiveMode();
@@ -365,6 +368,10 @@ export class SDKAgent {
 
     // Consume pending messages from SessionManager (event-driven, no polling)
     for await (const message of this.sessionManager.getMessageIterator(session.sessionDbId)) {
+      // CLAIM-CONFIRM: Track message ID for confirmProcessed() after successful storage
+      // The message is now in 'processing' status in DB until ResponseProcessor calls confirmProcessed()
+      session.processingMessageIds.push(message._persistentId);
+
       // Capture cwd from each message for worktree support
       if (message.cwd) {
         cwdTracker.lastCwd = message.cwd;
@@ -384,9 +391,6 @@ export class SDKAgent {
           created_at_epoch: Date.now(),
           cwd: message.cwd
         });
-
-        // Track pending message ID for completion and timestamp accuracy
-        onPendingMessage(message._persistentId, message._originalTimestamp);
 
         // Add to shared conversation history for provider interop
         session.conversationHistory.push({ role: 'user', content: obsPrompt });
@@ -409,9 +413,6 @@ export class SDKAgent {
           user_prompt: session.userPrompt,
           last_assistant_message: message.last_assistant_message || ''
         }, mode);
-
-        // Track pending message ID for completion and timestamp accuracy
-        onPendingMessage(message._persistentId, message._originalTimestamp);
 
         // Add to shared conversation history for provider interop
         session.conversationHistory.push({ role: 'user', content: summaryPrompt });
@@ -450,7 +451,17 @@ export class SDKAgent {
       return settings.CLAUDE_CODE_PATH;
     }
 
-    // 2. Try auto-detection
+    // 2. On Windows, prefer "claude.cmd" via PATH to avoid spawn issues with spaces in paths
+    if (process.platform === 'win32') {
+      try {
+        execSync('where claude.cmd', { encoding: 'utf8', windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] });
+        return 'claude.cmd'; // Let Windows resolve via PATHEXT
+      } catch {
+        // Fall through to generic error
+      }
+    }
+
+    // 3. Try auto-detection for non-Windows platforms
     try {
       const claudePath = execSync(
         process.platform === 'win32' ? 'where claude' : 'which claude',

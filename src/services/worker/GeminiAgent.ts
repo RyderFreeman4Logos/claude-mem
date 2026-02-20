@@ -17,6 +17,7 @@ import { SessionManager } from './SessionManager.js';
 import { logger } from '../../utils/logger.js';
 import { buildInitPrompt, buildObservationPrompt, buildSummaryPrompt, buildContinuationPrompt } from '../../sdk/prompts.js';
 import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
+import { getCredential } from '../../shared/EnvManager.js';
 import type { ActiveSession, ConversationMessage } from '../worker-types.js';
 import { ModeManager } from '../domain/ModeManager.js';
 import {
@@ -26,10 +27,10 @@ import {
   type WorkerRef,
   type FallbackAgent
 } from './agents/index.js';
-import { ConcurrencyManager } from './ConcurrencyManager.js';
 
-// Gemini API endpoint
-const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
+// Gemini API endpoint — use v1 (stable), not v1beta.
+// v1beta does not support newer models like gemini-3-flash.
+const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1/models';
 
 // Gemini model types (available via API)
 export type GeminiModel =
@@ -38,6 +39,7 @@ export type GeminiModel =
   | 'gemini-2.5-pro'
   | 'gemini-2.0-flash'
   | 'gemini-2.0-flash-lite'
+  | 'gemini-3-flash'
   | 'gemini-3-flash-preview';
 
 // Free tier RPM limits by model (requests per minute)
@@ -47,6 +49,7 @@ const GEMINI_RPM_LIMITS: Record<GeminiModel, number> = {
   'gemini-2.5-pro': 5,
   'gemini-2.0-flash': 15,
   'gemini-2.0-flash-lite': 30,
+  'gemini-3-flash': 10,
   'gemini-3-flash-preview': 5,
 };
 
@@ -127,37 +130,19 @@ export class GeminiAgent {
    */
   async startSession(session: ActiveSession, worker?: WorkerRef): Promise<void> {
     try {
-      // Initialize memorySessionId if not already set.
-      // Prefer existing DB value (preserves FK integrity for historical sessions).
-      // For brand-new sessions, generate one proactively because Gemini does not
-      // provide a server-side session ID we can capture like Claude SDK does.
-      if (!session.memorySessionId) {
-        const existingSession = this.dbManager.getSessionStore().getSessionById(session.sessionDbId);
-        const existingMemoryId = existingSession?.memory_session_id;
-
-        if (existingMemoryId) {
-          session.memorySessionId = existingMemoryId;
-          logger.info('SDK', 'Reusing existing memorySessionId for Gemini session', {
-            sessionDbId: session.sessionDbId,
-            memorySessionId: existingMemoryId
-          });
-        } else {
-          const uniqueMemoryId = `gemini-${session.contentSessionId}-${Date.now()}`;
-          session.memorySessionId = uniqueMemoryId;
-          this.dbManager.getSessionStore().updateMemorySessionId(session.sessionDbId, uniqueMemoryId);
-
-          logger.info('SDK', 'Generated memorySessionId for Gemini session', {
-            sessionDbId: session.sessionDbId,
-            memorySessionId: uniqueMemoryId
-          });
-        }
-      }
-
       // Get Gemini configuration
       const { apiKey, model, rateLimitingEnabled } = this.getGeminiConfig();
 
       if (!apiKey) {
         throw new Error('Gemini API key not configured. Set CLAUDE_MEM_GEMINI_API_KEY in settings or GEMINI_API_KEY environment variable.');
+      }
+
+      // Generate synthetic memorySessionId (Gemini is stateless, doesn't return session IDs)
+      if (!session.memorySessionId) {
+        const syntheticMemorySessionId = `gemini-${session.contentSessionId}-${Date.now()}`;
+        session.memorySessionId = syntheticMemorySessionId;
+        this.dbManager.getSessionStore().updateMemorySessionId(session.sessionDbId, syntheticMemorySessionId);
+        logger.info('SESSION', `MEMORY_ID_GENERATED | sessionDbId=${session.sessionDbId} | provider=Gemini`);
       }
 
       // Load active mode
@@ -199,144 +184,139 @@ export class GeminiAgent {
         });
       }
 
-      // Process pending messages sequentially to preserve full context
+      // Process pending messages
       // Track cwd from messages for CLAUDE.md generation
       let lastCwd: string | undefined;
-      const pendingStore = this.sessionManager.getPendingMessageStore();
 
       for await (const message of this.sessionManager.getMessageIterator(session.sessionDbId)) {
+        // CLAIM-CONFIRM: Track message ID for confirmProcessed() after successful storage
+        // The message is now in 'processing' status in DB until ResponseProcessor calls confirmProcessed()
+        session.processingMessageIds.push(message._persistentId);
+
         // Capture cwd from each message for worktree support
         if (message.cwd) {
           lastCwd = message.cwd;
         }
-
         // Capture earliest timestamp BEFORE processing (will be cleared after)
         // This ensures backlog messages get their original timestamps, not current time
         const originalTimestamp = session.earliestPendingTimestamp;
 
-        try {
-          if (message.type === 'observation') {
-            // Update last prompt number
-            if (message.prompt_number !== undefined) {
-              session.lastPromptNumber = message.prompt_number;
-            }
-
-            // Avoid expensive LLM calls when session linkage is not ready.
-            if (!session.memorySessionId) {
-              throw new Error('Cannot process observations: memorySessionId not yet captured. This session may need to be reinitialized.');
-            }
-
-            // Build observation prompt
-            const obsPrompt = buildObservationPrompt({
-              id: 0,
-              tool_name: message.tool_name!,
-              tool_input: JSON.stringify(message.tool_input),
-              tool_output: JSON.stringify(message.tool_response),
-              created_at_epoch: originalTimestamp ?? Date.now(),
-              cwd: message.cwd
-            });
-
-            // Add to conversation history and query Gemini with full context
-            session.conversationHistory.push({ role: 'user', content: obsPrompt });
-            const obsResponse = await this.queryGeminiMultiTurn(session.conversationHistory, apiKey, model, rateLimitingEnabled);
-
-            let tokensUsed = 0;
-            if (obsResponse.content) {
-              tokensUsed = obsResponse.tokensUsed || 0;
-              session.cumulativeInputTokens += Math.floor(tokensUsed * 0.7);
-              session.cumulativeOutputTokens += Math.floor(tokensUsed * 0.3);
-            }
-
-            // Process response using shared ResponseProcessor
-            await processAgentResponse(
-              obsResponse.content || '',
-              session,
-              this.dbManager,
-              this.sessionManager,
-              worker,
-              tokensUsed,
-              originalTimestamp,
-              'Gemini',
-              lastCwd
-            );
-          } else if (message.type === 'summarize') {
-            // Avoid expensive LLM calls when session linkage is not ready.
-            if (!session.memorySessionId) {
-              throw new Error('Cannot process summary: memorySessionId not yet captured. This session may need to be reinitialized.');
-            }
-
-            // Build summary prompt
-            const summaryPrompt = buildSummaryPrompt({
-              id: session.sessionDbId,
-              memory_session_id: session.memorySessionId,
-              project: session.project,
-              user_prompt: session.userPrompt,
-              last_assistant_message: message.last_assistant_message || ''
-            }, mode);
-
-            // Add to conversation history and query Gemini with full context
-            session.conversationHistory.push({ role: 'user', content: summaryPrompt });
-            const summaryResponse = await this.queryGeminiMultiTurn(session.conversationHistory, apiKey, model, rateLimitingEnabled);
-
-            let tokensUsed = 0;
-            if (summaryResponse.content) {
-              tokensUsed = summaryResponse.tokensUsed || 0;
-              session.cumulativeInputTokens += Math.floor(tokensUsed * 0.7);
-              session.cumulativeOutputTokens += Math.floor(tokensUsed * 0.3);
-            }
-
-            // Process response using shared ResponseProcessor
-            await processAgentResponse(
-              summaryResponse.content || '',
-              session,
-              this.dbManager,
-              this.sessionManager,
-              worker,
-              tokensUsed,
-              originalTimestamp,
-              'Gemini',
-              lastCwd
-            );
+        if (message.type === 'observation') {
+          // Update last prompt number
+          if (message.prompt_number !== undefined) {
+            session.lastPromptNumber = message.prompt_number;
           }
 
-          // Mark message completed after successful processing
-          pendingStore.complete(message._persistentId);
-        } catch (error) {
-          logger.error('SDK', 'Gemini message processing failed', {
-            sessionId: session.sessionDbId,
-            messageId: message._persistentId,
-            messageType: message.type
-          }, error as Error);
+          // CRITICAL: Check memorySessionId BEFORE making expensive LLM call
+          // This prevents wasting tokens when we won't be able to store the result anyway
+          if (!session.memorySessionId) {
+            throw new Error('Cannot process observations: memorySessionId not yet captured. This session may need to be reinitialized.');
+          }
 
-          pendingStore.markFailed(message._persistentId);
+          // Build observation prompt
+          const obsPrompt = buildObservationPrompt({
+            id: 0,
+            tool_name: message.tool_name!,
+            tool_input: JSON.stringify(message.tool_input),
+            tool_output: JSON.stringify(message.tool_response),
+            created_at_epoch: originalTimestamp ?? Date.now(),
+            cwd: message.cwd
+          });
+
+          // Add to conversation history and query Gemini with full context
+          session.conversationHistory.push({ role: 'user', content: obsPrompt });
+          const obsResponse = await this.queryGeminiMultiTurn(session.conversationHistory, apiKey, model, rateLimitingEnabled);
+
+          let tokensUsed = 0;
+          if (obsResponse.content) {
+            // Add response to conversation history
+            session.conversationHistory.push({ role: 'assistant', content: obsResponse.content });
+
+            tokensUsed = obsResponse.tokensUsed || 0;
+            session.cumulativeInputTokens += Math.floor(tokensUsed * 0.7);
+            session.cumulativeOutputTokens += Math.floor(tokensUsed * 0.3);
+          }
+
+          // Process response using shared ResponseProcessor
+          if (obsResponse.content) {
+            await processAgentResponse(
+              obsResponse.content,
+              session,
+              this.dbManager,
+              this.sessionManager,
+              worker,
+              tokensUsed,
+              originalTimestamp,
+              'Gemini',
+              lastCwd
+            );
+          } else {
+            logger.warn('SDK', 'Empty Gemini observation response, skipping processing to preserve message', {
+              sessionId: session.sessionDbId,
+              messageId: session.processingMessageIds[session.processingMessageIds.length - 1]
+            });
+            // Don't confirm - leave message for stale recovery
+          }
+
+        } else if (message.type === 'summarize') {
+          // CRITICAL: Check memorySessionId BEFORE making expensive LLM call
+          if (!session.memorySessionId) {
+            throw new Error('Cannot process summary: memorySessionId not yet captured. This session may need to be reinitialized.');
+          }
+
+          // Build summary prompt
+          const summaryPrompt = buildSummaryPrompt({
+            id: session.sessionDbId,
+            memory_session_id: session.memorySessionId,
+            project: session.project,
+            user_prompt: session.userPrompt,
+            last_assistant_message: message.last_assistant_message || ''
+          }, mode);
+
+          // Add to conversation history and query Gemini with full context
+          session.conversationHistory.push({ role: 'user', content: summaryPrompt });
+          const summaryResponse = await this.queryGeminiMultiTurn(session.conversationHistory, apiKey, model, rateLimitingEnabled);
+
+          let tokensUsed = 0;
+          if (summaryResponse.content) {
+            // Add response to conversation history
+            session.conversationHistory.push({ role: 'assistant', content: summaryResponse.content });
+
+            tokensUsed = summaryResponse.tokensUsed || 0;
+            session.cumulativeInputTokens += Math.floor(tokensUsed * 0.7);
+            session.cumulativeOutputTokens += Math.floor(tokensUsed * 0.3);
+          }
+
+          // Process response using shared ResponseProcessor
+          if (summaryResponse.content) {
+            await processAgentResponse(
+              summaryResponse.content,
+              session,
+              this.dbManager,
+              this.sessionManager,
+              worker,
+              tokensUsed,
+              originalTimestamp,
+              'Gemini',
+              lastCwd
+            );
+          } else {
+            logger.warn('SDK', 'Empty Gemini summary response, skipping processing to preserve message', {
+              sessionId: session.sessionDbId,
+              messageId: session.processingMessageIds[session.processingMessageIds.length - 1]
+            });
+            // Don't confirm - leave message for stale recovery
+          }
         }
       }
 
-      // Check if queue is truly empty before marking session complete.
-      // Some unit tests provide lightweight store mocks without getPendingCount.
-      const finalPendingStore = this.sessionManager.getPendingMessageStore();
-      const pendingCount = typeof finalPendingStore.getPendingCount === 'function'
-        ? finalPendingStore.getPendingCount(session.sessionDbId)
-        : 0;
+      // Mark session complete
       const sessionDuration = Date.now() - session.startTime;
-
-      if (pendingCount === 0) {
-        // Only mark completed if queue is truly empty
-        this.dbManager.getSessionStore().markSessionCompleted(session.sessionDbId);
-        logger.success('SDK', 'Gemini agent completed', {
-          sessionId: session.sessionDbId,
-          duration: `${(sessionDuration / 1000).toFixed(1)}s`,
-          historyLength: session.conversationHistory.length
-        });
-      } else {
-        // Queue not empty, keep session active
-        logger.info('SDK', 'Gemini agent finished but queue not empty, keeping session active', {
-          sessionId: session.sessionDbId,
-          duration: `${(sessionDuration / 1000).toFixed(1)}s`,
-          pendingCount,
-          historyLength: session.conversationHistory.length
-        });
-      }
+      logger.success('SDK', 'Gemini agent completed', {
+        sessionId: session.sessionDbId,
+        duration: `${(sessionDuration / 1000).toFixed(1)}s`,
+        historyLength: session.conversationHistory.length
+      });
 
     } catch (error: unknown) {
       if (isAbortError(error)) {
@@ -412,20 +392,6 @@ export class GeminiAgent {
 
     if (!response.ok) {
       const error = await response.text();
-
-      // Handle 429 rate limit error - auto-decrease concurrency
-      if (response.status === 429) {
-        logger.warn('SDK', 'Gemini API returned 429 rate limit error', {
-          model,
-          status: response.status,
-          error: error.substring(0, 200)
-        });
-
-        // Trigger auto-decrease (rate-limited to once per 2 minutes)
-        const concurrencyManager = ConcurrencyManager.getInstance();
-        await concurrencyManager.handle429Error();
-      }
-
       throw new Error(`Gemini API error: ${response.status} - ${error}`);
     }
 
@@ -444,13 +410,15 @@ export class GeminiAgent {
 
   /**
    * Get Gemini configuration from settings or environment
+   * Issue #733: Uses centralized ~/.claude-mem/.env for credentials, not random project .env files
    */
   private getGeminiConfig(): { apiKey: string; model: GeminiModel; rateLimitingEnabled: boolean } {
     const settingsPath = path.join(homedir(), '.claude-mem', 'settings.json');
     const settings = SettingsDefaultsManager.loadFromFile(settingsPath);
 
-    // API key: check settings first, then environment variable
-    const apiKey = settings.CLAUDE_MEM_GEMINI_API_KEY || process.env.GEMINI_API_KEY || '';
+    // API key: check settings first, then centralized claude-mem .env (NOT process.env)
+    // This prevents Issue #733 where random project .env files could interfere
+    const apiKey = settings.CLAUDE_MEM_GEMINI_API_KEY || getCredential('GEMINI_API_KEY') || '';
 
     // Model: from settings or default, with validation
     const defaultModel: GeminiModel = 'gemini-2.5-flash';
@@ -461,6 +429,7 @@ export class GeminiAgent {
       'gemini-2.5-pro',
       'gemini-2.0-flash',
       'gemini-2.0-flash-lite',
+      'gemini-3-flash',
       'gemini-3-flash-preview',
     ];
 
@@ -484,11 +453,12 @@ export class GeminiAgent {
 
 /**
  * Check if Gemini is available (has API key configured)
+ * Issue #733: Uses centralized ~/.claude-mem/.env, not random project .env files
  */
 export function isGeminiAvailable(): boolean {
   const settingsPath = path.join(homedir(), '.claude-mem', 'settings.json');
   const settings = SettingsDefaultsManager.loadFromFile(settingsPath);
-  return !!(settings.CLAUDE_MEM_GEMINI_API_KEY || process.env.GEMINI_API_KEY);
+  return !!(settings.CLAUDE_MEM_GEMINI_API_KEY || getCredential('GEMINI_API_KEY'));
 }
 
 /**
