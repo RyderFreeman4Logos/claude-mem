@@ -20,6 +20,7 @@ import { getAuthMethodDescription } from '../shared/EnvManager.js';
 import { logger } from '../utils/logger.js';
 import { ChromaMcpManager } from './sync/ChromaMcpManager.js';
 import { ChromaSync } from './sync/ChromaSync.js';
+import { ConcurrencyManager } from './worker/ConcurrencyManager.js';
 
 // Windows: avoid repeated spawn popups when startup fails (issue #921)
 const WINDOWS_SPAWN_COOLDOWN_MS = 2 * 60 * 1000;
@@ -506,13 +507,16 @@ export class WorkerService {
           }
           // Check for sessions with pending messages but no active generator
           // Skip if last AI interaction was a quota/rate-limit error within cooldown period (5 min)
-          const recentQuotaError = this.lastAiInteraction
+          // Only apply cooldown for transient errors (rate limits, quota, connection issues, max restarts).
+          // Non-transient errors (401, config errors) should not block sweeper from retrying.
+          const TRANSIENT_PATTERNS = ['429', 'RESOURCE_EXHAUSTED', 'quota', 'rate limit', 'socket', 'ECONNREFUSED', 'ETIMEDOUT', 'Max consecutive restarts'];
+          const recentTransientError = this.lastAiInteraction
             && !this.lastAiInteraction.success
-            && (this.lastAiInteraction.error?.includes('429') || this.lastAiInteraction.error?.includes('RESOURCE_EXHAUSTED'))
+            && TRANSIENT_PATTERNS.some(p => this.lastAiInteraction!.error?.includes(p))
             && Date.now() - this.lastAiInteraction.timestamp < 5 * 60 * 1000;
 
-          if (recentQuotaError) {
-            logger.debug('QUEUE', 'SWEEP | skipping generator restart — quota/rate-limit cooldown active');
+          if (recentTransientError) {
+            logger.debug('QUEUE', `SWEEP | skipping generator restart — cooldown active (${this.lastAiInteraction!.error})`);
           } else {
             const orphanedSessionIds = pendingStore.getSessionsWithPendingMessages();
             const sessionsToRestart = orphanedSessionIds.filter(id => {
@@ -520,8 +524,21 @@ export class WorkerService {
               return !session?.generatorPromise;
             });
             if (sessionsToRestart.length > 0) {
-              logger.info('QUEUE', `SWEEP | found ${sessionsToRestart.length} session(s) with pending work but no generator, restarting`);
-              await this.processPendingQueues(3);
+              // Use ConcurrencyManager limit, accounting for already-active sessions
+              const maxSessions = ConcurrencyManager.getInstance().getConcurrency();
+              const activeSessions = this.sessionManager.getActiveSessionCount();
+              const availableSlots = Math.max(0, maxSessions - activeSessions);
+
+              if (availableSlots > 0) {
+                logger.info('QUEUE', `SWEEP | found ${sessionsToRestart.length} session(s) with pending work but no generator, restarting up to ${availableSlots}`, {
+                  maxSessions, activeSessions, availableSlots
+                });
+                await this.processPendingQueues(availableSlots);
+              } else {
+                logger.debug('QUEUE', `SWEEP | ${sessionsToRestart.length} session(s) need restart but concurrency limit reached`, {
+                  maxSessions, activeSessions
+                });
+              }
             }
           }
         } catch (e) {
@@ -530,9 +547,10 @@ export class WorkerService {
       }, 90_000);
 
       // Auto-recover orphaned queues (fire-and-forget with error logging)
-      // Limit to 3 concurrent sessions to prevent memory explosion from parallel AI calls.
+      // Use ConcurrencyManager limit for startup recovery, accounting for already-active sessions.
       // Previous default of 50 caused OOM → GC death spiral on large backlogs.
-      this.processPendingQueues(3).then(result => {
+      const startupLimit = ConcurrencyManager.getInstance().getConcurrency();
+      this.processPendingQueues(startupLimit).then(result => {
         if (result.sessionsStarted > 0) {
           logger.info('SYSTEM', `Auto-recovered ${result.sessionsStarted} sessions with pending work`, {
             totalPending: result.totalPendingSessions,
@@ -734,16 +752,21 @@ export class WorkerService {
           session.consecutiveRestarts = (session.consecutiveRestarts || 0) + 1;
 
           if (session.consecutiveRestarts > MAX_CONSECUTIVE_RESTARTS) {
-            logger.error('SYSTEM', 'Session hit max consecutive restarts, abandoning remaining messages', {
+            logger.error('SYSTEM', 'Session hit max consecutive restarts, pausing session (messages stay pending for later retry)', {
               sessionId: session.sessionDbId,
               pendingCount,
               consecutiveRestarts: session.consecutiveRestarts
             });
-            // Mark remaining pending messages as failed to prevent future restart loops
-            const abandoned = pendingStore.markAllSessionMessagesAbandoned(session.sessionDbId);
-            logger.warn('SYSTEM', `Marked ${abandoned} messages as failed after max restarts`, {
-              sessionId: session.sessionDbId
-            });
+            // Reset consecutive restarts so sweeper can retry later with a fresh start.
+            // Messages stay as pending — the sweeper will pick them up after cooldown.
+            session.consecutiveRestarts = 0;
+            // Record failure so sweeper respects cooldown before retrying this session
+            this.lastAiInteraction = {
+              timestamp: Date.now(),
+              success: false,
+              provider: 'unknown',
+              error: 'Max consecutive restarts reached — paused for cooldown',
+            };
             this.broadcastProcessingStatus();
             return;
           }
@@ -822,13 +845,14 @@ export class WorkerService {
       }
     }
 
-    // No fallback or both failed: mark messages abandoned and remove session so queue doesn't grow
+    // No fallback or both failed: leave messages as pending for sweeper to retry later.
+    // Previously this called markAllSessionMessagesAbandoned() which permanently failed messages.
     const pendingStore = this.sessionManager.getPendingMessageStore();
-    const abandoned = pendingStore.markAllSessionMessagesAbandoned(sessionDbId);
-    if (abandoned > 0) {
-      logger.warn('SDK', 'No fallback available; marked pending messages abandoned', {
+    const pendingCount = pendingStore.getPendingCount(sessionDbId);
+    if (pendingCount > 0) {
+      logger.warn('SDK', 'No fallback available; messages stay pending for later retry by sweeper', {
         sessionId: sessionDbId,
-        abandoned
+        pendingCount
       });
     }
     this.sessionManager.removeSessionImmediate(sessionDbId);
@@ -871,15 +895,16 @@ export class WorkerService {
 
         logger.info('SYSTEM', `Marked ${ids.length} stale sessions as failed`);
 
-        const msgResult = sessionStore.db.prepare(`
-          UPDATE pending_messages
-          SET status = 'failed', failed_at_epoch = ?
+        // Leave pending messages as-is (don't mark them failed).
+        // The sweeper will pick them up and restart generators for these sessions.
+        const pendingMsgCount = sessionStore.db.prepare(`
+          SELECT COUNT(*) as count FROM pending_messages
           WHERE status = 'pending'
           AND session_db_id IN (${placeholders})
-        `).run(Date.now(), ...ids);
+        `).get(...ids) as { count: number } | undefined;
 
-        if (msgResult.changes > 0) {
-          logger.info('SYSTEM', `Marked ${msgResult.changes} pending messages from stale sessions as failed`);
+        if (pendingMsgCount && pendingMsgCount.count > 0) {
+          logger.info('SYSTEM', `${pendingMsgCount.count} pending messages from stale sessions preserved for retry`);
         }
       }
     } catch (error) {
@@ -910,12 +935,27 @@ export class WorkerService {
       });
     }
 
-    logger.info('SYSTEM', `Processing up to ${sessionLimit} of ${orphanedSessionIds.length} pending session queues`, {
-      totalPendingMessages
+    // Enforce global concurrency: cap sessionLimit by (configured max - already active)
+    const maxConcurrency = ConcurrencyManager.getInstance().getConcurrency();
+    const currentActive = this.sessionManager.getActiveSessionCount();
+    const effectiveLimit = Math.min(sessionLimit, Math.max(0, maxConcurrency - currentActive));
+
+    logger.info('SYSTEM', `Processing up to ${effectiveLimit} of ${orphanedSessionIds.length} pending session queues`, {
+      totalPendingMessages,
+      maxConcurrency,
+      currentActive,
+      requestedLimit: sessionLimit
     });
 
+    if (effectiveLimit === 0) {
+      logger.debug('SYSTEM', 'Concurrency limit reached, skipping new session starts', {
+        maxConcurrency, currentActive
+      });
+      return result;
+    }
+
     for (const sessionDbId of orphanedSessionIds) {
-      if (result.sessionsStarted >= sessionLimit) break;
+      if (result.sessionsStarted >= effectiveLimit) break;
 
       try {
         const existingSession = this.sessionManager.getSession(sessionDbId);
