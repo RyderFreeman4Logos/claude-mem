@@ -181,6 +181,12 @@ export class WorkerService {
   // Stale session reaper interval (Issue #1168)
   private staleSessionReaperInterval: ReturnType<typeof setInterval> | null = null;
 
+  // Memory self-monitor interval (prevents GC death spiral)
+  private memoryMonitorInterval: ReturnType<typeof setInterval> | null = null;
+
+  // Stale processing message sweeper interval
+  private staleMessageSweeperInterval: ReturnType<typeof setInterval> | null = null;
+
   // AI interaction tracking for health endpoint
   private lastAiInteraction: {
     timestamp: number;
@@ -457,6 +463,25 @@ export class WorkerService {
       });
       logger.info('SYSTEM', 'Started orphan reaper (runs every 5 minutes)');
 
+      // Self-monitor memory usage to prevent GC death spirals.
+      // When Bun's RSS exceeds the soft limit, log a warning.
+      // When it exceeds the hard limit, force exit — the wrapper handles restart.
+      const MEMORY_SOFT_LIMIT_MB = 2048;
+      const MEMORY_HARD_LIMIT_MB = 4096;
+      this.memoryMonitorInterval = setInterval(() => {
+        const rss = process.memoryUsage.rss();
+        const rssMb = Math.round(rss / 1024 / 1024);
+        if (rssMb > MEMORY_HARD_LIMIT_MB) {
+          logger.error('SYSTEM', `RSS ${rssMb}MB exceeds hard limit ${MEMORY_HARD_LIMIT_MB}MB — forcing exit to prevent GC death spiral`);
+          removePidFile();
+          process.exit(1);
+        } else if (rssMb > MEMORY_SOFT_LIMIT_MB) {
+          logger.warn('SYSTEM', `RSS ${rssMb}MB exceeds soft limit ${MEMORY_SOFT_LIMIT_MB}MB — consider investigating`, {
+            rssMb, heapUsedMb: Math.round(process.memoryUsage().heapUsed / 1024 / 1024)
+          });
+        }
+      }, 60_000);
+
       // Reap stale sessions to unblock orphan process cleanup (Issue #1168)
       this.staleSessionReaperInterval = setInterval(async () => {
         try {
@@ -469,8 +494,35 @@ export class WorkerService {
         }
       }, 2 * 60 * 1000);
 
+      // Sweep stale 'processing' messages back to 'pending' every 90 seconds,
+      // then restart generators for any sessions with pending work but no active generator.
+      // claimNextMessage() self-heals per-session, but only when a generator is running.
+      // When a generator exits (idle timeout, crash), orphaned messages are never reclaimed.
+      this.staleMessageSweeperInterval = setInterval(async () => {
+        try {
+          const swept = pendingStore.resetStaleProcessingMessages(90_000); // 90s threshold
+          if (swept > 0) {
+            logger.info('QUEUE', `SWEEP | reset ${swept} stale processing message(s) to pending`);
+          }
+          // Check for sessions with pending messages but no active generator
+          const orphanedSessionIds = pendingStore.getSessionsWithPendingMessages();
+          const sessionsToRestart = orphanedSessionIds.filter(id => {
+            const session = this.sessionManager.getSession(id);
+            return !session?.generatorPromise;
+          });
+          if (sessionsToRestart.length > 0) {
+            logger.info('QUEUE', `SWEEP | found ${sessionsToRestart.length} session(s) with pending work but no generator, restarting`);
+            await this.processPendingQueues(3);
+          }
+        } catch (e) {
+          logger.error('QUEUE', 'Stale message sweeper error', { error: e instanceof Error ? e.message : String(e) });
+        }
+      }, 90_000);
+
       // Auto-recover orphaned queues (fire-and-forget with error logging)
-      this.processPendingQueues(50).then(result => {
+      // Limit to 3 concurrent sessions to prevent memory explosion from parallel AI calls.
+      // Previous default of 50 caused OOM → GC death spiral on large backlogs.
+      this.processPendingQueues(3).then(result => {
         if (result.sessionsStarted > 0) {
           logger.info('SYSTEM', `Auto-recovered ${result.sessionsStarted} sessions with pending work`, {
             totalPending: result.totalPendingSessions,
@@ -543,6 +595,8 @@ export class WorkerService {
           'ENOENT',
           'spawn',
           'Invalid API key',
+          'Missing Authentication',  // 401 — bad key or missing header, won't self-heal
+          '401 -',                    // OpenRouter/API 401 response code
         ];
         if (unrecoverablePatterns.some(pattern => errorMessage.includes(pattern))) {
           hadUnrecoverableError = true;
@@ -613,6 +667,8 @@ export class WorkerService {
             success: true,
             provider: providerName,
           };
+          // Reset consecutive restart counter on successful processing
+          session.consecutiveRestarts = 0;
         }
 
         // Do NOT restart after unrecoverable errors - prevents infinite loops
@@ -643,9 +699,30 @@ export class WorkerService {
         const pendingCount = pendingStore.getPendingCount(session.sessionDbId);
 
         if (pendingCount > 0) {
+          // Guard against infinite restart loops: if the generator keeps failing
+          // without processing any messages, stop retrying after MAX_CONSECUTIVE_RESTARTS.
+          const MAX_CONSECUTIVE_RESTARTS = 5;
+          session.consecutiveRestarts = (session.consecutiveRestarts || 0) + 1;
+
+          if (session.consecutiveRestarts > MAX_CONSECUTIVE_RESTARTS) {
+            logger.error('SYSTEM', 'Session hit max consecutive restarts, abandoning remaining messages', {
+              sessionId: session.sessionDbId,
+              pendingCount,
+              consecutiveRestarts: session.consecutiveRestarts
+            });
+            // Mark remaining pending messages as failed to prevent future restart loops
+            const abandoned = pendingStore.markAllSessionMessagesAbandoned(session.sessionDbId);
+            logger.warn('SYSTEM', `Marked ${abandoned} messages as failed after max restarts`, {
+              sessionId: session.sessionDbId
+            });
+            this.broadcastProcessingStatus();
+            return;
+          }
+
           logger.info('SYSTEM', 'Pending work remains after generator exit, restarting with fresh AbortController', {
             sessionId: session.sessionDbId,
-            pendingCount
+            pendingCount,
+            consecutiveRestarts: session.consecutiveRestarts
           });
           // Reset AbortController for restart
           session.abortController = new AbortController();
@@ -791,7 +868,22 @@ export class WorkerService {
 
     if (orphanedSessionIds.length === 0) return result;
 
-    logger.info('SYSTEM', `Processing up to ${sessionLimit} of ${orphanedSessionIds.length} pending session queues`);
+    // Count total pending messages across all sessions for diagnostics
+    const totalPendingMessages = orphanedSessionIds.reduce(
+      (sum, id) => sum + pendingStore.getPendingCount(id), 0
+    );
+
+    if (totalPendingMessages > 500) {
+      logger.warn('SYSTEM', 'Large pending message backlog detected — processing will be throttled', {
+        totalSessions: orphanedSessionIds.length,
+        totalMessages: totalPendingMessages,
+        sessionLimit
+      });
+    }
+
+    logger.info('SYSTEM', `Processing up to ${sessionLimit} of ${orphanedSessionIds.length} pending session queues`, {
+      totalPendingMessages
+    });
 
     for (const sessionDbId of orphanedSessionIds) {
       if (result.sessionsStarted >= sessionLimit) break;
@@ -804,16 +896,19 @@ export class WorkerService {
         }
 
         const session = this.sessionManager.initializeSession(sessionDbId);
+        const sessionPendingCount = pendingStore.getPendingCount(sessionDbId);
         logger.info('SYSTEM', `Starting processor for session ${sessionDbId}`, {
           project: session.project,
-          pendingCount: pendingStore.getPendingCount(sessionDbId)
+          pendingCount: sessionPendingCount
         });
 
         this.startSessionProcessor(session, 'startup-recovery');
         result.sessionsStarted++;
         result.startedSessionIds.push(sessionDbId);
 
-        await new Promise(resolve => setTimeout(resolve, 100));
+        // Stagger session starts to avoid concurrent AI call stampede.
+        // 100ms was far too aggressive with large backlogs.
+        await new Promise(resolve => setTimeout(resolve, 2000));
       } catch (error) {
         logger.error('SYSTEM', `Failed to process session ${sessionDbId}`, {}, error as Error);
         result.sessionsSkipped++;
@@ -837,6 +932,18 @@ export class WorkerService {
     if (this.staleSessionReaperInterval) {
       clearInterval(this.staleSessionReaperInterval);
       this.staleSessionReaperInterval = null;
+    }
+
+    // Stop memory monitor
+    if (this.memoryMonitorInterval) {
+      clearInterval(this.memoryMonitorInterval);
+      this.memoryMonitorInterval = null;
+    }
+
+    // Stop stale message sweeper
+    if (this.staleMessageSweeperInterval) {
+      clearInterval(this.staleMessageSweeperInterval);
+      this.staleMessageSweeperInterval = null;
     }
 
     await performGracefulShutdown({
@@ -955,6 +1062,20 @@ async function ensureWorkerStarted(port: number): Promise<boolean> {
 // ============================================================================
 
 async function main() {
+  // Prevent ANY execution mode from dying silently on unhandled errors.
+  // Previously only registered in --daemon mode, leaving hook in-process workers
+  // and other CLI commands unprotected (Issue #1195).
+  process.on('unhandledRejection', (reason) => {
+    logger.error('SYSTEM', 'Unhandled rejection', {
+      reason: reason instanceof Error ? reason.message : String(reason)
+    });
+    // Don't exit — keep the process running
+  });
+  process.on('uncaughtException', (error) => {
+    logger.error('SYSTEM', 'Uncaught exception', {}, error as Error);
+    // Don't exit — keep the process running
+  });
+
   const command = process.argv[2];
   const port = getWorkerPort();
 
@@ -1127,17 +1248,8 @@ async function main() {
         process.exit(0);
       }
 
-      // Prevent daemon from dying silently on unhandled errors.
-      // The HTTP server can continue serving even if a background task throws.
-      process.on('unhandledRejection', (reason) => {
-        logger.error('SYSTEM', 'Unhandled rejection in daemon', {
-          reason: reason instanceof Error ? reason.message : String(reason)
-        });
-      });
-      process.on('uncaughtException', (error) => {
-        logger.error('SYSTEM', 'Uncaught exception in daemon', {}, error as Error);
-        // Don't exit — keep the HTTP server running
-      });
+      // Note: unhandled rejection/exception handlers are registered at the top of main()
+      // covering all execution modes (Issue #1195).
 
       const worker = new WorkerService();
       worker.start().catch((error) => {

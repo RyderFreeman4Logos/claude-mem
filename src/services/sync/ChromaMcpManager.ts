@@ -117,6 +117,15 @@ export class ChromaMcpManager {
       stderr: 'pipe'
     });
 
+    // Capture subprocess stderr for diagnostics on startup failure (Issue #1193).
+    // Without this, permission errors from uvx/Python are silently swallowed and
+    // users see only a generic "Chroma server not reachable" message.
+    const stderrChunks: Buffer[] = [];
+    const stderrStream = this.transport.stderr;
+    if (stderrStream) {
+      stderrStream.on('data', (chunk: Buffer) => stderrChunks.push(chunk));
+    }
+
     this.client = new Client(
       { name: CHROMA_MCP_CLIENT_NAME, version: CHROMA_MCP_CLIENT_VERSION },
       { capabilities: {} }
@@ -136,8 +145,19 @@ export class ChromaMcpManager {
     } catch (connectionError) {
       // Connection failed or timed out - kill the subprocess to prevent zombies
       clearTimeout(timeoutId!);
+
+      // Surface subprocess stderr so the actual root cause is visible (Issue #1193)
+      const stderrOutput = Buffer.concat(stderrChunks).toString().trim();
+      if (stderrOutput) {
+        logger.error('CHROMA_MCP', 'Subprocess stderr on connection failure', { stderr: stderrOutput.slice(0, 2000) });
+      }
+
+      const baseMsg = connectionError instanceof Error ? connectionError.message : String(connectionError);
+      const diagnosticMsg = stderrOutput
+        ? `${baseMsg} | subprocess stderr: ${stderrOutput.slice(0, 500)}`
+        : baseMsg;
       logger.warn('CHROMA_MCP', 'Connection failed, killing subprocess to prevent zombie', {
-        error: connectionError instanceof Error ? connectionError.message : String(connectionError)
+        error: diagnosticMsg
       });
       try { await this.transport.close(); } catch { /* best effort */ }
       try { await this.client.close(); } catch { /* best effort */ }

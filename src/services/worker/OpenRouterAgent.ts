@@ -29,7 +29,19 @@ import {
 } from './agents/index.js';
 
 // OpenRouter API endpoint
-const OPENROUTER_API_URL = 'https://openrouter.ai/api/v1/chat/completions';
+// Use configured base URL if available, fall back to OpenRouter public API.
+// Users may set CLAUDE_MEM_OPENROUTER_BASE_URL to a local proxy or alternative endpoint.
+function getOpenRouterApiUrl(): string {
+  try {
+    const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
+    if (settings.CLAUDE_MEM_OPENROUTER_BASE_URL) {
+      return settings.CLAUDE_MEM_OPENROUTER_BASE_URL;
+    }
+  } catch {
+    // Settings not available — use default
+  }
+  return 'https://openrouter.ai/api/v1/chat/completions';
+}
 
 // Context window management constants (defaults, overridable via settings)
 const DEFAULT_MAX_CONTEXT_MESSAGES = 20;  // Maximum messages to keep in conversation history
@@ -346,7 +358,8 @@ export class OpenRouterAgent {
 
   /**
    * Query OpenRouter via REST API with full conversation history (multi-turn)
-   * Sends the entire conversation context for coherent responses
+   * Sends the entire conversation context for coherent responses.
+   * Retries on 429 (rate limit) and 5xx (server error) with exponential backoff (Issue #1194).
    */
   private async queryOpenRouterMultiTurn(
     history: ConversationMessage[],
@@ -367,26 +380,66 @@ export class OpenRouterAgent {
       estimatedTokens
     });
 
-    const response = await fetch(OPENROUTER_API_URL, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'HTTP-Referer': siteUrl || 'https://github.com/thedotmack/claude-mem',
-        'X-Title': appName || 'claude-mem',
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model,
-        messages,
-        temperature: 0.3,  // Lower temperature for structured extraction
-        max_tokens: 4096,
-      }),
-    });
+    const MAX_RETRIES = 3;
+    const BASE_DELAY_MS = 2000;
 
-    if (!response.ok) {
+    let lastError: Error | null = null;
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      const response = await fetch(getOpenRouterApiUrl(), {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'HTTP-Referer': siteUrl || 'https://github.com/thedotmack/claude-mem',
+          'X-Title': appName || 'claude-mem',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model,
+          messages,
+          temperature: 0.3,  // Lower temperature for structured extraction
+          max_tokens: 4096,
+        }),
+      });
+
+      if (response.ok) {
+        return this.parseOpenRouterResponse(response, truncatedHistory, model);
+      }
+
       const errorText = await response.text();
-      throw new Error(`OpenRouter API error: ${response.status} - ${errorText}`);
+      const isRetryable = response.status === 429 || response.status >= 500;
+
+      if (!isRetryable || attempt === MAX_RETRIES) {
+        throw new Error(`OpenRouter API error: ${response.status} - ${errorText}`);
+      }
+
+      // Respect Retry-After header if present, otherwise use exponential backoff
+      const retryAfter = response.headers.get('retry-after');
+      const delayMs = retryAfter
+        ? parseInt(retryAfter, 10) * 1000
+        : BASE_DELAY_MS * Math.pow(2, attempt);
+
+      logger.warn('SDK', `OpenRouter ${response.status}, retrying in ${delayMs}ms`, {
+        attempt: attempt + 1,
+        maxRetries: MAX_RETRIES,
+        status: response.status,
+        model
+      });
+
+      await new Promise(resolve => setTimeout(resolve, delayMs));
     }
+
+    // Should not reach here, but TypeScript needs it
+    throw lastError || new Error('OpenRouter request failed after retries');
+  }
+
+  /**
+   * Parse a successful OpenRouter response, extracting content and token usage
+   */
+  private async parseOpenRouterResponse(
+    response: Response,
+    truncatedHistory: ConversationMessage[],
+    model: string
+  ): Promise<{ content: string; tokensUsed?: number }> {
 
     const data = await response.json() as OpenRouterResponse;
 

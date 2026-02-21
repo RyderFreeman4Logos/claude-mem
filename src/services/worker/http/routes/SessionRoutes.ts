@@ -205,9 +205,28 @@ export class SessionRoutes extends BaseRouteHandler {
             const pendingCount = pendingStore.getPendingCount(sessionDbId);
 
             if (pendingCount > 0) {
+              // Guard against infinite restart loops (same protection as startSessionProcessor)
+              const MAX_CONSECUTIVE_RESTARTS = 5;
+              session.consecutiveRestarts = (session.consecutiveRestarts || 0) + 1;
+
+              if (session.consecutiveRestarts > MAX_CONSECUTIVE_RESTARTS) {
+                logger.error('SESSION', 'Session hit max consecutive restarts via SessionRoutes, abandoning', {
+                  sessionId: sessionDbId,
+                  pendingCount,
+                  consecutiveRestarts: session.consecutiveRestarts
+                });
+                const abandoned = pendingStore.markAllSessionMessagesAbandoned(sessionDbId);
+                logger.warn('SESSION', `Marked ${abandoned} messages as failed after max restarts`, {
+                  sessionId: sessionDbId
+                });
+                this.workerService.broadcastProcessingStatus();
+                return;
+              }
+
               logger.info('SESSION', `Restarting generator after crash/exit with pending work`, {
                 sessionId: sessionDbId,
-                pendingCount
+                pendingCount,
+                consecutiveRestarts: session.consecutiveRestarts
               });
 
               // CRITICAL: Only replace controller if it hasn't been replaced by another generator

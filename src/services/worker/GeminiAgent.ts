@@ -373,39 +373,65 @@ export class GeminiAgent {
 
     const url = `${GEMINI_API_URL}/${model}:generateContent?key=${apiKey}`;
 
-    // Enforce RPM rate limit for free tier (skipped if rate limiting disabled)
-    await enforceRateLimitForModel(model, rateLimitingEnabled);
+    const MAX_RETRIES = 3;
+    const BASE_DELAY_MS = 2000;
 
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        contents,
-        generationConfig: {
-          temperature: 0.3,  // Lower temperature for structured extraction
-          maxOutputTokens: 4096,
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      // Enforce RPM rate limit for free tier (skipped if rate limiting disabled)
+      await enforceRateLimitForModel(model, rateLimitingEnabled);
+
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
         },
-      }),
-    });
+        body: JSON.stringify({
+          contents,
+          generationConfig: {
+            temperature: 0.3,  // Lower temperature for structured extraction
+            maxOutputTokens: 4096,
+          },
+        }),
+      });
 
-    if (!response.ok) {
-      const error = await response.text();
-      throw new Error(`Gemini API error: ${response.status} - ${error}`);
+      if (response.ok) {
+        const data = await response.json() as GeminiResponse;
+
+        if (!data.candidates?.[0]?.content?.parts?.[0]?.text) {
+          logger.error('SDK', 'Empty response from Gemini');
+          return { content: '' };
+        }
+
+        const content = data.candidates[0].content.parts[0].text;
+        const tokensUsed = data.usageMetadata?.totalTokenCount;
+
+        return { content, tokensUsed };
+      }
+
+      // Not ok — check if retryable
+      const errorText = await response.text();
+      const isRetryable = response.status === 429 || response.status >= 500;
+
+      if (isRetryable && attempt < MAX_RETRIES) {
+        // Parse "Please retry in Xs" from Gemini 429 responses
+        let delayMs = BASE_DELAY_MS * Math.pow(2, attempt);
+        const retryMatch = errorText.match(/retry in ([\d.]+)s/i);
+        if (retryMatch) {
+          delayMs = Math.ceil(parseFloat(retryMatch[1]) * 1000) + 500; // server-suggested + 500ms buffer
+        }
+        logger.warn('SDK', `Gemini ${response.status}, retrying in ${delayMs}ms`, {
+          attempt: attempt + 1, maxRetries: MAX_RETRIES, status: response.status, model
+        });
+        await new Promise(resolve => setTimeout(resolve, delayMs));
+        continue;
+      }
+
+      // Not retryable or max retries exhausted — fail immediately
+      throw new Error(`Gemini API error: ${response.status} - ${errorText}`);
     }
 
-    const data = await response.json() as GeminiResponse;
-
-    if (!data.candidates?.[0]?.content?.parts?.[0]?.text) {
-      logger.error('SDK', 'Empty response from Gemini');
-      return { content: '' };
-    }
-
-    const content = data.candidates[0].content.parts[0].text;
-    const tokensUsed = data.usageMetadata?.totalTokenCount;
-
-    return { content, tokensUsed };
+    // Should not reach here — loop always returns or throws
+    throw new Error('Gemini API: max retries exceeded');
   }
 
   /**
