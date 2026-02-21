@@ -276,11 +276,22 @@ export class OpenRouterAgent {
         throw error;
       }
 
-      // Check if we should fall back to Claude
+      // Rate limit / quota exhaustion: graceful pause, DON'T fall back or restart
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      if (errorMsg.includes('429') || errorMsg.includes('rate limit') || errorMsg.includes('quota')) {
+        logger.warn('SDK', 'OpenRouter rate limit / quota exhausted, pausing session gracefully', {
+          sessionDbId: session.sessionDbId,
+          error: errorMsg
+        });
+        session.quotaPaused = true;
+        return; // graceful exit — messages stay pending for later retry
+      }
+
+      // Check if we should fall back to Claude (non-quota errors only)
       if (shouldFallbackToClaude(error) && this.fallbackAgent) {
         logger.warn('SDK', 'OpenRouter API failed, falling back to Claude SDK', {
           sessionDbId: session.sessionDbId,
-          error: error instanceof Error ? error.message : String(error),
+          error: errorMsg,
           historyLength: session.conversationHistory.length
         });
 

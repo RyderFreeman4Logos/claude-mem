@@ -324,11 +324,24 @@ export class GeminiAgent {
         throw error;
       }
 
-      // Check if we should fall back to Claude
+      // Rate limit / quota exhaustion: graceful pause, DON'T fall back or restart
+      // Quota errors are temporary — messages stay pending for later retry when quota resets.
+      // Falling back to Claude wastes credits and triggers restart→abandon chains.
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      if (errorMsg.includes('429') || errorMsg.includes('RESOURCE_EXHAUSTED') || errorMsg.includes('quota')) {
+        logger.warn('SDK', 'Gemini rate limit / quota exhausted, pausing session gracefully', {
+          sessionDbId: session.sessionDbId,
+          error: errorMsg
+        });
+        session.quotaPaused = true;
+        return; // graceful exit — processing message recovered by sweeper, pending messages stay pending
+      }
+
+      // Check if we should fall back to Claude (non-quota errors only)
       if (shouldFallbackToClaude(error) && this.fallbackAgent) {
         logger.warn('SDK', 'Gemini API failed, falling back to Claude SDK', {
           sessionDbId: session.sessionDbId,
-          error: error instanceof Error ? error.message : String(error),
+          error: errorMsg,
           historyLength: session.conversationHistory.length
         });
 

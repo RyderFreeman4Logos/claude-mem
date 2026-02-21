@@ -505,14 +505,24 @@ export class WorkerService {
             logger.info('QUEUE', `SWEEP | reset ${swept} stale processing message(s) to pending`);
           }
           // Check for sessions with pending messages but no active generator
-          const orphanedSessionIds = pendingStore.getSessionsWithPendingMessages();
-          const sessionsToRestart = orphanedSessionIds.filter(id => {
-            const session = this.sessionManager.getSession(id);
-            return !session?.generatorPromise;
-          });
-          if (sessionsToRestart.length > 0) {
-            logger.info('QUEUE', `SWEEP | found ${sessionsToRestart.length} session(s) with pending work but no generator, restarting`);
-            await this.processPendingQueues(3);
+          // Skip if last AI interaction was a quota/rate-limit error within cooldown period (5 min)
+          const recentQuotaError = this.lastAiInteraction
+            && !this.lastAiInteraction.success
+            && (this.lastAiInteraction.error?.includes('429') || this.lastAiInteraction.error?.includes('RESOURCE_EXHAUSTED'))
+            && Date.now() - this.lastAiInteraction.timestamp < 5 * 60 * 1000;
+
+          if (recentQuotaError) {
+            logger.debug('QUEUE', 'SWEEP | skipping generator restart — quota/rate-limit cooldown active');
+          } else {
+            const orphanedSessionIds = pendingStore.getSessionsWithPendingMessages();
+            const sessionsToRestart = orphanedSessionIds.filter(id => {
+              const session = this.sessionManager.getSession(id);
+              return !session?.generatorPromise;
+            });
+            if (sessionsToRestart.length > 0) {
+              logger.info('QUEUE', `SWEEP | found ${sessionsToRestart.length} session(s) with pending work but no generator, restarting`);
+              await this.processPendingQueues(3);
+            }
           }
         } catch (e) {
           logger.error('QUEUE', 'Stale message sweeper error', { error: e instanceof Error ? e.message : String(e) });
@@ -660,8 +670,16 @@ export class WorkerService {
 
         session.generatorPromise = null;
 
-        // Record successful AI interaction if no error occurred
-        if (!sessionFailed && !hadUnrecoverableError) {
+        // Record AI interaction result
+        if (session.quotaPaused) {
+          // Quota exhaustion: record as failed so sweeper respects cooldown
+          this.lastAiInteraction = {
+            timestamp: Date.now(),
+            success: false,
+            provider: providerName,
+            error: 'Rate limit / quota exhausted (429)',
+          };
+        } else if (!sessionFailed && !hadUnrecoverableError) {
           this.lastAiInteraction = {
             timestamp: Date.now(),
             success: true,
@@ -691,6 +709,17 @@ export class WorkerService {
             sessionId: session.sessionDbId
           });
           session.idleTimedOut = false; // Reset flag
+          this.broadcastProcessingStatus();
+          return;
+        }
+
+        // Rate limit / quota exhaustion — don't restart, messages stay pending for later retry
+        // The sweeper will attempt restart after a cooldown period
+        if (session.quotaPaused) {
+          logger.warn('SYSTEM', 'Generator paused due to rate limit / quota exhaustion, not restarting', {
+            sessionId: session.sessionDbId
+          });
+          session.quotaPaused = false; // Reset flag
           this.broadcastProcessingStatus();
           return;
         }
