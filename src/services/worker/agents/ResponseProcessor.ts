@@ -100,6 +100,17 @@ export async function processAgentResponse(
     memorySessionId: session.memorySessionId
   });
 
+  // CLAIM-CONFIRM: Delete processed messages from pending queue
+  // Messages were claimed as 'processing' by claimNextMessage(); now that storage succeeded, remove them
+  if (session.processingMessageIds.length > 0) {
+    const pendingStore = sessionManager.getPendingMessageStore();
+    for (const msgId of session.processingMessageIds) {
+      pendingStore.confirmProcessed(msgId);
+    }
+    logger.info('QUEUE', `CONFIRMED | sessionDbId=${session.sessionDbId} | confirmed=${session.processingMessageIds.length} msgIds=[${session.processingMessageIds.join(',')}]`);
+    session.processingMessageIds = [];
+  }
+
   // AFTER transaction commits - async operations (can fail safely without data loss)
   await syncAndBroadcastObservations(
     observations,

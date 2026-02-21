@@ -516,7 +516,7 @@ export class WorkerService {
             && Date.now() - this.lastAiInteraction.timestamp < 5 * 60 * 1000;
 
           if (recentTransientError) {
-            logger.debug('QUEUE', `SWEEP | skipping generator restart — cooldown active (${this.lastAiInteraction!.error})`);
+            logger.info('QUEUE', `SWEEP | skipping generator restart — cooldown active (${this.lastAiInteraction!.error})`);
           } else {
             const orphanedSessionIds = pendingStore.getSessionsWithPendingMessages();
             const sessionsToRestart = orphanedSessionIds.filter(id => {
@@ -535,7 +535,7 @@ export class WorkerService {
                 });
                 await this.processPendingQueues(availableSlots);
               } else {
-                logger.debug('QUEUE', `SWEEP | ${sessionsToRestart.length} session(s) need restart but concurrency limit reached`, {
+                logger.info('QUEUE', `SWEEP | ${sessionsToRestart.length} session(s) need restart but concurrency limit reached`, {
                   maxSessions, activeSessions
                 });
               }
@@ -771,15 +771,43 @@ export class WorkerService {
             return;
           }
 
-          logger.info('SYSTEM', 'Pending work remains after generator exit, restarting with fresh AbortController', {
+          // Check concurrency before restarting — prevents stampede when multiple
+          // sessions fail simultaneously and all try to restart at once.
+          const maxConcurrency = ConcurrencyManager.getInstance().getConcurrency();
+          const currentActive = this.sessionManager.getActiveSessionCount();
+          if (currentActive > maxConcurrency) {
+            logger.info('SYSTEM', 'Deferring restart to sweeper — concurrency limit reached', {
+              sessionId: session.sessionDbId,
+              pendingCount,
+              maxConcurrency,
+              currentActive
+            });
+            this.broadcastProcessingStatus();
+            return;
+          }
+
+          // Stagger restart with random delay (1-5s) to avoid all sessions
+          // hitting the API at the exact same millisecond after a bulk failure.
+          const staggerMs = 1000 + Math.floor(Math.random() * 4000);
+          logger.info('SYSTEM', `Pending work remains, restarting after ${staggerMs}ms stagger`, {
             sessionId: session.sessionDbId,
             pendingCount,
             consecutiveRestarts: session.consecutiveRestarts
           });
-          // Reset AbortController for restart
-          session.abortController = new AbortController();
-          // Restart processor
-          this.startSessionProcessor(session, 'pending-work-restart');
+          setTimeout(() => {
+            // Re-check concurrency after stagger delay
+            const activeNow = this.sessionManager.getActiveSessionCount();
+            const maxNow = ConcurrencyManager.getInstance().getConcurrency();
+            if (activeNow > maxNow) {
+              logger.info('SYSTEM', 'Post-stagger restart skipped — concurrency limit reached', {
+                sessionId: session.sessionDbId
+              });
+              return;
+            }
+            // Reset AbortController for restart
+            session.abortController = new AbortController();
+            this.startSessionProcessor(session, 'pending-work-restart');
+          }, staggerMs);
         }
 
         this.broadcastProcessingStatus();
