@@ -141,7 +141,13 @@ export class WorkerService {
       getInitializationComplete: () => this.initializationCompleteFlag,
       getMcpReady: () => this.mcpReady,
       onShutdown: () => this.shutdown(),
-      onRestart: () => this.shutdown()
+      onRestart: () => this.shutdown(),
+      workerPath: process.argv[1] || 'worker-service.cjs',
+      getAiStatus: () => ({
+        provider: this.settingsManager?.getSettings()?.CLAUDE_MEM_PROVIDER || 'openrouter',
+        authMethod: 'api',
+        lastInteraction: null,
+      }),
     });
 
     // Register route handlers
