@@ -926,9 +926,8 @@ export class MigrationRunner {
    * Backfills existing rows with unique random hashes so they don't block new inserts.
    */
   private addObservationContentHashColumn(): void {
-    const applied = this.db.prepare('SELECT version FROM schema_versions WHERE version = ?').get(22) as SchemaVersion | undefined;
-    if (applied) return;
-
+    // Check column existence first (not version), because version 22 may have been
+    // recorded by a different migration in forks that renumbered local migrations.
     const tableInfo = this.db.query('PRAGMA table_info(observations)').all() as TableColumnInfo[];
     const hasColumn = tableInfo.some(col => col.name === 'content_hash');
 
@@ -949,9 +948,8 @@ export class MigrationRunner {
    * Allows callers (e.g. Maestro agents) to label sessions with a human-readable name.
    */
   private addSessionCustomTitleColumn(): void {
-    const applied = this.db.prepare('SELECT version FROM schema_versions WHERE version = ?').get(23) as SchemaVersion | undefined;
-    if (applied) return;
-
+    // Check column existence first (not version), because version 23 may have been
+    // recorded by a different migration in forks that renumbered local migrations.
     const tableInfo = this.db.query('PRAGMA table_info(sdk_sessions)').all() as TableColumnInfo[];
     const hasColumn = tableInfo.some(col => col.name === 'custom_title');
 

@@ -28,7 +28,8 @@ import {
   getPlatformTimeout,
   cleanupOrphanedProcesses,
   spawnDaemon,
-  createSignalHandler
+  createSignalHandler,
+  isProcessAlive
 } from './infrastructure/ProcessManager.js';
 import {
   isPortInUse,
@@ -744,13 +745,61 @@ async function main() {
       process.exit(cursorResult);
     }
 
+    case 'hook': {
+      // Hook commands: worker-service.cjs hook <platform> <event>
+      // Auto-start worker if not running, then dispatch to hook handler
+      const hookPlatform = process.argv[3];
+      const hookEvent = process.argv[4];
+      if (!hookPlatform || !hookEvent) {
+        console.error('Usage: claude-mem hook <platform> <event>');
+        process.exit(1);
+      }
+
+      // Check if worker is already running on port
+      const hookPortInUse = await isPortInUse(port);
+      let startedWorkerInProcess = false;
+
+      if (!hookPortInUse) {
+        // Port free - start worker IN THIS PROCESS (no spawn!)
+        try {
+          logger.info('SYSTEM', 'Starting worker in-process for hook', { event: hookEvent });
+          const hookWorker = new WorkerService();
+          await hookWorker.start();
+          startedWorkerInProcess = true;
+        } catch (error) {
+          logger.failure('SYSTEM', 'Worker failed to start in hook', {}, error as Error);
+          removePidFile();
+          process.exit(0);
+        }
+      }
+
+      const { hookCommand } = await import('../cli/hook-command.js');
+      await hookCommand(hookPlatform, hookEvent, { skipExit: startedWorkerInProcess });
+      break;
+    }
+
     case '--daemon':
     default: {
+      // GUARD 1: Refuse to start if another worker is already alive (PID check)
+      const existingPidInfo = readPidFile();
+      if (existingPidInfo && isProcessAlive(existingPidInfo.pid)) {
+        logger.info('SYSTEM', 'Worker already running (PID alive), refusing to start duplicate', {
+          existingPid: existingPidInfo.pid,
+        });
+        process.exit(0);
+      }
+
+      // GUARD 2: Refuse to start if the port is already bound
+      if (await isPortInUse(port)) {
+        logger.info('SYSTEM', 'Port already in use, refusing to start duplicate', { port });
+        process.exit(0);
+      }
+
       const worker = new WorkerService();
       worker.start().catch((error) => {
         logger.failure('SYSTEM', 'Worker failed to start', {}, error as Error);
         removePidFile();
-        process.exit(1);
+        process.exit(0);
       });
     }
   }
