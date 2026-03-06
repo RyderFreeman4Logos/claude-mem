@@ -26,11 +26,6 @@ import type { ServerOptions } from '../../src/services/server/Server.js';
 
 // Suppress logger output during tests
 let loggerSpies: ReturnType<typeof spyOn>[] = [];
-const TEST_AI_STATUS = {
-  provider: 'claude',
-  authMethod: 'test-auth',
-  lastInteraction: null,
-};
 
 describe('Worker API Endpoints Integration', () => {
   let server: Server;
@@ -50,8 +45,12 @@ describe('Worker API Endpoints Integration', () => {
       getMcpReady: () => true,
       onShutdown: mock(() => Promise.resolve()),
       onRestart: mock(() => Promise.resolve()),
-      workerPath: 'test-worker-service',
-      getAiStatus: () => TEST_AI_STATUS,
+      workerPath: '/test/worker-service.cjs',
+      getAiStatus: () => ({
+        provider: 'claude',
+        authMethod: 'cli',
+        lastInteraction: null,
+      }),
     };
 
     testPort = 40000 + Math.floor(Math.random() * 10000);
@@ -95,8 +94,8 @@ describe('Worker API Endpoints Integration', () => {
           getMcpReady: () => false,
           onShutdown: mock(() => Promise.resolve()),
           onRestart: mock(() => Promise.resolve()),
-          workerPath: 'test-worker-service',
-          getAiStatus: () => TEST_AI_STATUS,
+          workerPath: '/test/worker-service.cjs',
+          getAiStatus: () => ({ provider: 'claude', authMethod: 'cli', lastInteraction: null }),
         };
 
         server = new Server(uninitOptions);
@@ -130,8 +129,8 @@ describe('Worker API Endpoints Integration', () => {
           getMcpReady: () => false,
           onShutdown: mock(() => Promise.resolve()),
           onRestart: mock(() => Promise.resolve()),
-          workerPath: 'test-worker-service',
-          getAiStatus: () => TEST_AI_STATUS,
+          workerPath: '/test/worker-service.cjs',
+          getAiStatus: () => ({ provider: 'claude', authMethod: 'cli', lastInteraction: null }),
         };
 
         server = new Server(uninitOptions);
@@ -247,8 +246,8 @@ describe('Worker API Endpoints Integration', () => {
         getMcpReady: () => true,
         onShutdown: mock(() => Promise.resolve()),
         onRestart: mock(() => Promise.resolve()),
-        workerPath: 'test-worker-service',
-        getAiStatus: () => TEST_AI_STATUS,
+        workerPath: '/test/worker-service.cjs',
+        getAiStatus: () => ({ provider: 'claude', authMethod: 'cli', lastInteraction: null }),
       };
 
       server = new Server(dynamicOptions);
@@ -273,8 +272,8 @@ describe('Worker API Endpoints Integration', () => {
         getMcpReady: () => mcpReady,
         onShutdown: mock(() => Promise.resolve()),
         onRestart: mock(() => Promise.resolve()),
-        workerPath: 'test-worker-service',
-        getAiStatus: () => TEST_AI_STATUS,
+        workerPath: '/test/worker-service.cjs',
+        getAiStatus: () => ({ provider: 'claude', authMethod: 'cli', lastInteraction: null }),
       };
 
       server = new Server(dynamicOptions);
