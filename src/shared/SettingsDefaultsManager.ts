@@ -5,7 +5,7 @@
  * Provides methods to get defaults with optional environment variable overrides.
  */
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, watch } from 'fs';
 import { join, dirname } from 'path';
 import { homedir } from 'os';
 import { DEFAULT_OBSERVATION_TYPES_STRING, DEFAULT_OBSERVATION_CONCEPTS_STRING } from '../constants/observation-metadata.js';
@@ -20,15 +20,14 @@ export interface SettingsDefaults {
   CLAUDE_MEM_SKIP_TOOLS: string;
   // AI Provider Configuration
   CLAUDE_MEM_PROVIDER: string;  // 'claude' | 'gemini' | 'openrouter'
-  CLAUDE_MEM_CLAUDE_AUTH_METHOD: string;  // 'cli' | 'api' - how Claude provider authenticates
   CLAUDE_MEM_GEMINI_API_KEY: string;
-  CLAUDE_MEM_GEMINI_MODEL: string;  // 'gemini-2.5-flash-lite' | 'gemini-2.5-flash' | 'gemini-3-flash-preview'
+  CLAUDE_MEM_GEMINI_MODEL: string;  // 'gemini-3-flash' | 'gemini-3-pro' | 'gemini-2.5-flash' (deprecated)
   CLAUDE_MEM_GEMINI_RATE_LIMITING_ENABLED: string;  // 'true' | 'false' - enable rate limiting for free tier
   CLAUDE_MEM_OPENROUTER_API_KEY: string;
   CLAUDE_MEM_OPENROUTER_MODEL: string;
+  CLAUDE_MEM_OPENROUTER_BASE_URL: string;
   CLAUDE_MEM_OPENROUTER_SITE_URL: string;
   CLAUDE_MEM_OPENROUTER_APP_NAME: string;
-  CLAUDE_MEM_OPENROUTER_BASE_URL: string;  // Custom API endpoint (e.g., local proxy)
   CLAUDE_MEM_OPENROUTER_MAX_CONTEXT_MESSAGES: string;
   CLAUDE_MEM_OPENROUTER_MAX_TOKENS: string;
   // System Configuration
@@ -52,27 +51,14 @@ export interface SettingsDefaults {
   // Feature Toggles
   CLAUDE_MEM_CONTEXT_SHOW_LAST_SUMMARY: string;
   CLAUDE_MEM_CONTEXT_SHOW_LAST_MESSAGE: string;
-  CLAUDE_MEM_CONTEXT_SHOW_TERMINAL_OUTPUT: string;
-  CLAUDE_MEM_FOLDER_CLAUDEMD_ENABLED: string;
-  // Process Management
-  CLAUDE_MEM_MAX_CONCURRENT_AGENTS: string;  // Max concurrent Claude SDK agent subprocesses (default: 2)
-  CLAUDE_MEM_CONCURRENT_MESSAGES: string;    // Max concurrent message-processing sessions (default: 3)
-  // Exclusion Settings
-  CLAUDE_MEM_EXCLUDED_PROJECTS: string;  // Comma-separated glob patterns for excluded project paths
-  CLAUDE_MEM_FOLDER_MD_EXCLUDE: string;  // JSON array of folder paths to exclude from CLAUDE.md generation
-  // Chroma Vector Database Configuration
-  CLAUDE_MEM_CHROMA_ENABLED: string;   // 'true' | 'false' - set to 'false' for SQLite-only mode
-  CLAUDE_MEM_CHROMA_MODE: string;      // 'local' | 'remote'
-  CLAUDE_MEM_CHROMA_HOST: string;
-  CLAUDE_MEM_CHROMA_PORT: string;
-  CLAUDE_MEM_CHROMA_SSL: string;
-  // Future cloud support
-  CLAUDE_MEM_CHROMA_API_KEY: string;
-  CLAUDE_MEM_CHROMA_TENANT: string;
-  CLAUDE_MEM_CHROMA_DATABASE: string;
 }
 
 export class SettingsDefaultsManager {
+  // Cache for settings to avoid repeated file I/O
+  private static settingsCache: Map<string, { settings: SettingsDefaults; timestamp: number }> = new Map();
+  private static readonly CACHE_TTL_MS = 5000; // 5 seconds cache TTL
+  private static fileWatchers: Map<string, any> = new Map();
+
   /**
    * Default values for all settings
    */
@@ -84,15 +70,14 @@ export class SettingsDefaultsManager {
     CLAUDE_MEM_SKIP_TOOLS: 'ListMcpResourcesTool,SlashCommand,Skill,TodoWrite,AskUserQuestion',
     // AI Provider Configuration
     CLAUDE_MEM_PROVIDER: 'claude',  // Default to Claude
-    CLAUDE_MEM_CLAUDE_AUTH_METHOD: 'cli',  // Default to CLI subscription billing (not API key)
     CLAUDE_MEM_GEMINI_API_KEY: '',  // Empty by default, can be set via UI or env
-    CLAUDE_MEM_GEMINI_MODEL: 'gemini-2.5-flash-lite',  // Default Gemini model (highest free tier RPM)
+    CLAUDE_MEM_GEMINI_MODEL: 'gemini-3-flash',  // Default to latest Gemini 3 Flash model
     CLAUDE_MEM_GEMINI_RATE_LIMITING_ENABLED: 'true',  // Rate limiting ON by default for free tier users
     CLAUDE_MEM_OPENROUTER_API_KEY: '',  // Empty by default, can be set via UI or env
     CLAUDE_MEM_OPENROUTER_MODEL: 'xiaomi/mimo-v2-flash:free',  // Default OpenRouter model (free tier)
+    CLAUDE_MEM_OPENROUTER_BASE_URL: 'https://openrouter.ai/api/v1/chat/completions',  // Default OpenRouter API endpoint
     CLAUDE_MEM_OPENROUTER_SITE_URL: '',  // Optional: for OpenRouter analytics
     CLAUDE_MEM_OPENROUTER_APP_NAME: 'claude-mem',  // App name for OpenRouter analytics
-    CLAUDE_MEM_OPENROUTER_BASE_URL: '',  // Empty = use default OpenRouter API; set for local proxy
     CLAUDE_MEM_OPENROUTER_MAX_CONTEXT_MESSAGES: '20',  // Max messages in context window
     CLAUDE_MEM_OPENROUTER_MAX_TOKENS: '100000',  // Max estimated tokens (~100k safety limit)
     // System Configuration
@@ -102,38 +87,20 @@ export class SettingsDefaultsManager {
     CLAUDE_CODE_PATH: '', // Empty means auto-detect via 'which claude'
     CLAUDE_MEM_MODE: 'code', // Default mode profile
     // Token Economics
-    CLAUDE_MEM_CONTEXT_SHOW_READ_TOKENS: 'false',
-    CLAUDE_MEM_CONTEXT_SHOW_WORK_TOKENS: 'false',
-    CLAUDE_MEM_CONTEXT_SHOW_SAVINGS_AMOUNT: 'false',
+    CLAUDE_MEM_CONTEXT_SHOW_READ_TOKENS: 'true',
+    CLAUDE_MEM_CONTEXT_SHOW_WORK_TOKENS: 'true',
+    CLAUDE_MEM_CONTEXT_SHOW_SAVINGS_AMOUNT: 'true',
     CLAUDE_MEM_CONTEXT_SHOW_SAVINGS_PERCENT: 'true',
     // Observation Filtering
     CLAUDE_MEM_CONTEXT_OBSERVATION_TYPES: DEFAULT_OBSERVATION_TYPES_STRING,
     CLAUDE_MEM_CONTEXT_OBSERVATION_CONCEPTS: DEFAULT_OBSERVATION_CONCEPTS_STRING,
     // Display Configuration
-    CLAUDE_MEM_CONTEXT_FULL_COUNT: '0',
+    CLAUDE_MEM_CONTEXT_FULL_COUNT: '5',
     CLAUDE_MEM_CONTEXT_FULL_FIELD: 'narrative',
     CLAUDE_MEM_CONTEXT_SESSION_COUNT: '10',
     // Feature Toggles
     CLAUDE_MEM_CONTEXT_SHOW_LAST_SUMMARY: 'true',
     CLAUDE_MEM_CONTEXT_SHOW_LAST_MESSAGE: 'false',
-    CLAUDE_MEM_CONTEXT_SHOW_TERMINAL_OUTPUT: 'true',
-    CLAUDE_MEM_FOLDER_CLAUDEMD_ENABLED: 'false',
-    // Process Management
-    CLAUDE_MEM_MAX_CONCURRENT_AGENTS: '2',  // Max concurrent Claude SDK agent subprocesses
-    CLAUDE_MEM_CONCURRENT_MESSAGES: '3',   // Max concurrent message-processing sessions
-    // Exclusion Settings
-    CLAUDE_MEM_EXCLUDED_PROJECTS: '',  // Comma-separated glob patterns for excluded project paths
-    CLAUDE_MEM_FOLDER_MD_EXCLUDE: '[]',  // JSON array of folder paths to exclude from CLAUDE.md generation
-    // Chroma Vector Database Configuration
-    CLAUDE_MEM_CHROMA_ENABLED: 'true',         // Set to 'false' to disable Chroma and use SQLite-only search
-    CLAUDE_MEM_CHROMA_MODE: 'local',           // 'local' uses persistent chroma-mcp via uvx, 'remote' connects to existing server
-    CLAUDE_MEM_CHROMA_HOST: '127.0.0.1',
-    CLAUDE_MEM_CHROMA_PORT: '8000',
-    CLAUDE_MEM_CHROMA_SSL: 'false',
-    // Future cloud support (claude-mem pro)
-    CLAUDE_MEM_CHROMA_API_KEY: '',
-    CLAUDE_MEM_CHROMA_TENANT: 'default_tenant',
-    CLAUDE_MEM_CHROMA_DATABASE: 'default_database',
   };
 
   /**
@@ -160,38 +127,48 @@ export class SettingsDefaultsManager {
 
   /**
    * Get a boolean default value
-   * Handles both string 'true' and boolean true from JSON
    */
   static getBool(key: keyof SettingsDefaults): boolean {
     const value = this.get(key);
-    return value === 'true' || value === true;
-  }
-
-  /**
-   * Apply environment variable overrides to settings
-   * Environment variables take highest priority over file and defaults
-   */
-  private static applyEnvOverrides(settings: SettingsDefaults): SettingsDefaults {
-    const result = { ...settings };
-    for (const key of Object.keys(this.DEFAULTS) as Array<keyof SettingsDefaults>) {
-      if (process.env[key] !== undefined) {
-        result[key] = process.env[key]!;
-      }
-    }
-    return result;
+    return value === 'true';
   }
 
   /**
    * Load settings from file with fallback to defaults
-   * Returns merged settings with proper priority: process.env > settings file > defaults
-   * Handles all errors (missing file, corrupted JSON, permissions) gracefully
+   * Returns merged settings with defaults as fallback
+   * Handles all errors (missing file, corrupted JSON, permissions) by returning defaults
    *
-   * Configuration Priority:
-   *   1. Environment variables (highest priority)
-   *   2. Settings file (~/.claude-mem/settings.json)
-   *   3. Default values (lowest priority)
+   * Now with caching and file watching for automatic updates
    */
   static loadFromFile(settingsPath: string): SettingsDefaults {
+    // Check cache first
+    const cached = this.settingsCache.get(settingsPath);
+    const now = Date.now();
+
+    if (cached && (now - cached.timestamp) < this.CACHE_TTL_MS) {
+      return cached.settings;
+    }
+
+    // Load from file
+    const settings = this.loadSettingsFromDisk(settingsPath);
+
+    // Update cache
+    this.settingsCache.set(settingsPath, {
+      settings,
+      timestamp: now
+    });
+
+    // Setup file watcher if not already watching
+    this.setupFileWatcher(settingsPath);
+
+    return settings;
+  }
+
+  /**
+   * Load settings from disk without caching
+   * Internal method used by loadFromFile
+   */
+  private static loadSettingsFromDisk(settingsPath: string): SettingsDefaults {
     try {
       if (!existsSync(settingsPath)) {
         const defaults = this.getAllDefaults();
@@ -206,8 +183,7 @@ export class SettingsDefaultsManager {
         } catch (error) {
           console.warn('[SETTINGS] Failed to create settings file, using in-memory defaults:', settingsPath, error);
         }
-        // Still apply env var overrides even when file doesn't exist
-        return this.applyEnvOverrides(defaults);
+        return defaults;
       }
 
       const settingsData = readFileSync(settingsPath, 'utf-8');
@@ -237,12 +213,53 @@ export class SettingsDefaultsManager {
         }
       }
 
-      // Apply environment variable overrides (highest priority)
-      return this.applyEnvOverrides(result);
+      return result;
     } catch (error) {
       console.warn('[SETTINGS] Failed to load settings, using defaults:', settingsPath, error);
-      // Still apply env var overrides even on error
-      return this.applyEnvOverrides(this.getAllDefaults());
+      return this.getAllDefaults();
     }
+  }
+
+  /**
+   * Setup file watcher to invalidate cache when settings file changes
+   */
+  private static setupFileWatcher(settingsPath: string): void {
+    // Skip if already watching
+    if (this.fileWatchers.has(settingsPath)) {
+      return;
+    }
+
+    try {
+      const watcher = watch(settingsPath, (eventType) => {
+        if (eventType === 'change') {
+          // Invalidate cache on file change
+          this.settingsCache.delete(settingsPath);
+          console.log('[SETTINGS] Configuration file changed, cache invalidated:', settingsPath);
+        }
+      });
+
+      this.fileWatchers.set(settingsPath, watcher);
+      console.log('[SETTINGS] File watcher established for:', settingsPath);
+    } catch (error) {
+      console.warn('[SETTINGS] Failed to setup file watcher:', settingsPath, error);
+      // Non-critical error, continue without watching
+    }
+  }
+
+  /**
+   * Clear all caches and stop all file watchers
+   * Useful for testing or manual cache invalidation
+   */
+  static clearCache(): void {
+    this.settingsCache.clear();
+    for (const [path, watcher] of this.fileWatchers.entries()) {
+      try {
+        watcher.close();
+      } catch (error) {
+        console.warn('[SETTINGS] Failed to close watcher for:', path, error);
+      }
+    }
+    this.fileWatchers.clear();
+    console.log('[SETTINGS] All caches cleared and watchers closed');
   }
 }
