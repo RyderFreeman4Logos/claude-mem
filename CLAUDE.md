@@ -10,9 +10,20 @@ Claude-mem is a Claude Code plugin providing persistent memory across sessions. 
 
 **Worker Service** (`src/services/worker-service.ts`) - Express API on port 37777, Bun-managed, handles AI processing asynchronously
 
+⚠️ **CRITICAL: Do NOT restart worker service unnecessarily** - Restarting the worker causes all pending messages in the processing queue (`pending_messages` table) to be lost. Only restart when:
+- Deploying code changes that affect worker behavior
+- Changing critical configuration (provider, model, etc.) that requires restart
+- Worker is confirmed crashed or unresponsive
+
+To check queue status before restart: `sqlite3 ~/.claude-mem/claude-mem.db "SELECT COUNT(*) FROM pending_messages"`
+
 **Database** (`src/services/sqlite/`) - SQLite3 at `~/.claude-mem/claude-mem.db`
 
 **Search Skill** (`plugin/skills/mem-search/SKILL.md`) - HTTP API for searching past work, auto-invoked when users ask about history
+
+**Planning Skill** (`plugin/skills/make-plan/SKILL.md`) - Orchestrator instructions for creating phased implementation plans with documentation discovery
+
+**Execution Skill** (`plugin/skills/do/SKILL.md`) - Orchestrator instructions for executing phased plans using subagents
 
 **Chroma** (`src/services/sync/ChromaSync.ts`) - Vector embeddings for semantic search
 
@@ -40,6 +51,18 @@ Settings are managed in `~/.claude-mem/settings.json`. The file is auto-created 
 - **Installed Plugin**: `~/.claude/plugins/marketplaces/thedotmack/`
 - **Database**: `~/.claude-mem/claude-mem.db`
 - **Chroma**: `~/.claude-mem/chroma/`
+
+## Exit Code Strategy
+
+Claude-mem hooks use specific exit codes per Claude Code's hook contract:
+
+- **Exit 0**: Success or graceful shutdown (Windows Terminal closes tabs)
+- **Exit 1**: Non-blocking error (stderr shown to user, continues)
+- **Exit 2**: Blocking error (stderr fed to Claude for processing)
+
+**Philosophy**: Worker/hook errors exit with code 0 to prevent Windows Terminal tab accumulation. The wrapper/plugin layer handles restart logic. ERROR-level logging is maintained for diagnostics.
+
+See `private/context/claude-code/exit-codes.md` for full hook behavior matrix.
 
 ## Requirements
 

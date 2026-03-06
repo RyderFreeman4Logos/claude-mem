@@ -21,6 +21,7 @@ import { SessionCompletionHandler } from '../../session/SessionCompletionHandler
 import { PrivacyCheckValidator } from '../../validation/PrivacyCheckValidator.js';
 import { SettingsDefaultsManager } from '../../../../shared/SettingsDefaultsManager.js';
 import { USER_SETTINGS_PATH } from '../../../../shared/paths.js';
+import { getProcessBySession, ensureProcessExit } from '../../ProcessRegistry.js';
 
 export class SessionRoutes extends BaseRouteHandler {
   private completionHandler: SessionCompletionHandler;
@@ -87,6 +88,8 @@ export class SessionRoutes extends BaseRouteHandler {
    * we let the current generator finish naturally (max 5s linger timeout).
    * The next generator will use the new provider with shared conversationHistory.
    */
+  private static readonly STALE_GENERATOR_THRESHOLD_MS = 30_000; // 30 seconds (#1099)
+
   private ensureGeneratorRunning(sessionDbId: number, source: string): void {
     const session = this.sessionManager.getSession(sessionDbId);
     if (!session) return;
@@ -96,6 +99,26 @@ export class SessionRoutes extends BaseRouteHandler {
     // Start generator if not running
     if (!session.generatorPromise) {
       this.startGeneratorWithProvider(session, selectedProvider, source);
+      return;
+    }
+
+    // Generator is running - check if stale (no activity for 30s) to prevent queue stall (#1099)
+    const timeSinceActivity = Date.now() - session.lastGeneratorActivity;
+    if (timeSinceActivity > SessionRoutes.STALE_GENERATOR_THRESHOLD_MS) {
+      logger.warn('SESSION', 'Stale generator detected, aborting to prevent queue stall (#1099)', {
+        sessionId: sessionDbId,
+        timeSinceActivityMs: timeSinceActivity,
+        thresholdMs: SessionRoutes.STALE_GENERATOR_THRESHOLD_MS,
+        source
+      });
+      // Abort the stale generator and reset state
+      session.abortController.abort();
+      session.generatorPromise = null;
+      session.abortController = new AbortController();
+      session.lastGeneratorActivity = Date.now();
+      // Start a fresh generator
+      this.spawnInProgress.set(sessionDbId, true);
+      this.startGeneratorWithProvider(session, selectedProvider, 'stale-recovery');
       return;
     }
 
@@ -122,6 +145,17 @@ export class SessionRoutes extends BaseRouteHandler {
   ): void {
     if (!session) return;
 
+    // If previous lifecycle aborted this controller, a new generator would immediately
+    // exit without consuming queue messages. Reset before (re)start.
+    if (session.abortController.signal.aborted) {
+      logger.warn('SESSION', 'Resetting aborted controller before generator start', {
+        sessionId: session.sessionDbId,
+        source,
+        provider
+      });
+      session.abortController = new AbortController();
+    }
+
     const agent = provider === 'openrouter' ? this.openRouterAgent : (provider === 'gemini' ? this.geminiAgent : this.sdkAgent);
     const agentName = provider === 'openrouter' ? 'OpenRouter' : (provider === 'gemini' ? 'Gemini' : 'Claude SDK');
 
@@ -131,8 +165,9 @@ export class SessionRoutes extends BaseRouteHandler {
       historyLength: session.conversationHistory.length
     });
 
-    // Track which provider is running
+    // Track which provider is running and mark activity for stale detection (#1099)
     session.currentProvider = provider;
+    session.lastGeneratorActivity = Date.now();
 
     session.generatorPromise = agent.startSession(session, this.workerService)
       .catch(error => {
@@ -161,9 +196,20 @@ export class SessionRoutes extends BaseRouteHandler {
           }, dbError as Error);
         }
       })
-      .finally(() => {
+      .finally(async () => {
+        // CRITICAL: Verify subprocess exit to prevent zombie accumulation (Issue #1168)
+        const tracked = getProcessBySession(session.sessionDbId);
+        if (tracked && !tracked.process.killed && tracked.process.exitCode === null) {
+          await ensureProcessExit(tracked, 5000);
+        }
+
         const sessionDbId = session.sessionDbId;
         const wasAborted = session.abortController.signal.aborted;
+
+        // CRITICAL: Capture the controller reference BEFORE clearing generatorPromise
+        // This prevents a race condition where a new generator starts (from new observation)
+        // and we accidentally abort its controller instead of our old one
+        const myController = session.abortController;
 
         if (wasAborted) {
           logger.info('SESSION', `Generator aborted`, { sessionId: sessionDbId });
@@ -182,15 +228,41 @@ export class SessionRoutes extends BaseRouteHandler {
             const pendingCount = pendingStore.getPendingCount(sessionDbId);
 
             if (pendingCount > 0) {
+              // Guard against infinite restart loops (same protection as startSessionProcessor)
+              const MAX_CONSECUTIVE_RESTARTS = 5;
+              session.consecutiveRestarts = (session.consecutiveRestarts || 0) + 1;
+
+              if (session.consecutiveRestarts > MAX_CONSECUTIVE_RESTARTS) {
+                logger.error('SESSION', 'Session hit max consecutive restarts via SessionRoutes, abandoning', {
+                  sessionId: sessionDbId,
+                  pendingCount,
+                  consecutiveRestarts: session.consecutiveRestarts
+                });
+                const abandoned = pendingStore.markAllSessionMessagesAbandoned(sessionDbId);
+                logger.warn('SESSION', `Marked ${abandoned} messages as failed after max restarts`, {
+                  sessionId: sessionDbId
+                });
+                this.workerService.broadcastProcessingStatus();
+                return;
+              }
+
               logger.info('SESSION', `Restarting generator after crash/exit with pending work`, {
                 sessionId: sessionDbId,
-                pendingCount
+                pendingCount,
+                consecutiveRestarts: session.consecutiveRestarts
               });
 
-              // Abort OLD controller before replacing to prevent child process leaks
-              const oldController = session.abortController;
-              session.abortController = new AbortController();
-              oldController.abort();
+              // CRITICAL: Only replace controller if it hasn't been replaced by another generator
+              // (race condition: new observation may have already started a new generator)
+              if (session.abortController === myController) {
+                const oldController = session.abortController;
+                session.abortController = new AbortController();
+                oldController.abort();
+              } else {
+                logger.debug('SESSION', 'Controller already replaced by new generator, skipping abort', {
+                  sessionId: sessionDbId
+                });
+              }
 
               // Small delay before restart
               setTimeout(() => {
@@ -200,16 +272,28 @@ export class SessionRoutes extends BaseRouteHandler {
                 }
               }, 1000);
             } else {
-              // No pending work - abort to kill the child process
-              session.abortController.abort();
-              logger.debug('SESSION', 'Aborted controller after natural completion', {
-                sessionId: sessionDbId
-              });
+              // No pending work - only abort if controller hasn't been replaced
+              // (race condition: new observation may have started between generatorPromise=null and here)
+              if (session.abortController === myController) {
+                session.abortController.abort();
+                // Reset restart counter after a clean completion path.
+                session.consecutiveRestarts = 0;
+                logger.debug('SESSION', 'Aborted controller after natural completion', {
+                  sessionId: sessionDbId
+                });
+              } else {
+                logger.debug('SESSION', 'Controller replaced, new generator running - skipping abort', {
+                  sessionId: sessionDbId
+                });
+              }
             }
           } catch (e) {
             // Ignore errors during recovery check, but still abort to prevent leaks
-            logger.debug('SESSION', 'Error during recovery check, aborting to prevent leaks', { sessionId: sessionDbId, error: e instanceof Error ? e.message : String(e) });
-            session.abortController.abort();
+            // Only abort if controller hasn't been replaced
+            if (session.abortController === myController) {
+              logger.debug('SESSION', 'Error during recovery check, aborting to prevent leaks', { sessionId: sessionDbId, error: e instanceof Error ? e.message : String(e) });
+              session.abortController.abort();
+            }
           }
         }
         // NOTE: We do NOT delete the session here anymore.
@@ -231,6 +315,14 @@ export class SessionRoutes extends BaseRouteHandler {
     app.post('/api/sessions/init', this.handleSessionInitByClaudeId.bind(this));
     app.post('/api/sessions/observations', this.handleObservationsByClaudeId.bind(this));
     app.post('/api/sessions/summarize', this.handleSummarizeByClaudeId.bind(this));
+    app.post('/api/sessions/complete', this.handleCompleteByClaudeId.bind(this));
+
+    // Dead letter queue endpoints
+    app.get('/api/dead-letter-queue', this.handleGetDeadLetterQueue.bind(this));
+    app.post('/api/dead-letter-queue/:id/retry', this.handleRetryFailedMessage.bind(this));
+    app.post('/api/dead-letter-queue/retry-all', this.handleRetryAllFailedMessages.bind(this));
+    app.delete('/api/dead-letter-queue/:id', this.handleDeleteFailedMessage.bind(this));
+    app.delete('/api/dead-letter-queue', this.handleClearDeadLetterQueue.bind(this));
   }
 
   /**
@@ -433,57 +525,63 @@ export class SessionRoutes extends BaseRouteHandler {
       }
     }
 
-    const store = this.dbManager.getSessionStore();
+    try {
+      const store = this.dbManager.getSessionStore();
 
-    // Get or create session
-    const sessionDbId = store.createSDKSession(contentSessionId, '', '');
-    const promptNumber = store.getPromptNumberFromUserPrompts(contentSessionId);
+      // Get or create session
+      const sessionDbId = store.createSDKSession(contentSessionId, '', '');
+      const promptNumber = store.getPromptNumberFromUserPrompts(contentSessionId);
 
-    // Privacy check: skip if user prompt was entirely private
-    const userPrompt = PrivacyCheckValidator.checkUserPromptPrivacy(
-      store,
-      contentSessionId,
-      promptNumber,
-      'observation',
-      sessionDbId,
-      { tool_name }
-    );
-    if (!userPrompt) {
-      res.json({ status: 'skipped', reason: 'private' });
-      return;
+      // Privacy check: skip if user prompt was entirely private
+      const userPrompt = PrivacyCheckValidator.checkUserPromptPrivacy(
+        store,
+        contentSessionId,
+        promptNumber,
+        'observation',
+        sessionDbId,
+        { tool_name }
+      );
+      if (!userPrompt) {
+        res.json({ status: 'skipped', reason: 'private' });
+        return;
+      }
+
+      // Strip memory tags from tool_input and tool_response
+      const cleanedToolInput = tool_input !== undefined
+        ? stripMemoryTagsFromJson(JSON.stringify(tool_input))
+        : '{}';
+
+      const cleanedToolResponse = tool_response !== undefined
+        ? stripMemoryTagsFromJson(JSON.stringify(tool_response))
+        : '{}';
+
+      // Queue observation
+      this.sessionManager.queueObservation(sessionDbId, {
+        tool_name,
+        tool_input: cleanedToolInput,
+        tool_response: cleanedToolResponse,
+        prompt_number: promptNumber,
+        cwd: cwd || (() => {
+          logger.error('SESSION', 'Missing cwd when queueing observation in SessionRoutes', {
+            sessionId: sessionDbId,
+            tool_name
+          });
+          return '';
+        })()
+      });
+
+      // Ensure SDK agent is running
+      this.ensureGeneratorRunning(sessionDbId, 'observation');
+
+      // Broadcast observation queued event
+      this.eventBroadcaster.broadcastObservationQueued(sessionDbId);
+
+      res.json({ status: 'queued' });
+    } catch (error) {
+      // Return 200 on recoverable errors so the hook doesn't break
+      logger.error('SESSION', 'Observation storage failed', { contentSessionId, tool_name }, error as Error);
+      res.json({ stored: false, reason: (error as Error).message });
     }
-
-    // Strip memory tags from tool_input and tool_response
-    const cleanedToolInput = tool_input !== undefined
-      ? stripMemoryTagsFromJson(JSON.stringify(tool_input))
-      : '{}';
-
-    const cleanedToolResponse = tool_response !== undefined
-      ? stripMemoryTagsFromJson(JSON.stringify(tool_response))
-      : '{}';
-
-    // Queue observation
-    this.sessionManager.queueObservation(sessionDbId, {
-      tool_name,
-      tool_input: cleanedToolInput,
-      tool_response: cleanedToolResponse,
-      prompt_number: promptNumber,
-      cwd: cwd || (() => {
-        logger.error('SESSION', 'Missing cwd when queueing observation in SessionRoutes', {
-          sessionId: sessionDbId,
-          tool_name
-        });
-        return '';
-      })()
-    });
-
-    // Ensure SDK agent is running
-    this.ensureGeneratorRunning(sessionDbId, 'observation');
-
-    // Broadcast observation queued event
-    this.eventBroadcaster.broadcastObservationQueued(sessionDbId);
-
-    res.json({ status: 'queued' });
   });
 
   /**
@@ -532,6 +630,31 @@ export class SessionRoutes extends BaseRouteHandler {
   });
 
   /**
+   * Complete session by contentSessionId (session-complete hook uses this)
+   * POST /api/sessions/complete
+   * Body: { contentSessionId }
+   */
+  private handleCompleteByClaudeId = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
+    const { contentSessionId } = req.body;
+
+    if (!contentSessionId) {
+      return this.badRequest(res, 'Missing contentSessionId');
+    }
+
+    const store = this.dbManager.getSessionStore();
+    const sessionDbId = store.createSDKSession(contentSessionId, '', '');
+    const activeSession = this.sessionManager.getSession(sessionDbId);
+
+    if (!activeSession) {
+      res.json({ status: 'skipped', reason: 'not_active' });
+      return;
+    }
+
+    await this.completionHandler.completeByDbId(sessionDbId);
+    res.json({ status: 'completed', sessionDbId });
+  });
+
+  /**
    * Initialize session by contentSessionId (new-hook uses this)
    * POST /api/sessions/init
    * Body: { contentSessionId, project, prompt }
@@ -544,23 +667,30 @@ export class SessionRoutes extends BaseRouteHandler {
    * Returns: { sessionDbId, promptNumber, skipped: boolean, reason?: string }
    */
   private handleSessionInitByClaudeId = this.wrapHandler((req: Request, res: Response): void => {
-    const { contentSessionId, project, prompt } = req.body;
+    const { contentSessionId } = req.body;
+
+    // Only contentSessionId is truly required — Cursor and other platforms
+    // may omit prompt/project in their payload (#838, #1049)
+    const project = req.body.project || 'unknown';
+    const prompt = req.body.prompt || '[media prompt]';
+    const customTitle = req.body.customTitle || undefined;
 
     logger.info('HTTP', 'SessionRoutes: handleSessionInitByClaudeId called', {
       contentSessionId,
       project,
-      prompt_length: prompt?.length
+      prompt_length: prompt?.length,
+      customTitle
     });
 
     // Validate required parameters
-    if (!this.validateRequired(req, res, ['contentSessionId', 'project', 'prompt'])) {
+    if (!this.validateRequired(req, res, ['contentSessionId'])) {
       return;
     }
 
     const store = this.dbManager.getSessionStore();
 
     // Step 1: Create/get SDK session (idempotent INSERT OR IGNORE)
-    const sessionDbId = store.createSDKSession(contentSessionId, project, prompt);
+    const sessionDbId = store.createSDKSession(contentSessionId, project, prompt, customTitle);
 
     // Verify session creation with DB lookup
     const dbSession = store.getSessionById(sessionDbId);
@@ -604,16 +734,147 @@ export class SessionRoutes extends BaseRouteHandler {
     // Step 5: Save cleaned user prompt
     store.saveUserPrompt(contentSessionId, promptNumber, cleanedPrompt);
 
+    // Step 6: Check if SDK agent is already running for this session (#1079)
+    // If contextInjected is true, the hook should skip re-initializing the SDK agent
+    const contextInjected = this.sessionManager.getSession(sessionDbId) !== undefined;
+
     // Debug-level log since CREATED already logged the key info
     logger.debug('SESSION', 'User prompt saved', {
       sessionId: sessionDbId,
-      promptNumber
+      promptNumber,
+      contextInjected
     });
 
     res.json({
       sessionDbId,
       promptNumber,
-      skipped: false
+      skipped: false,
+      contextInjected
+    });
+  });
+
+  /**
+   * Get dead letter queue messages
+   * GET /api/dead-letter-queue
+   * Query params: limit, offset
+   */
+  private handleGetDeadLetterQueue = this.wrapHandler((req: Request, res: Response): void => {
+    const limit = parseInt(req.query.limit as string) || 100;
+    const offset = parseInt(req.query.offset as string) || 0;
+
+    const pendingStore = this.sessionManager.getPendingMessageStore();
+    const failedMessages = pendingStore.getFailedMessages(limit, offset);
+    const totalCount = pendingStore.getFailedMessageCount();
+
+    res.json({
+      messages: failedMessages,
+      pagination: {
+        total: totalCount,
+        limit,
+        offset,
+        hasMore: offset + failedMessages.length < totalCount
+      }
+    });
+  });
+
+  /**
+   * Retry a specific failed message
+   * POST /api/dead-letter-queue/:id/retry
+   */
+  private handleRetryFailedMessage = this.wrapHandler((req: Request, res: Response): void => {
+    const id = parseInt(req.params.id);
+    if (isNaN(id)) {
+      return this.badRequest(res, 'Invalid message ID');
+    }
+
+    const pendingStore = this.sessionManager.getPendingMessageStore();
+    const result = pendingStore.retryFailedMessage(id);
+
+    if (result.success) {
+      res.json({
+        success: true,
+        message: 'Message retried successfully',
+        newMessageId: result.newMessageId
+      });
+
+      // Trigger processing of pending queues
+      this.workerService.processPendingQueues(10).catch(error => {
+        logger.error('SESSION', 'Failed to process pending queues after retry', {}, error as Error);
+      });
+    } else {
+      res.status(400).json({
+        success: false,
+        error: result.error || 'Failed to retry message'
+      });
+    }
+  });
+
+  /**
+   * Retry all failed messages
+   * POST /api/dead-letter-queue/retry-all
+   */
+  private handleRetryAllFailedMessages = this.wrapHandler((req: Request, res: Response): void => {
+    const pendingStore = this.sessionManager.getPendingMessageStore();
+    const totalCount = pendingStore.getFailedMessageCount();
+
+    // Get all failed messages and retry them
+    const failedMessages = pendingStore.getFailedMessages(10000, 0);
+    let retriedCount = 0;
+
+    for (const msg of failedMessages) {
+      const result = pendingStore.retryFailedMessage(msg.id);
+      if (result.success) {
+        retriedCount++;
+      }
+    }
+
+    res.json({
+      success: true,
+      message: `Retried ${retriedCount} of ${totalCount} failed messages`,
+      retriedCount,
+      totalCount
+    });
+
+    // Trigger processing of pending queues
+    if (retriedCount > 0) {
+      this.workerService.processPendingQueues(10).catch(error => {
+        logger.error('SESSION', 'Failed to process pending queues after retry all', {}, error as Error);
+      });
+    }
+  });
+
+  /**
+   * Delete a specific failed message
+   * DELETE /api/dead-letter-queue/:id
+   */
+  private handleDeleteFailedMessage = this.wrapHandler((req: Request, res: Response): void => {
+    const id = parseInt(req.params.id);
+    if (isNaN(id)) {
+      return this.badRequest(res, 'Invalid message ID');
+    }
+
+    const pendingStore = this.sessionManager.getPendingMessageStore();
+    const deleted = pendingStore.deleteFailedMessage(id);
+
+    if (deleted) {
+      res.json({ success: true, message: 'Failed message deleted' });
+    } else {
+      res.status(404).json({ success: false, error: 'Failed message not found' });
+    }
+  });
+
+  /**
+   * Clear all failed messages from dead letter queue
+   * DELETE /api/dead-letter-queue
+   */
+  private handleClearDeadLetterQueue = this.wrapHandler((req: Request, res: Response): void => {
+    const pendingStore = this.sessionManager.getPendingMessageStore();
+    const deletedCount = pendingStore.clearFailedMessages();
+
+    res.json({
+      success: true,
+      message: `Cleared ${deletedCount} failed messages from dead letter queue`,
+      deletedCount
     });
   });
 }

@@ -97,6 +97,7 @@ export class SettingsRoutes extends BaseRouteHandler {
       // OpenRouter Configuration
       'CLAUDE_MEM_OPENROUTER_API_KEY',
       'CLAUDE_MEM_OPENROUTER_MODEL',
+      'CLAUDE_MEM_OPENROUTER_BASE_URL',
       'CLAUDE_MEM_OPENROUTER_SITE_URL',
       'CLAUDE_MEM_OPENROUTER_APP_NAME',
       'CLAUDE_MEM_OPENROUTER_MAX_CONTEXT_MESSAGES',
@@ -121,6 +122,7 @@ export class SettingsRoutes extends BaseRouteHandler {
       // Feature Toggles
       'CLAUDE_MEM_CONTEXT_SHOW_LAST_SUMMARY',
       'CLAUDE_MEM_CONTEXT_SHOW_LAST_MESSAGE',
+      'CLAUDE_MEM_FOLDER_CLAUDEMD_ENABLED',
     ];
 
     for (const key of settingKeys) {
@@ -241,9 +243,9 @@ export class SettingsRoutes extends BaseRouteHandler {
 
     // Validate CLAUDE_MEM_GEMINI_MODEL
     if (settings.CLAUDE_MEM_GEMINI_MODEL) {
-      const validGeminiModels = ['gemini-2.5-flash-lite', 'gemini-2.5-flash', 'gemini-3-flash'];
+      const validGeminiModels = ['gemini-2.5-flash-lite', 'gemini-2.5-flash', 'gemini-3-flash-preview'];
       if (!validGeminiModels.includes(settings.CLAUDE_MEM_GEMINI_MODEL)) {
-        return { valid: false, error: 'CLAUDE_MEM_GEMINI_MODEL must be one of: gemini-2.5-flash-lite, gemini-2.5-flash, gemini-3-flash' };
+        return { valid: false, error: 'CLAUDE_MEM_GEMINI_MODEL must be one of: gemini-2.5-flash-lite, gemini-2.5-flash, gemini-3-flash-preview' };
       }
     }
 
@@ -341,6 +343,16 @@ export class SettingsRoutes extends BaseRouteHandler {
       const tokens = parseInt(settings.CLAUDE_MEM_OPENROUTER_MAX_TOKENS, 10);
       if (isNaN(tokens) || tokens < 1000 || tokens > 1000000) {
         return { valid: false, error: 'CLAUDE_MEM_OPENROUTER_MAX_TOKENS must be between 1000 and 1000000' };
+      }
+    }
+
+    // Validate CLAUDE_MEM_OPENROUTER_BASE_URL if provided
+    if (settings.CLAUDE_MEM_OPENROUTER_BASE_URL) {
+      try {
+        new URL(settings.CLAUDE_MEM_OPENROUTER_BASE_URL);
+      } catch (error) {
+        logger.debug('SETTINGS', 'Invalid URL format', { url: settings.CLAUDE_MEM_OPENROUTER_BASE_URL, error: error instanceof Error ? error.message : String(error) });
+        return { valid: false, error: 'CLAUDE_MEM_OPENROUTER_BASE_URL must be a valid URL' };
       }
     }
 

@@ -1,6 +1,8 @@
 datasets/
 node_modules/
 dist/
+!installer/dist/
+**/_tree-sitter/
 *.log
 .DS_Store
 .env
@@ -11,12 +13,15 @@ dist/
 .claude/settings.local.json
 .claude/agents/
 .claude/skills/
+.claude/plans/
+.claude/worktrees/
 plugin/data/
 plugin/data.backup/
 package-lock.json
 bun.lock
 private/
 datasets/
+Auto Run Docs/
 
 # Generated UI files (built from viewer-template.html)
 src/ui/viewer.html
@@ -32,3 +37,26 @@ src/ui/viewer.html
 # Prevent other malformed path directories
 http*/
 https*/
+
+# Auto-generated CLAUDE.md files (keep root CLAUDE.md only)
+**/CLAUDE.md
+!/CLAUDE.md
+!/.claude/CLAUDE.md
+
+# Draft and development directories
+@drafts/
+@mandate-dev-drafts/
+claude/
+crates/
+drafts/
+llm/
+mandate-dev-drafts/
+mandate-enterprise/
+mandate-monorepo/
+mandate-tor-manager/
+tasks/
+ui/
+src/agents/
+
+# Ignore WebStorm project files (for dinosaur IDE users)
+.idea/

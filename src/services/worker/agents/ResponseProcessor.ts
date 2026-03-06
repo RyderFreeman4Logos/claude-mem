@@ -13,9 +13,11 @@
 
 import { logger } from '../../../utils/logger.js';
 import { parseObservations, parseSummary, type ParsedObservation, type ParsedSummary } from '../../../sdk/parser.js';
-import { updateCursorContextForProject } from '../../worker-service.js';
+import { updateCursorContextForProject } from '../../integrations/CursorHooksInstaller.js';
 import { updateFolderClaudeMdFiles } from '../../../utils/claude-md-utils.js';
 import { getWorkerPort } from '../../../shared/worker-utils.js';
+import { SettingsDefaultsManager } from '../../../shared/SettingsDefaultsManager.js';
+import { USER_SETTINGS_PATH } from '../../../shared/paths.js';
 import type { ActiveSession } from '../../worker-types.js';
 import type { DatabaseManager } from '../DatabaseManager.js';
 import type { SessionManager } from '../SessionManager.js';
@@ -54,6 +56,9 @@ export async function processAgentResponse(
   agentName: string,
   projectRoot?: string
 ): Promise<void> {
+  // Track generator activity for stale detection (Issue #1099)
+  session.lastGeneratorActivity = Date.now();
+
   // Add assistant response to shared conversation history for provider interop
   if (text) {
     session.conversationHistory.push({ role: 'assistant', content: text });
@@ -81,7 +86,7 @@ export async function processAgentResponse(
   });
 
   // ATOMIC TRANSACTION: Store observations + summary ONCE
-  // Messages are already deleted from queue on claim, so no completion tracking needed
+  // Messages are marked 'processing' on claim and completed after successful processing
   const result = sessionStore.storeObservations(
     session.memorySessionId,
     session.project,
@@ -97,6 +102,17 @@ export async function processAgentResponse(
     sessionId: session.sessionDbId,
     memorySessionId: session.memorySessionId
   });
+
+  // CLAIM-CONFIRM: Delete processed messages from pending queue
+  // Messages were claimed as 'processing' by claimNextMessage(); now that storage succeeded, remove them
+  if (session.processingMessageIds.length > 0) {
+    const pendingStore = sessionManager.getPendingMessageStore();
+    for (const msgId of session.processingMessageIds) {
+      pendingStore.confirmProcessed(msgId);
+    }
+    logger.info('QUEUE', `CONFIRMED | sessionDbId=${session.sessionDbId} | confirmed=${session.processingMessageIds.length} msgIds=[${session.processingMessageIds.join(',')}]`);
+    session.processingMessageIds = [];
+  }
 
   // AFTER transaction commits - async operations (can fail safely without data loss)
   await syncAndBroadcastObservations(
@@ -167,8 +183,8 @@ async function syncAndBroadcastObservations(
     const obs = observations[i];
     const chromaStart = Date.now();
 
-    // Sync to Chroma (fire-and-forget)
-    dbManager.getChromaSync().syncObservation(
+    // Sync to Chroma (fire-and-forget, skipped if Chroma is disabled)
+    dbManager.getChromaSync()?.syncObservation(
       obsId,
       session.contentSessionId,
       session.project,
@@ -215,21 +231,30 @@ async function syncAndBroadcastObservations(
 
   // Update folder CLAUDE.md files for touched folders (fire-and-forget)
   // This runs per-observation batch to ensure folders are updated as work happens
-  const allFilePaths: string[] = [];
-  for (const obs of observations) {
-    allFilePaths.push(...(obs.files_modified || []));
-    allFilePaths.push(...(obs.files_read || []));
-  }
+  // Check if feature is enabled (disabled by default to avoid cluttering codebase)
+  const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
+  const folderToggle =
+    settings.CLAUDE_MEM_FOLDER_CLAUDEMD_ENABLED ??
+    settings.CLAUDE_MEM_ENABLE_FOLDER_CLAUDE_MD;
+  const folderClaudeMdEnabled = folderToggle === 'true' || folderToggle === true;
 
-  if (allFilePaths.length > 0) {
-    updateFolderClaudeMdFiles(
-      allFilePaths,
-      session.project,
-      getWorkerPort(),
-      projectRoot
-    ).catch(error => {
-      logger.warn('FOLDER_INDEX', 'CLAUDE.md update failed (non-critical)', { project: session.project }, error as Error);
-    });
+  if (folderClaudeMdEnabled) {
+    const allFilePaths: string[] = [];
+    for (const obs of observations) {
+      allFilePaths.push(...(obs.files_modified || []));
+      allFilePaths.push(...(obs.files_read || []));
+    }
+
+    if (allFilePaths.length > 0) {
+      updateFolderClaudeMdFiles(
+        allFilePaths,
+        session.project,
+        getWorkerPort(),
+        projectRoot
+      ).catch(error => {
+        logger.warn('FOLDER_INDEX', 'CLAUDE.md update failed (non-critical)', { project: session.project }, error as Error);
+      });
+    }
   }
 }
 
@@ -252,8 +277,8 @@ async function syncAndBroadcastSummary(
 
   const chromaStart = Date.now();
 
-  // Sync to Chroma (fire-and-forget)
-  dbManager.getChromaSync().syncSummary(
+  // Sync to Chroma (fire-and-forget, skipped if Chroma is disabled)
+  dbManager.getChromaSync()?.syncSummary(
     result.summaryId,
     session.contentSessionId,
     session.project,

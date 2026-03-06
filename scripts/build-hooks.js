@@ -12,14 +12,6 @@ import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-const HOOKS = [
-  { name: 'context-hook', source: 'src/hooks/context-hook.ts' },
-  { name: 'new-hook', source: 'src/hooks/new-hook.ts' },
-  { name: 'save-hook', source: 'src/hooks/save-hook.ts' },
-  { name: 'summary-hook', source: 'src/hooks/summary-hook.ts' },
-  { name: 'user-message-hook', source: 'src/hooks/user-message-hook.ts' }
-];
-
 const WORKER_SERVICE = {
   name: 'worker-service',
   source: 'src/services/worker-service.ts'
@@ -66,7 +58,18 @@ async function buildHooks() {
       private: true,
       description: 'Runtime dependencies for claude-mem bundled hooks',
       type: 'module',
-      dependencies: {},
+      dependencies: {
+        'tree-sitter-cli': '^0.26.5',
+        'tree-sitter-c': '^0.24.1',
+        'tree-sitter-cpp': '^0.23.4',
+        'tree-sitter-go': '^0.25.0',
+        'tree-sitter-java': '^0.23.5',
+        'tree-sitter-javascript': '^0.25.0',
+        'tree-sitter-python': '^0.25.0',
+        'tree-sitter-ruby': '^0.23.1',
+        'tree-sitter-rust': '^0.24.0',
+        'tree-sitter-typescript': '^0.23.2',
+      },
       engines: {
         node: '>=18.0.0',
         bun: '>=1.0.0'
@@ -100,7 +103,15 @@ async function buildHooks() {
       outfile: `${hooksDir}/${WORKER_SERVICE.name}.cjs`,
       minify: true,
       logLevel: 'error', // Suppress warnings (import.meta warning is benign)
-      external: ['bun:sqlite'],
+      external: [
+        'bun:sqlite',
+        // Optional chromadb embedding providers
+        'cohere-ai',
+        'ollama',
+        // Default embedding function with native binaries
+        '@chroma-core/default-embed',
+        'onnxruntime-node'
+      ],
       define: {
         '__DEFAULT_PACKAGE_VERSION__': `"${version}"`
       },
@@ -125,7 +136,19 @@ async function buildHooks() {
       outfile: `${hooksDir}/${MCP_SERVER.name}.cjs`,
       minify: true,
       logLevel: 'error',
-      external: ['bun:sqlite'],
+      external: [
+        'bun:sqlite',
+        'tree-sitter-cli',
+        'tree-sitter-javascript',
+        'tree-sitter-typescript',
+        'tree-sitter-python',
+        'tree-sitter-go',
+        'tree-sitter-rust',
+        'tree-sitter-ruby',
+        'tree-sitter-java',
+        'tree-sitter-c',
+        'tree-sitter-cpp',
+      ],
       define: {
         '__DEFAULT_PACKAGE_VERSION__': `"${version}"`
       },
@@ -159,45 +182,26 @@ async function buildHooks() {
     const contextGenStats = fs.statSync(`${hooksDir}/${CONTEXT_GENERATOR.name}.cjs`);
     console.log(`✓ context-generator built (${(contextGenStats.size / 1024).toFixed(2)} KB)`);
 
-    // Build each hook
-    for (const hook of HOOKS) {
-      console.log(`\n🔧 Building ${hook.name}...`);
-
-      const outfile = `${hooksDir}/${hook.name}.js`;
-
-      await build({
-        entryPoints: [hook.source],
-        bundle: true,
-        platform: 'node',
-        target: 'node18',
-        format: 'esm',
-        outfile,
-        minify: true,
-        external: ['bun:sqlite'],
-        define: {
-          '__DEFAULT_PACKAGE_VERSION__': `"${version}"`
-        },
-        banner: {
-          js: '#!/usr/bin/env bun'
-        }
-      });
-
-      // Make executable
-      fs.chmodSync(outfile, 0o755);
-
-      // Check file size
-      const stats = fs.statSync(outfile);
-      const sizeInKB = (stats.size / 1024).toFixed(2);
-      console.log(`✓ ${hook.name} built (${sizeInKB} KB)`);
+    // Verify critical distribution files exist (skills are source files, not build outputs)
+    console.log('\n📋 Verifying distribution files...');
+    const requiredDistributionFiles = [
+      'plugin/skills/mem-search/SKILL.md',
+      'plugin/skills/smart-explore/SKILL.md',
+      'plugin/hooks/hooks.json',
+      'plugin/.claude-plugin/plugin.json',
+    ];
+    for (const filePath of requiredDistributionFiles) {
+      if (!fs.existsSync(filePath)) {
+        throw new Error(`Missing required distribution file: ${filePath}`);
+      }
     }
+    console.log('✓ All required distribution files present');
 
-    console.log('\n✅ All hooks, worker service, and MCP server built successfully!');
+    console.log('\n✅ Worker service, MCP server, and context generator built successfully!');
     console.log(`   Output: ${hooksDir}/`);
-    console.log(`   - Hooks: *-hook.js`);
     console.log(`   - Worker: worker-service.cjs`);
     console.log(`   - MCP Server: mcp-server.cjs`);
-    console.log('\n💡 Note: Dependencies will be auto-installed on first hook execution');
-    console.log('📝 Cursor hooks are in cursor-hooks/ (no build needed - plain shell scripts)');
+    console.log(`   - Context Generator: context-generator.cjs`);
 
   } catch (error) {
     console.error('\n❌ Build failed:', error.message);
