@@ -39,6 +39,7 @@ import {
   checkVersionMatch
 } from './infrastructure/HealthMonitor.js';
 import { performGracefulShutdown } from './infrastructure/GracefulShutdown.js';
+import { ChromaServerLifecycle } from './sync/ChromaServerLifecycle.js';
 
 // Server imports
 import { Server } from './server/Server.js';
@@ -102,6 +103,9 @@ export class WorkerService {
   // Route handlers
   private searchRoutes: SearchRoutes | null = null;
 
+  // Chroma SSE server lifecycle
+  private chromaServerLifecycle: ChromaServerLifecycle;
+
   // Initialization tracking
   private initializationComplete: Promise<void>;
   private resolveInitialization!: () => void;
@@ -125,6 +129,7 @@ export class WorkerService {
     this.paginationHelper = new PaginationHelper(this.dbManager);
     this.settingsManager = new SettingsManager(this.dbManager);
     this.sessionEventBroadcaster = new SessionEventBroadcaster(this.sseBroadcaster, this);
+    this.chromaServerLifecycle = new ChromaServerLifecycle();
 
     // Set callback for when sessions are deleted
     this.sessionManager.setOnSessionDeleted(() => {
@@ -237,6 +242,13 @@ export class WorkerService {
       const modeId = settings.CLAUDE_MEM_MODE;
       ModeManager.getInstance().loadMode(modeId);
       logger.info('SYSTEM', `Mode loaded: ${modeId}`);
+
+      // Start chroma-mcp SSE server before DB init (ChromaSync needs it)
+      try {
+        await this.chromaServerLifecycle.start();
+      } catch (error) {
+        logger.warn('SYSTEM', 'Chroma SSE server failed to start, vector search will be unavailable', {}, error as Error);
+      }
 
       await this.dbManager.initialize();
 
@@ -390,7 +402,8 @@ export class WorkerService {
       server: this.server.getHttpServer(),
       sessionManager: this.sessionManager,
       mcpClient: this.mcpClient,
-      dbManager: this.dbManager
+      dbManager: this.dbManager,
+      chromaServerLifecycle: this.chromaServerLifecycle
     });
   }
 

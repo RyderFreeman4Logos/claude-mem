@@ -51,6 +51,8 @@ export interface SettingsDefaults {
   // Feature Toggles
   CLAUDE_MEM_CONTEXT_SHOW_LAST_SUMMARY: string;
   CLAUDE_MEM_CONTEXT_SHOW_LAST_MESSAGE: string;
+  // Chroma MCP Server
+  CLAUDE_MEM_CHROMA_SERVER_PORT: string;
 }
 
 export class SettingsDefaultsManager {
@@ -101,6 +103,8 @@ export class SettingsDefaultsManager {
     // Feature Toggles
     CLAUDE_MEM_CONTEXT_SHOW_LAST_SUMMARY: 'true',
     CLAUDE_MEM_CONTEXT_SHOW_LAST_MESSAGE: 'false',
+    // Chroma MCP Server
+    CLAUDE_MEM_CHROMA_SERVER_PORT: '37778',
   };
 
   /**
