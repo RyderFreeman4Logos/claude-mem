@@ -108,13 +108,18 @@ export class OpenRouterAgent {
    * Uses multi-turn conversation to maintain context across messages
    */
   async startSession(session: ActiveSession, worker?: WorkerRef): Promise<void> {
-    // Check if OpenRouter is in cooldown
+    // Check if OpenRouter is in cooldown - delegate to Gemini directly
     if (OpenRouterAgent.isInCooldown()) {
       const remaining = OpenRouterAgent.getCooldownRemainingSeconds();
-      logger.warn('SDK', `OpenRouter in cooldown (${remaining}s remaining), attempting anyway to trigger retry cycle`, {
+      logger.info('SDK', `OpenRouter in cooldown (${remaining}s remaining), delegating to Gemini`, {
         sessionDbId: session.sessionDbId,
         cooldownUntil: new Date(OpenRouterAgent.cooldownUntil).toISOString()
       });
+
+      if (isGeminiAvailable() && this.geminiAgent) {
+        return this.geminiAgent.startSession(session, worker);
+      }
+      logger.warn('SDK', 'OpenRouter in cooldown but Gemini not available, attempting anyway');
     }
 
     try {
@@ -284,7 +289,28 @@ export class OpenRouterAgent {
 
       const errorMessage = error instanceof Error ? error.message : String(error);
 
-      logger.failure('SDK', 'OpenRouter agent error', { sessionDbId: session.sessionDbId }, error as Error);
+      // Fallback: OpenRouter → Gemini for all non-abort errors
+      // (no Claude SDK fallback per user preference)
+      if (isGeminiAvailable() && this.geminiAgent) {
+        logger.warn('SDK', 'OpenRouter failed, falling back to Gemini', {
+          sessionDbId: session.sessionDbId,
+          error: errorMessage,
+          historyLength: session.conversationHistory.length
+        });
+
+        try {
+          return await this.geminiAgent.startSession(session, worker);
+        } catch (geminiError: unknown) {
+          logger.failure('SDK', 'Both OpenRouter and Gemini failed', {
+            sessionDbId: session.sessionDbId,
+            openRouterError: errorMessage,
+            geminiError: geminiError instanceof Error ? geminiError.message : String(geminiError)
+          }, geminiError as Error);
+          throw geminiError;
+        }
+      }
+
+      logger.failure('SDK', 'OpenRouter agent error (no Gemini available)', { sessionDbId: session.sessionDbId }, error as Error);
       throw error;
     }
   }
