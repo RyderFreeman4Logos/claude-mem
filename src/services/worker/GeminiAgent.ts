@@ -22,7 +22,6 @@ import type { ActiveSession, ConversationMessage } from '../worker-types.js';
 import { ModeManager } from '../domain/ModeManager.js';
 import {
   processAgentResponse,
-  shouldFallbackToClaude,
   isAbortError,
   type WorkerRef,
   type FallbackAgent
