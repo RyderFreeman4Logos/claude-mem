@@ -9,6 +9,7 @@
  */
 
 import { ChildProcess, spawn } from 'child_process';
+import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { logger } from '../../utils/logger.js';
@@ -135,13 +136,8 @@ export class ChromaServerLifecycle {
     const devPath = path.join(__dirname, '..', '..', '..', 'plugin', 'scripts', 'chroma-sse-wrapper.py');
 
     // Try bundled first, then dev
-    try {
-      const fs = require('fs');
-      if (fs.existsSync(bundledPath)) return bundledPath;
-      if (fs.existsSync(devPath)) return devPath;
-    } catch {
-      // Fall through
-    }
+    if (fs.existsSync(bundledPath)) return bundledPath;
+    if (fs.existsSync(devPath)) return devPath;
 
     // Default to bundled path (most common in production)
     return bundledPath;
