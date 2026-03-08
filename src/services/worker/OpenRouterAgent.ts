@@ -108,10 +108,10 @@ export class OpenRouterAgent {
    * Uses multi-turn conversation to maintain context across messages
    */
   async startSession(session: ActiveSession, worker?: WorkerRef): Promise<void> {
-    // Check if OpenRouter is in cooldown - delegate to fallback directly
+    // Check if OpenRouter is in cooldown - delegate to Gemini directly
     if (OpenRouterAgent.isInCooldown()) {
       const remaining = OpenRouterAgent.getCooldownRemainingSeconds();
-      logger.info('SDK', `OpenRouter in cooldown (${remaining}s remaining), delegating to fallback`, {
+      logger.info('SDK', `OpenRouter in cooldown (${remaining}s remaining), delegating to Gemini`, {
         sessionDbId: session.sessionDbId,
         cooldownUntil: new Date(OpenRouterAgent.cooldownUntil).toISOString()
       });
@@ -119,10 +119,7 @@ export class OpenRouterAgent {
       if (isGeminiAvailable() && this.geminiAgent) {
         return this.geminiAgent.startSession(session, worker);
       }
-      if (this.fallbackAgent) {
-        return this.fallbackAgent.startSession(session, worker);
-      }
-      logger.warn('SDK', 'OpenRouter in cooldown but no fallback available, attempting anyway');
+      logger.warn('SDK', 'OpenRouter in cooldown but Gemini not available, attempting anyway');
     }
 
     try {
@@ -292,55 +289,28 @@ export class OpenRouterAgent {
 
       const errorMessage = error instanceof Error ? error.message : String(error);
 
-      // Multi-level fallback: OpenRouter → Gemini → Claude SDK
-      if (shouldFallbackToClaude(error)) {
-        // Try Gemini first if available
-        if (isGeminiAvailable() && this.geminiAgent) {
-          logger.warn('SDK', 'All OpenRouter models failed, falling back to Gemini', {
+      // Fallback: OpenRouter → Gemini for all non-abort errors
+      // (no Claude SDK fallback per user preference)
+      if (isGeminiAvailable() && this.geminiAgent) {
+        logger.warn('SDK', 'OpenRouter failed, falling back to Gemini', {
+          sessionDbId: session.sessionDbId,
+          error: errorMessage,
+          historyLength: session.conversationHistory.length
+        });
+
+        try {
+          return await this.geminiAgent.startSession(session, worker);
+        } catch (geminiError: unknown) {
+          logger.failure('SDK', 'Both OpenRouter and Gemini failed', {
             sessionDbId: session.sessionDbId,
-            error: errorMessage,
-            historyLength: session.conversationHistory.length
-          });
-
-          try {
-            // Fall back to Gemini - it will use the same session with shared conversationHistory
-            return await this.geminiAgent.startSession(session, worker);
-          } catch (geminiError: unknown) {
-            const geminiErrorMsg = geminiError instanceof Error ? geminiError.message : String(geminiError);
-            logger.warn('SDK', 'Gemini fallback also failed, falling back to Claude SDK', {
-              sessionDbId: session.sessionDbId,
-              geminiError: geminiErrorMsg,
-              originalError: errorMessage
-            });
-
-            // If Gemini also fails, try Claude SDK as last resort
-            if (this.fallbackAgent) {
-              return this.fallbackAgent.startSession(session, worker);
-            }
-
-            // No more fallback options
-            logger.failure('SDK', 'All providers failed (OpenRouter, Gemini, Claude SDK)', {
-              sessionDbId: session.sessionDbId
-            }, geminiError as Error);
-            throw geminiError;
-          }
-        }
-
-        // No Gemini available, try Claude SDK directly
-        if (this.fallbackAgent) {
-          logger.warn('SDK', 'OpenRouter API failed, falling back to Claude SDK', {
-            sessionDbId: session.sessionDbId,
-            error: errorMessage,
-            historyLength: session.conversationHistory.length
-          });
-
-          // Fall back to Claude - it will use the same session with shared conversationHistory
-          // Note: With claim-and-delete queue pattern, messages are already deleted on claim
-          return this.fallbackAgent.startSession(session, worker);
+            openRouterError: errorMessage,
+            geminiError: geminiError instanceof Error ? geminiError.message : String(geminiError)
+          }, geminiError as Error);
+          throw geminiError;
         }
       }
 
-      logger.failure('SDK', 'OpenRouter agent error', { sessionDbId: session.sessionDbId }, error as Error);
+      logger.failure('SDK', 'OpenRouter agent error (no Gemini available)', { sessionDbId: session.sessionDbId }, error as Error);
       throw error;
     }
   }
