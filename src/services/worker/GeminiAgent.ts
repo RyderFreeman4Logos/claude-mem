@@ -331,19 +331,6 @@ export class GeminiAgent {
         return; // graceful exit — processing message recovered by sweeper, pending messages stay pending
       }
 
-      // Check if we should fall back to Claude (non-quota errors only)
-      if (shouldFallbackToClaude(error) && this.fallbackAgent) {
-        logger.warn('SDK', 'Gemini API failed, falling back to Claude SDK', {
-          sessionDbId: session.sessionDbId,
-          error: errorMsg,
-          historyLength: session.conversationHistory.length
-        });
-
-        // Fall back to Claude - it will use the same session with shared conversationHistory
-        // Note: With claim-and-delete queue pattern, messages are already deleted on claim
-        return this.fallbackAgent.startSession(session, worker);
-      }
-
       logger.failure('SDK', 'Gemini agent error', { sessionDbId: session.sessionDbId }, error as Error);
       throw error;
     }
