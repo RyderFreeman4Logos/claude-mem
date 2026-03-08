@@ -73,7 +73,7 @@ export class ChromaSync {
   private project: string;
   private collectionName: string;
   private collectionCreated = false;
-  private readonly BATCH_SIZE = 100;
+  private readonly BATCH_SIZE = 20;
 
   constructor(project: string) {
     this.project = project;

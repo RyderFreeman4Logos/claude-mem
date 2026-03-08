@@ -19,6 +19,7 @@ const CHROMA_MCP_CLIENT_NAME = 'claude-mem-chroma';
 const CHROMA_MCP_CLIENT_VERSION = '2.0.0';
 const MCP_CONNECTION_TIMEOUT_MS = 30_000;
 const RECONNECT_BACKOFF_MS = 10_000;
+const MCP_TOOL_TIMEOUT_MS = 300_000; // 5 min for embedding-heavy operations
 
 export class ChromaMcpManager {
   private static instance: ChromaMcpManager | null = null;
@@ -165,7 +166,7 @@ export class ChromaMcpManager {
       result = await this.client!.callTool({
         name: toolName,
         arguments: toolArguments
-      });
+      }, undefined, { timeout: MCP_TOOL_TIMEOUT_MS });
     } catch (transportError) {
       // SSE connection may have dropped. Reconnect and retry once.
       this.connected = false;
@@ -181,7 +182,7 @@ export class ChromaMcpManager {
         result = await this.client!.callTool({
           name: toolName,
           arguments: toolArguments
-        });
+        }, undefined, { timeout: MCP_TOOL_TIMEOUT_MS });
       } catch (retryError) {
         this.connected = false;
         throw new Error(`chroma-mcp transport error during "${toolName}" (retry failed): ${retryError instanceof Error ? retryError.message : String(retryError)}`);
