@@ -21,7 +21,7 @@ export interface SettingsDefaults {
   // AI Provider Configuration
   CLAUDE_MEM_PROVIDER: string;  // 'claude' | 'gemini' | 'openrouter'
   CLAUDE_MEM_GEMINI_API_KEY: string;
-  CLAUDE_MEM_GEMINI_MODEL: string;  // 'gemini-3-flash' | 'gemini-3-pro' | 'gemini-2.5-flash' (deprecated)
+  CLAUDE_MEM_GEMINI_MODEL: string;  // 'gemini-3-flash-preview' | 'gemini-3-flash' (2.x models removed — see GeminiAgent.ts)
   CLAUDE_MEM_GEMINI_RATE_LIMITING_ENABLED: string;  // 'true' | 'false' - enable rate limiting for free tier
   CLAUDE_MEM_OPENROUTER_API_KEY: string;
   CLAUDE_MEM_OPENROUTER_MODEL: string;
@@ -51,6 +51,8 @@ export interface SettingsDefaults {
   // Feature Toggles
   CLAUDE_MEM_CONTEXT_SHOW_LAST_SUMMARY: string;
   CLAUDE_MEM_CONTEXT_SHOW_LAST_MESSAGE: string;
+  // Chroma MCP Server
+  CLAUDE_MEM_CHROMA_SERVER_PORT: string;
 }
 
 export class SettingsDefaultsManager {
@@ -71,7 +73,7 @@ export class SettingsDefaultsManager {
     // AI Provider Configuration
     CLAUDE_MEM_PROVIDER: 'claude',  // Default to Claude
     CLAUDE_MEM_GEMINI_API_KEY: '',  // Empty by default, can be set via UI or env
-    CLAUDE_MEM_GEMINI_MODEL: 'gemini-3-flash',  // Default to latest Gemini 3 Flash model
+    CLAUDE_MEM_GEMINI_MODEL: 'gemini-3-flash-preview',  // Default to latest — do NOT revert to 2.x (see GeminiAgent.ts)
     CLAUDE_MEM_GEMINI_RATE_LIMITING_ENABLED: 'true',  // Rate limiting ON by default for free tier users
     CLAUDE_MEM_OPENROUTER_API_KEY: '',  // Empty by default, can be set via UI or env
     CLAUDE_MEM_OPENROUTER_MODEL: 'xiaomi/mimo-v2-flash:free',  // Default OpenRouter model (free tier)
@@ -101,6 +103,8 @@ export class SettingsDefaultsManager {
     // Feature Toggles
     CLAUDE_MEM_CONTEXT_SHOW_LAST_SUMMARY: 'true',
     CLAUDE_MEM_CONTEXT_SHOW_LAST_MESSAGE: 'false',
+    // Chroma MCP Server
+    CLAUDE_MEM_CHROMA_SERVER_PORT: '37778',
   };
 
   /**

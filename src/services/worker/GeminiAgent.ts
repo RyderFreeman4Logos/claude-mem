@@ -33,22 +33,16 @@ import {
 const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1/models';
 
 // Gemini model types (available via API)
+// NOTE: Gemini 2.x models removed intentionally — gemini-3-flash-preview
+// outperforms 2.5-flash on all benchmarks (GPQA 90.4% vs ~65%, SWE-bench 78% vs ~40%)
+// while using 30% fewer tokens. Keeping deprecated models risks silent quality regression
+// when upstream merges re-add them. If you need 2.x for testing, add it back explicitly.
 export type GeminiModel =
-  | 'gemini-2.5-flash-lite'
-  | 'gemini-2.5-flash'
-  | 'gemini-2.5-pro'
-  | 'gemini-2.0-flash'
-  | 'gemini-2.0-flash-lite'
   | 'gemini-3-flash'
   | 'gemini-3-flash-preview';
 
 // Free tier RPM limits by model (requests per minute)
 const GEMINI_RPM_LIMITS: Record<GeminiModel, number> = {
-  'gemini-2.5-flash-lite': 10,
-  'gemini-2.5-flash': 10,
-  'gemini-2.5-pro': 5,
-  'gemini-2.0-flash': 15,
-  'gemini-2.0-flash-lite': 30,
   'gemini-3-flash': 10,
   'gemini-3-flash-preview': 5,
 };
@@ -460,14 +454,11 @@ export class GeminiAgent {
     const apiKey = settings.CLAUDE_MEM_GEMINI_API_KEY || getCredential('GEMINI_API_KEY') || '';
 
     // Model: from settings or default, with validation
-    const defaultModel: GeminiModel = 'gemini-2.5-flash';
+    // NOTE: Default is gemini-3-flash-preview — do NOT revert to 2.x models.
+    // See GeminiModel type comment for rationale.
+    const defaultModel: GeminiModel = 'gemini-3-flash-preview';
     const configuredModel = settings.CLAUDE_MEM_GEMINI_MODEL || defaultModel;
     const validModels: GeminiModel[] = [
-      'gemini-2.5-flash-lite',
-      'gemini-2.5-flash',
-      'gemini-2.5-pro',
-      'gemini-2.0-flash',
-      'gemini-2.0-flash-lite',
       'gemini-3-flash',
       'gemini-3-flash-preview',
     ];

@@ -64,9 +64,27 @@ export class OpenRouterAgent {
   private geminiAgent: FallbackAgent | null = null;
   private fallbackAgent: FallbackAgent | null = null;
 
+  // Cooldown tracking: when proxy reports model_cooldown with reset_seconds,
+  // skip OpenRouter entirely and route to Gemini until cooldown expires
+  private static cooldownUntil: number = 0;
+
   constructor(dbManager: DatabaseManager, sessionManager: SessionManager) {
     this.dbManager = dbManager;
     this.sessionManager = sessionManager;
+  }
+
+  /**
+   * Check if OpenRouter is currently in cooldown
+   */
+  static isInCooldown(): boolean {
+    return Date.now() < OpenRouterAgent.cooldownUntil;
+  }
+
+  /**
+   * Get remaining cooldown seconds (0 if not in cooldown)
+   */
+  static getCooldownRemainingSeconds(): number {
+    return Math.max(0, Math.ceil((OpenRouterAgent.cooldownUntil - Date.now()) / 1000));
   }
 
   /**
@@ -90,6 +108,23 @@ export class OpenRouterAgent {
    * Uses multi-turn conversation to maintain context across messages
    */
   async startSession(session: ActiveSession, worker?: WorkerRef): Promise<void> {
+    // Check if OpenRouter is in cooldown - delegate to fallback directly
+    if (OpenRouterAgent.isInCooldown()) {
+      const remaining = OpenRouterAgent.getCooldownRemainingSeconds();
+      logger.info('SDK', `OpenRouter in cooldown (${remaining}s remaining), delegating to fallback`, {
+        sessionDbId: session.sessionDbId,
+        cooldownUntil: new Date(OpenRouterAgent.cooldownUntil).toISOString()
+      });
+
+      if (isGeminiAvailable() && this.geminiAgent) {
+        return this.geminiAgent.startSession(session, worker);
+      }
+      if (this.fallbackAgent) {
+        return this.fallbackAgent.startSession(session, worker);
+      }
+      logger.warn('SDK', 'OpenRouter in cooldown but no fallback available, attempting anyway');
+    }
+
     try {
       // Get OpenRouter configuration
       const { apiKey, models, baseUrl, siteUrl, appName } = this.getOpenRouterConfig();
@@ -422,6 +457,16 @@ export class OpenRouterAgent {
                             errorMessage.toLowerCase().includes('credit') ||
                             errorMessage.toLowerCase().includes('429');
 
+        // If cooldown was set (with reset_seconds), skip remaining models -
+        // they share the same proxy/credentials and will also be in cooldown
+        if (OpenRouterAgent.isInCooldown()) {
+          logger.warn('SDK', 'OpenRouter cooldown active, skipping remaining models', {
+            failedModel: model,
+            remainingSeconds: OpenRouterAgent.getCooldownRemainingSeconds()
+          });
+          throw new Error(`OpenRouter in cooldown (${OpenRouterAgent.getCooldownRemainingSeconds()}s remaining). Last error: ${errorMessage}`);
+        }
+
         if (isQuotaError && i < models.length - 1) {
           // Quota error and we have more models to try
           logger.warn('SDK', `OpenRouter model quota exhausted, falling back to next model`, {
@@ -493,6 +538,24 @@ export class OpenRouterAgent {
 
     if (!response.ok) {
       const errorText = await response.text();
+
+      // Parse cooldown info from 429 responses to enable proactive routing
+      if (response.status === 429) {
+        try {
+          const errorData = JSON.parse(errorText);
+          const resetSeconds = errorData.error?.reset_seconds;
+          if (resetSeconds && typeof resetSeconds === 'number') {
+            OpenRouterAgent.cooldownUntil = Date.now() + (resetSeconds * 1000);
+            logger.warn('SDK', `OpenRouter cooldown detected, switching to fallback for ${resetSeconds}s`, {
+              model,
+              resetSeconds,
+              resetTime: errorData.error.reset_time,
+              cooldownUntil: new Date(OpenRouterAgent.cooldownUntil).toISOString()
+            });
+          }
+        } catch { /* response may not be JSON - fall through to normal error handling */ }
+      }
+
       throw new Error(`OpenRouter API error: ${response.status} - ${errorText}`);
     }
 

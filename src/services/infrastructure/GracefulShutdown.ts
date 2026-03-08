@@ -45,6 +45,7 @@ export interface GracefulShutdownConfig {
   mcpClient?: CloseableClient;
   dbManager?: CloseableDatabase;
   chromaMcpManager?: StoppableService;
+  chromaServerLifecycle?: StoppableService;
 }
 
 /**
@@ -84,6 +85,13 @@ export async function performGracefulShutdown(config: GracefulShutdownConfig): P
     logger.info('SHUTDOWN', 'Stopping Chroma MCP connection...');
     await config.chromaMcpManager.stop();
     logger.info('SHUTDOWN', 'Chroma MCP connection stopped');
+  }
+
+  // STEP 5b: Stop Chroma SSE server process
+  if (config.chromaServerLifecycle) {
+    logger.info('SHUTDOWN', 'Stopping Chroma SSE server process...');
+    await config.chromaServerLifecycle.stop();
+    logger.info('SHUTDOWN', 'Chroma SSE server process stopped');
   }
 
   // STEP 6: Close database connection (includes ChromaSync cleanup)
