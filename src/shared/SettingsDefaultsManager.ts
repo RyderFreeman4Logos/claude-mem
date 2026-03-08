@@ -183,7 +183,7 @@ export class SettingsDefaultsManager {
           }
           writeFileSync(settingsPath, JSON.stringify(defaults, null, 2), 'utf-8');
           // Use console instead of logger to avoid circular dependency
-          console.log('[SETTINGS] Created settings file with defaults:', settingsPath);
+          console.error('[SETTINGS] Created settings file with defaults:', settingsPath);
         } catch (error) {
           console.warn('[SETTINGS] Failed to create settings file, using in-memory defaults:', settingsPath, error);
         }
@@ -202,7 +202,7 @@ export class SettingsDefaultsManager {
         // Auto-migrate the file to flat schema
         try {
           writeFileSync(settingsPath, JSON.stringify(flatSettings, null, 2), 'utf-8');
-          console.log('[SETTINGS] Migrated settings file from nested to flat schema:', settingsPath);
+          console.error('[SETTINGS] Migrated settings file from nested to flat schema:', settingsPath);
         } catch (error) {
           console.warn('[SETTINGS] Failed to auto-migrate settings file:', settingsPath, error);
           // Continue with in-memory migration even if write fails
@@ -238,12 +238,12 @@ export class SettingsDefaultsManager {
         if (eventType === 'change') {
           // Invalidate cache on file change
           this.settingsCache.delete(settingsPath);
-          console.log('[SETTINGS] Configuration file changed, cache invalidated:', settingsPath);
+          console.error('[SETTINGS] Configuration file changed, cache invalidated:', settingsPath);
         }
       });
 
       this.fileWatchers.set(settingsPath, watcher);
-      console.log('[SETTINGS] File watcher established for:', settingsPath);
+      console.error('[SETTINGS] File watcher established for:', settingsPath);
     } catch (error) {
       console.warn('[SETTINGS] Failed to setup file watcher:', settingsPath, error);
       // Non-critical error, continue without watching
@@ -264,6 +264,6 @@ export class SettingsDefaultsManager {
       }
     }
     this.fileWatchers.clear();
-    console.log('[SETTINGS] All caches cleared and watchers closed');
+    console.error('[SETTINGS] All caches cleared and watchers closed');
   }
 }
