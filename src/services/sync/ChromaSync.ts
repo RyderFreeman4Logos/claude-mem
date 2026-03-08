@@ -283,11 +283,33 @@ export class ChromaSync {
           metadatas: cleanMetadatas
         });
       } catch (error) {
-        logger.error('CHROMA_SYNC', 'Batch add failed, continuing with remaining batches', {
-          collection: this.collectionName,
-          batchStart: i,
-          batchSize: batch.length
-        }, error as Error);
+        const message = error instanceof Error ? error.message : String(error);
+        if (message.includes('already exist')) {
+          try {
+            await chromaMcp.callTool('chroma_update_documents', {
+              collection_name: this.collectionName,
+              ids: batch.map(d => d.id),
+              documents: batch.map(d => d.document),
+              metadatas: cleanMetadatas
+            });
+            logger.debug('CHROMA_SYNC', 'Batch updated after duplicate ID error', {
+              collection: this.collectionName,
+              batchStart: i,
+              batchSize: batch.length
+            });
+          } catch (updateError) {
+            logger.error('CHROMA_SYNC', 'Batch update also failed', {
+              collection: this.collectionName,
+              batchStart: i
+            }, updateError as Error);
+          }
+        } else {
+          logger.error('CHROMA_SYNC', 'Batch add failed, continuing with remaining batches', {
+            collection: this.collectionName,
+            batchStart: i,
+            batchSize: batch.length
+          }, error as Error);
+        }
       }
     }
 
