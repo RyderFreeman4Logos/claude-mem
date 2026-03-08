@@ -117,7 +117,6 @@ export class SessionRoutes extends BaseRouteHandler {
       session.abortController = new AbortController();
       session.lastGeneratorActivity = Date.now();
       // Start a fresh generator
-      this.spawnInProgress.set(sessionDbId, true);
       this.startGeneratorWithProvider(session, selectedProvider, 'stale-recovery');
       return;
     }
