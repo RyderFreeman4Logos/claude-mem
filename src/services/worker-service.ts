@@ -870,6 +870,22 @@ export class WorkerService {
       this.staleSessionReaperInterval = null;
     }
 
+    // Reset all 'processing' messages back to 'pending' before shutdown.
+    // This ensures no messages are lost when the worker restarts — they'll
+    // be reprocessed on next startup via processPendingQueues().
+    if (this.initializationCompleteFlag) {
+      try {
+        const { PendingMessageStore } = await import('./sqlite/PendingMessageStore.js');
+        const pendingStore = new PendingMessageStore(this.dbManager.getSessionStore().db, 3);
+        const resetCount = pendingStore.resetStaleProcessingMessages(0);
+        if (resetCount > 0) {
+          logger.info('SHUTDOWN', `Reset ${resetCount} processing messages to pending for recovery`);
+        }
+      } catch (error) {
+        logger.error('SHUTDOWN', 'Failed to reset processing messages', {}, error as Error);
+      }
+    }
+
     await performGracefulShutdown({
       server: this.server.getHttpServer(),
       sessionManager: this.sessionManager,
