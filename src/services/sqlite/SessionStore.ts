@@ -839,8 +839,9 @@ export class SessionStore {
    * Add content_hash column to observations for deduplication (migration 22)
    */
   private addObservationContentHashColumn(): void {
-    // Check column existence first (not version), because version 22 may have been
-    // recorded by a different migration in forks that renumbered local migrations.
+    const applied = this.db.prepare('SELECT version FROM schema_versions WHERE version = ?').get(22) as SchemaVersion | undefined;
+    if (applied) return;
+
     const tableInfo = this.db.query('PRAGMA table_info(observations)').all() as TableColumnInfo[];
     const hasColumn = tableInfo.some(col => col.name === 'content_hash');
 
@@ -858,8 +859,9 @@ export class SessionStore {
    * Add custom_title column to sdk_sessions for agent attribution (migration 23)
    */
   private addSessionCustomTitleColumn(): void {
-    // Check column existence first (not version), because version 23 may have been
-    // recorded by a different migration in forks that renumbered local migrations.
+    const applied = this.db.prepare('SELECT version FROM schema_versions WHERE version = ?').get(23) as SchemaVersion | undefined;
+    if (applied) return;
+
     const tableInfo = this.db.query('PRAGMA table_info(sdk_sessions)').all() as TableColumnInfo[];
     const hasColumn = tableInfo.some(col => col.name === 'custom_title');
 

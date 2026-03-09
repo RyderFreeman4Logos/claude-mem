@@ -637,106 +637,6 @@ export class MigrationRunner {
   }
 
   /**
-   * Add last_attempted_at_epoch column to pending_messages (migration 24)
-   * Used by claim() for exponential backoff tracking
-   */
-  private addLastAttemptedAtColumn(): void {
-    const applied = this.db.prepare('SELECT version FROM schema_versions WHERE version = ?').get(24) as SchemaVersion | undefined;
-    if (applied) return;
-
-    const tableInfo = this.db.query('PRAGMA table_info(pending_messages)').all() as TableColumnInfo[];
-    const hasColumn = tableInfo.some(col => col.name === 'last_attempted_at_epoch');
-
-    if (!hasColumn) {
-      this.db.run('ALTER TABLE pending_messages ADD COLUMN last_attempted_at_epoch INTEGER');
-      logger.debug('DB', 'Added last_attempted_at_epoch column to pending_messages table');
-    }
-
-    this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(24, new Date().toISOString());
-  }
-
-  /**
-   * Create failed_messages table for dead letter queue (migration 25)
-   * Stores messages that exceeded max retries or timed out
-   */
-  private createFailedMessagesTable(): void {
-    const applied = this.db.prepare('SELECT version FROM schema_versions WHERE version = ?').get(25) as SchemaVersion | undefined;
-    if (applied) return;
-
-    // Check if table already exists
-    const tables = this.db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='failed_messages'").all() as TableNameRow[];
-    if (tables.length > 0) {
-      this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(25, new Date().toISOString());
-      return;
-    }
-
-    logger.debug('DB', 'Creating failed_messages table for dead letter queue');
-
-    this.db.run(`
-      CREATE TABLE failed_messages (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        original_id INTEGER,
-        session_db_id INTEGER NOT NULL,
-        content_session_id TEXT NOT NULL,
-        message_type TEXT NOT NULL,
-        tool_name TEXT,
-        tool_input TEXT,
-        tool_response TEXT,
-        cwd TEXT,
-        last_assistant_message TEXT,
-        prompt_number INTEGER,
-        retry_count INTEGER NOT NULL DEFAULT 0,
-        created_at_epoch INTEGER NOT NULL,
-        failed_at_epoch INTEGER NOT NULL,
-        fail_reason TEXT NOT NULL DEFAULT 'max_retries_exceeded',
-        retry_history TEXT,
-        FOREIGN KEY (session_db_id) REFERENCES sdk_sessions(id) ON DELETE CASCADE
-      )
-    `);
-
-    this.db.run('CREATE INDEX IF NOT EXISTS idx_failed_messages_session ON failed_messages(session_db_id)');
-    this.db.run('CREATE INDEX IF NOT EXISTS idx_failed_messages_failed_at ON failed_messages(failed_at_epoch DESC)');
-    this.db.run('CREATE INDEX IF NOT EXISTS idx_failed_messages_claude_session ON failed_messages(content_session_id)');
-
-    this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(25, new Date().toISOString());
-
-    logger.debug('DB', 'failed_messages table created successfully');
-  }
-
-  /**
-   * Add content_hash and duplicate_count columns for message deduplication (migration 26)
-   * Enables detection and merging of duplicate messages in the queue
-   */
-  private addMessageDeduplicationColumns(): void {
-    const applied = this.db.prepare('SELECT version FROM schema_versions WHERE version = ?').get(26) as SchemaVersion | undefined;
-    if (applied) return;
-
-    const tableInfo = this.db.query('PRAGMA table_info(pending_messages)').all() as TableColumnInfo[];
-    const hasContentHash = tableInfo.some(col => col.name === 'content_hash');
-    const hasDuplicateCount = tableInfo.some(col => col.name === 'duplicate_count');
-    const hasMergedMetadata = tableInfo.some(col => col.name === 'merged_metadata');
-
-    if (!hasContentHash) {
-      this.db.run('ALTER TABLE pending_messages ADD COLUMN content_hash TEXT');
-      this.db.run('CREATE INDEX IF NOT EXISTS idx_pending_messages_content_hash ON pending_messages(content_hash)');
-      logger.debug('DB', 'Added content_hash column to pending_messages table');
-    }
-
-    if (!hasDuplicateCount) {
-      this.db.run('ALTER TABLE pending_messages ADD COLUMN duplicate_count INTEGER NOT NULL DEFAULT 0');
-      logger.debug('DB', 'Added duplicate_count column to pending_messages table');
-    }
-
-    if (!hasMergedMetadata) {
-      this.db.run('ALTER TABLE pending_messages ADD COLUMN merged_metadata TEXT');
-      logger.debug('DB', 'Added merged_metadata column to pending_messages table');
-    }
-
-    this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(26, new Date().toISOString());
-    logger.debug('DB', 'Message deduplication columns added successfully');
-  }
-
-  /**
    * Add ON UPDATE CASCADE to FK constraints on observations and session_summaries (migration 21)
    *
    * Both tables have FK(memory_session_id) -> sdk_sessions(memory_session_id) with ON DELETE CASCADE
@@ -926,8 +826,9 @@ export class MigrationRunner {
    * Backfills existing rows with unique random hashes so they don't block new inserts.
    */
   private addObservationContentHashColumn(): void {
-    // Check column existence first (not version), because version 22 may have been
-    // recorded by a different migration in forks that renumbered local migrations.
+    const applied = this.db.prepare('SELECT version FROM schema_versions WHERE version = ?').get(22) as SchemaVersion | undefined;
+    if (applied) return;
+
     const tableInfo = this.db.query('PRAGMA table_info(observations)').all() as TableColumnInfo[];
     const hasColumn = tableInfo.some(col => col.name === 'content_hash');
 
@@ -948,8 +849,9 @@ export class MigrationRunner {
    * Allows callers (e.g. Maestro agents) to label sessions with a human-readable name.
    */
   private addSessionCustomTitleColumn(): void {
-    // Check column existence first (not version), because version 23 may have been
-    // recorded by a different migration in forks that renumbered local migrations.
+    const applied = this.db.prepare('SELECT version FROM schema_versions WHERE version = ?').get(23) as SchemaVersion | undefined;
+    if (applied) return;
+
     const tableInfo = this.db.query('PRAGMA table_info(sdk_sessions)').all() as TableColumnInfo[];
     const hasColumn = tableInfo.some(col => col.name === 'custom_title');
 
@@ -959,5 +861,105 @@ export class MigrationRunner {
     }
 
     this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(23, new Date().toISOString());
+  }
+
+  /**
+   * Add last_attempted_at_epoch column to pending_messages (migration 24)
+   * Used by claim() for exponential backoff tracking
+   */
+  private addLastAttemptedAtColumn(): void {
+    const applied = this.db.prepare('SELECT version FROM schema_versions WHERE version = ?').get(24) as SchemaVersion | undefined;
+    if (applied) return;
+
+    const tableInfo = this.db.query('PRAGMA table_info(pending_messages)').all() as TableColumnInfo[];
+    const hasColumn = tableInfo.some(col => col.name === 'last_attempted_at_epoch');
+
+    if (!hasColumn) {
+      this.db.run('ALTER TABLE pending_messages ADD COLUMN last_attempted_at_epoch INTEGER');
+      logger.debug('DB', 'Added last_attempted_at_epoch column to pending_messages table');
+    }
+
+    this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(24, new Date().toISOString());
+  }
+
+  /**
+   * Create failed_messages table for dead letter queue (migration 25)
+   * Stores messages that exceeded max retries or timed out
+   */
+  private createFailedMessagesTable(): void {
+    const applied = this.db.prepare('SELECT version FROM schema_versions WHERE version = ?').get(25) as SchemaVersion | undefined;
+    if (applied) return;
+
+    // Check if table already exists
+    const tables = this.db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='failed_messages'").all() as TableNameRow[];
+    if (tables.length > 0) {
+      this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(25, new Date().toISOString());
+      return;
+    }
+
+    logger.debug('DB', 'Creating failed_messages table for dead letter queue');
+
+    this.db.run(`
+      CREATE TABLE failed_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        original_id INTEGER,
+        session_db_id INTEGER NOT NULL,
+        content_session_id TEXT NOT NULL,
+        message_type TEXT NOT NULL,
+        tool_name TEXT,
+        tool_input TEXT,
+        tool_response TEXT,
+        cwd TEXT,
+        last_assistant_message TEXT,
+        prompt_number INTEGER,
+        retry_count INTEGER NOT NULL DEFAULT 0,
+        created_at_epoch INTEGER NOT NULL,
+        failed_at_epoch INTEGER NOT NULL,
+        fail_reason TEXT NOT NULL DEFAULT 'max_retries_exceeded',
+        retry_history TEXT,
+        FOREIGN KEY (session_db_id) REFERENCES sdk_sessions(id) ON DELETE CASCADE
+      )
+    `);
+
+    this.db.run('CREATE INDEX IF NOT EXISTS idx_failed_messages_session ON failed_messages(session_db_id)');
+    this.db.run('CREATE INDEX IF NOT EXISTS idx_failed_messages_failed_at ON failed_messages(failed_at_epoch DESC)');
+    this.db.run('CREATE INDEX IF NOT EXISTS idx_failed_messages_claude_session ON failed_messages(content_session_id)');
+
+    this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(25, new Date().toISOString());
+
+    logger.debug('DB', 'failed_messages table created successfully');
+  }
+
+  /**
+   * Add content_hash and duplicate_count columns for message deduplication (migration 26)
+   * Enables detection and merging of duplicate messages in the queue
+   */
+  private addMessageDeduplicationColumns(): void {
+    const applied = this.db.prepare('SELECT version FROM schema_versions WHERE version = ?').get(26) as SchemaVersion | undefined;
+    if (applied) return;
+
+    const tableInfo = this.db.query('PRAGMA table_info(pending_messages)').all() as TableColumnInfo[];
+    const hasContentHash = tableInfo.some(col => col.name === 'content_hash');
+    const hasDuplicateCount = tableInfo.some(col => col.name === 'duplicate_count');
+    const hasMergedMetadata = tableInfo.some(col => col.name === 'merged_metadata');
+
+    if (!hasContentHash) {
+      this.db.run('ALTER TABLE pending_messages ADD COLUMN content_hash TEXT');
+      this.db.run('CREATE INDEX IF NOT EXISTS idx_pending_messages_content_hash ON pending_messages(content_hash)');
+      logger.debug('DB', 'Added content_hash column to pending_messages table');
+    }
+
+    if (!hasDuplicateCount) {
+      this.db.run('ALTER TABLE pending_messages ADD COLUMN duplicate_count INTEGER NOT NULL DEFAULT 0');
+      logger.debug('DB', 'Added duplicate_count column to pending_messages table');
+    }
+
+    if (!hasMergedMetadata) {
+      this.db.run('ALTER TABLE pending_messages ADD COLUMN merged_metadata TEXT');
+      logger.debug('DB', 'Added merged_metadata column to pending_messages table');
+    }
+
+    this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(26, new Date().toISOString());
+    logger.debug('DB', 'Message deduplication columns added successfully');
   }
 }

@@ -25,6 +25,8 @@ import { getProcessBySession, ensureProcessExit } from '../../ProcessRegistry.js
 
 export class SessionRoutes extends BaseRouteHandler {
   private completionHandler: SessionCompletionHandler;
+  private spawnInProgress = new Map<number, boolean>();
+  private crashRecoveryScheduled = new Set<number>();
 
   constructor(
     private sessionManager: SessionManager,
@@ -94,10 +96,17 @@ export class SessionRoutes extends BaseRouteHandler {
     const session = this.sessionManager.getSession(sessionDbId);
     if (!session) return;
 
+    // GUARD: Prevent duplicate spawns
+    if (this.spawnInProgress.get(sessionDbId)) {
+      logger.debug('SESSION', 'Spawn already in progress, skipping', { sessionDbId, source });
+      return;
+    }
+
     const selectedProvider = this.getSelectedProvider();
 
     // Start generator if not running
     if (!session.generatorPromise) {
+      this.spawnInProgress.set(sessionDbId, true);
       this.startGeneratorWithProvider(session, selectedProvider, source);
       return;
     }
@@ -117,6 +126,7 @@ export class SessionRoutes extends BaseRouteHandler {
       session.abortController = new AbortController();
       session.lastGeneratorActivity = Date.now();
       // Start a fresh generator
+      this.spawnInProgress.set(sessionDbId, true);
       this.startGeneratorWithProvider(session, selectedProvider, 'stale-recovery');
       return;
     }
@@ -144,13 +154,12 @@ export class SessionRoutes extends BaseRouteHandler {
   ): void {
     if (!session) return;
 
-    // If previous lifecycle aborted this controller, a new generator would immediately
-    // exit without consuming queue messages. Reset before (re)start.
+    // Reset AbortController if it was previously aborted
+    // This fixes the bug where a session gets stuck in an infinite "Generator aborted" loop
+    // after its AbortController was aborted (e.g., from a previous generator exit)
     if (session.abortController.signal.aborted) {
-      logger.warn('SESSION', 'Resetting aborted controller before generator start', {
-        sessionId: session.sessionDbId,
-        source,
-        provider
+      logger.debug('SESSION', 'Resetting aborted AbortController before starting generator', {
+        sessionId: session.sessionDbId
       });
       session.abortController = new AbortController();
     }
@@ -158,9 +167,13 @@ export class SessionRoutes extends BaseRouteHandler {
     const agent = provider === 'openrouter' ? this.openRouterAgent : (provider === 'gemini' ? this.geminiAgent : this.sdkAgent);
     const agentName = provider === 'openrouter' ? 'OpenRouter' : (provider === 'gemini' ? 'Gemini' : 'Claude SDK');
 
+    // Use database count for accurate telemetry (in-memory array is always empty due to FK constraint fix)
+    const pendingStore = this.sessionManager.getPendingMessageStore();
+    const actualQueueDepth = pendingStore.getPendingCount(session.sessionDbId);
+
     logger.info('SESSION', `Generator auto-starting (${source}) using ${agentName}`, {
       sessionId: session.sessionDbId,
-      queueDepth: session.pendingMessages.length,
+      queueDepth: actualQueueDepth,
       historyLength: session.conversationHistory.length
     });
 
@@ -203,12 +216,8 @@ export class SessionRoutes extends BaseRouteHandler {
         }
 
         const sessionDbId = session.sessionDbId;
+        this.spawnInProgress.delete(sessionDbId);
         const wasAborted = session.abortController.signal.aborted;
-
-        // CRITICAL: Capture the controller reference BEFORE clearing generatorPromise
-        // This prevents a race condition where a new generator starts (from new observation)
-        // and we accidentally abort its controller instead of our old one
-        const myController = session.abortController;
 
         if (wasAborted) {
           logger.info('SESSION', `Generator aborted`, { sessionId: sessionDbId });
@@ -220,79 +229,76 @@ export class SessionRoutes extends BaseRouteHandler {
         session.currentProvider = null;
         this.workerService.broadcastProcessingStatus();
 
-        // Crash recovery: If not aborted and still has work, restart
+        // Crash recovery: If not aborted and still has work, restart (with limit)
         if (!wasAborted) {
           try {
             const pendingStore = this.sessionManager.getPendingMessageStore();
             const pendingCount = pendingStore.getPendingCount(sessionDbId);
 
+            // CRITICAL: Limit consecutive restarts to prevent infinite loops
+            // This prevents runaway API costs when there's a persistent error (e.g., memorySessionId not captured)
+            const MAX_CONSECUTIVE_RESTARTS = 3;
+
             if (pendingCount > 0) {
-              // Guard against infinite restart loops (same protection as startSessionProcessor)
-              const MAX_CONSECUTIVE_RESTARTS = 5;
+              // GUARD: Prevent duplicate crash recovery spawns
+              if (this.crashRecoveryScheduled.has(sessionDbId)) {
+                logger.debug('SESSION', 'Crash recovery already scheduled', { sessionDbId });
+                return;
+              }
+
               session.consecutiveRestarts = (session.consecutiveRestarts || 0) + 1;
 
               if (session.consecutiveRestarts > MAX_CONSECUTIVE_RESTARTS) {
-                logger.error('SESSION', 'Session hit max consecutive restarts via SessionRoutes, abandoning', {
+                logger.error('SESSION', `CRITICAL: Generator restart limit exceeded - stopping to prevent runaway costs`, {
                   sessionId: sessionDbId,
                   pendingCount,
-                  consecutiveRestarts: session.consecutiveRestarts
+                  consecutiveRestarts: session.consecutiveRestarts,
+                  maxRestarts: MAX_CONSECUTIVE_RESTARTS,
+                  action: 'Generator will NOT restart. Check logs for root cause. Messages remain in pending state.'
                 });
-                const abandoned = pendingStore.markAllSessionMessagesAbandoned(sessionDbId);
-                logger.warn('SESSION', `Marked ${abandoned} messages as failed after max restarts`, {
-                  sessionId: sessionDbId
-                });
-                this.workerService.broadcastProcessingStatus();
+                // Don't restart - abort to prevent further API calls
+                session.abortController.abort();
                 return;
               }
 
               logger.info('SESSION', `Restarting generator after crash/exit with pending work`, {
                 sessionId: sessionDbId,
                 pendingCount,
-                consecutiveRestarts: session.consecutiveRestarts
+                consecutiveRestarts: session.consecutiveRestarts,
+                maxRestarts: MAX_CONSECUTIVE_RESTARTS
               });
 
-              // CRITICAL: Only replace controller if it hasn't been replaced by another generator
-              // (race condition: new observation may have already started a new generator)
-              if (session.abortController === myController) {
-                const oldController = session.abortController;
-                session.abortController = new AbortController();
-                oldController.abort();
-              } else {
-                logger.debug('SESSION', 'Controller already replaced by new generator, skipping abort', {
-                  sessionId: sessionDbId
-                });
-              }
+              // Abort OLD controller before replacing to prevent child process leaks
+              const oldController = session.abortController;
+              session.abortController = new AbortController();
+              oldController.abort();
 
-              // Small delay before restart
+              this.crashRecoveryScheduled.add(sessionDbId);
+
+              // Exponential backoff: 1s, 2s, 4s for subsequent restarts
+              const backoffMs = Math.min(1000 * Math.pow(2, session.consecutiveRestarts - 1), 8000);
+
+              // Delay before restart with exponential backoff
               setTimeout(() => {
+                this.crashRecoveryScheduled.delete(sessionDbId);
                 const stillExists = this.sessionManager.getSession(sessionDbId);
                 if (stillExists && !stillExists.generatorPromise) {
                   this.startGeneratorWithProvider(stillExists, this.getSelectedProvider(), 'crash-recovery');
                 }
-              }, 1000);
+              }, backoffMs);
             } else {
-              // No pending work - only abort if controller hasn't been replaced
-              // (race condition: new observation may have started between generatorPromise=null and here)
-              if (session.abortController === myController) {
-                session.abortController.abort();
-                // Reset restart counter after a clean completion path.
-                session.consecutiveRestarts = 0;
-                logger.debug('SESSION', 'Aborted controller after natural completion', {
-                  sessionId: sessionDbId
-                });
-              } else {
-                logger.debug('SESSION', 'Controller replaced, new generator running - skipping abort', {
-                  sessionId: sessionDbId
-                });
-              }
+              // No pending work - abort to kill the child process
+              session.abortController.abort();
+              // Reset restart counter on successful completion
+              session.consecutiveRestarts = 0;
+              logger.debug('SESSION', 'Aborted controller after natural completion', {
+                sessionId: sessionDbId
+              });
             }
           } catch (e) {
             // Ignore errors during recovery check, but still abort to prevent leaks
-            // Only abort if controller hasn't been replaced
-            if (session.abortController === myController) {
-              logger.debug('SESSION', 'Error during recovery check, aborting to prevent leaks', { sessionId: sessionDbId, error: e instanceof Error ? e.message : String(e) });
-              session.abortController.abort();
-            }
+            logger.debug('SESSION', 'Error during recovery check, aborting to prevent leaks', { sessionId: sessionDbId, error: e instanceof Error ? e.message : String(e) });
+            session.abortController.abort();
           }
         }
         // NOTE: We do NOT delete the session here anymore.
@@ -382,8 +388,8 @@ export class SessionRoutes extends BaseRouteHandler {
       });
     }
 
-    // Start agent in background using the helper method
-    this.startGeneratorWithProvider(session, this.getSelectedProvider(), 'init');
+    // Idempotent: ensure generator is running (matches handleObservations / handleSummarize)
+    this.ensureGeneratorRunning(sessionDbId, 'init');
 
     // Broadcast session started event
     this.eventBroadcaster.broadcastSessionStarted(sessionDbId, session.project);
@@ -453,11 +459,15 @@ export class SessionRoutes extends BaseRouteHandler {
       return;
     }
 
+    // Use database count for accurate queue length (in-memory array is always empty due to FK constraint fix)
+    const pendingStore = this.sessionManager.getPendingMessageStore();
+    const queueLength = pendingStore.getPendingCount(sessionDbId);
+
     res.json({
       status: 'active',
       sessionDbId,
       project: session.project,
-      queueLength: session.pendingMessages.length,
+      queueLength,
       uptime: Date.now() - session.startTime
     });
   });
@@ -632,24 +642,47 @@ export class SessionRoutes extends BaseRouteHandler {
    * Complete session by contentSessionId (session-complete hook uses this)
    * POST /api/sessions/complete
    * Body: { contentSessionId }
+   *
+   * Removes session from active sessions map, allowing orphan reaper to
+   * clean up any remaining subprocesses.
+   *
+   * Fixes Issue #842: Sessions stay in map forever, reaper thinks all active.
    */
   private handleCompleteByClaudeId = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
     const { contentSessionId } = req.body;
+
+    logger.info('HTTP', '→ POST /api/sessions/complete', { contentSessionId });
 
     if (!contentSessionId) {
       return this.badRequest(res, 'Missing contentSessionId');
     }
 
     const store = this.dbManager.getSessionStore();
-    const sessionDbId = store.createSDKSession(contentSessionId, '', '');
-    const activeSession = this.sessionManager.getSession(sessionDbId);
 
+    // Look up sessionDbId from contentSessionId (createSDKSession is idempotent)
+    // Pass empty strings - we only need the ID lookup, not to create a new session
+    const sessionDbId = store.createSDKSession(contentSessionId, '', '');
+
+    // Check if session is in the active sessions map
+    const activeSession = this.sessionManager.getSession(sessionDbId);
     if (!activeSession) {
+      // Session may not be in memory (already completed or never initialized)
+      logger.debug('SESSION', 'session-complete: Session not in active map', {
+        contentSessionId,
+        sessionDbId
+      });
       res.json({ status: 'skipped', reason: 'not_active' });
       return;
     }
 
+    // Complete the session (removes from active sessions map)
     await this.completionHandler.completeByDbId(sessionDbId);
+
+    logger.info('SESSION', 'Session completed via API', {
+      contentSessionId,
+      sessionDbId
+    });
+
     res.json({ status: 'completed', sessionDbId });
   });
 
