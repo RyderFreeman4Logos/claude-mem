@@ -1,6 +1,6 @@
 import { join, dirname, basename, sep } from 'path';
 import { homedir } from 'os';
-import { existsSync, mkdirSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync } from 'fs';
 import { execSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { SettingsDefaultsManager } from './SettingsDefaultsManager.js';
@@ -39,7 +39,6 @@ function resolveDataDir(): string {
   const settingsPath = join(defaultDataDir, 'settings.json');
   try {
     if (existsSync(settingsPath)) {
-      const { readFileSync } = require('fs');
       const raw = JSON.parse(readFileSync(settingsPath, 'utf-8'));
       const settings = raw.env ?? raw; // handle legacy nested schema
       if (settings.CLAUDE_MEM_DATA_DIR) {

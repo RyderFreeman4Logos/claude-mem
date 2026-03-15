@@ -179,10 +179,14 @@ export async function ensureProcessExit(tracked: TrackedProcess, timeoutMs: numb
   const sigkillExitPromise = new Promise<void>((resolve) => {
     proc.once('exit', () => resolve());
   });
+  let sigkillTimeoutHandle: NodeJS.Timeout | undefined;
   const sigkillTimeout = new Promise<void>((resolve) => {
-    setTimeout(resolve, 1000);
+    sigkillTimeoutHandle = setTimeout(resolve, 1000);
   });
   await Promise.race([sigkillExitPromise, sigkillTimeout]);
+  if (sigkillTimeoutHandle) {
+    clearTimeout(sigkillTimeoutHandle);
+  }
   unregisterProcess(pid);
 }
 

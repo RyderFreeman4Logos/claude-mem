@@ -1,5 +1,6 @@
 import { Database } from 'bun:sqlite';
 import { execFileSync } from 'child_process';
+import { randomUUID } from 'crypto';
 import { existsSync, unlinkSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -76,7 +77,7 @@ function repairMalformedSchema(db: Database): void {
     // We write a temp script rather than using -c to avoid shell escaping issues
     // with paths containing spaces or special characters. execFileSync passes
     // args directly without a shell, so dbPath and objectName are safe.
-    const scriptPath = join(tmpdir(), `claude-mem-repair-${Date.now()}.py`);
+    const scriptPath = join(tmpdir(), `claude-mem-repair-${Date.now()}-${randomUUID()}.py`);
     try {
       writeFileSync(scriptPath, `
 import sqlite3, sys
