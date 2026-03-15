@@ -1735,34 +1735,22 @@ export class SessionStore {
     const storeTx = this.db.transaction(() => {
       const observationIds: number[] = [];
 
-      // 1. Store all observations
+      // 1. Store all observations (with content-hash deduplication)
       const obsStmt = this.db.prepare(`
         INSERT INTO observations
         (memory_session_id, project, type, title, subtitle, facts, narrative, concepts,
-         files_read, files_modified, prompt_number, discovery_tokens, created_at, created_at_epoch)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         files_read, files_modified, prompt_number, discovery_tokens, content_hash, created_at, created_at_epoch)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
 
       for (const observation of observations) {
-        // Check if observation already exists to prevent duplicates
-        const existing = this.checkObservationExists(
-          memorySessionId,
-          observation.title,
-          observation.subtitle,
-          observation.type
-        );
-
+        // Content-hash deduplication (same logic as storeObservation singular)
+        const contentHash = computeObservationContentHash(memorySessionId, observation.title, observation.narrative);
+        const existing = findDuplicateObservation(this.db, contentHash, timestampEpoch);
         if (existing) {
-          logger.debug('DB', 'Observation already exists in batch, skipping', {
-            obsId: existing.id,
-            title: observation.title,
-            subtitle: observation.subtitle
-          });
           observationIds.push(existing.id);
-          continue; // Skip insertion, use existing ID
+          continue;
         }
-
-        // Insert new observation
         const result = obsStmt.run(
           memorySessionId,
           project,
@@ -1776,6 +1764,7 @@ export class SessionStore {
           JSON.stringify(observation.files_modified),
           promptNumber || null,
           discoveryTokens,
+          contentHash,
           timestampIso,
           timestampEpoch
         );
@@ -1874,15 +1863,23 @@ export class SessionStore {
     const storeAndMarkTx = this.db.transaction(() => {
       const observationIds: number[] = [];
 
-      // 1. Store all observations
+      // 1. Store all observations (with content-hash deduplication)
       const obsStmt = this.db.prepare(`
         INSERT INTO observations
         (memory_session_id, project, type, title, subtitle, facts, narrative, concepts,
-         files_read, files_modified, prompt_number, discovery_tokens, created_at, created_at_epoch)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         files_read, files_modified, prompt_number, discovery_tokens, content_hash, created_at, created_at_epoch)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
 
       for (const observation of observations) {
+        // Content-hash deduplication (same logic as storeObservation singular)
+        const contentHash = computeObservationContentHash(memorySessionId, observation.title, observation.narrative);
+        const existing = findDuplicateObservation(this.db, contentHash, timestampEpoch);
+        if (existing) {
+          observationIds.push(existing.id);
+          continue;
+        }
+
         const result = obsStmt.run(
           memorySessionId,
           project,
@@ -1896,6 +1893,7 @@ export class SessionStore {
           JSON.stringify(observation.files_modified),
           promptNumber || null,
           discoveryTokens,
+          contentHash,
           timestampIso,
           timestampEpoch
         );

@@ -158,7 +158,7 @@ export class ChromaServerLifecycle {
       const apiKey = (settings as Record<string, string>).CLAUDE_MEM_CHROMA_API_KEY || '';
 
       const args = ['--client-type', 'http', '--host', host, '--port', port];
-      if (ssl) args.push('--ssl');
+      args.push('--ssl', ssl ? 'true' : 'false');
       if (tenant !== 'default_tenant') args.push('--tenant', tenant);
       if (database !== 'default_database') args.push('--database', database);
       if (apiKey) args.push('--api-key', apiKey);
