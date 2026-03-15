@@ -7,6 +7,17 @@ description: Search claude-mem's persistent cross-session memory database. Use w
 
 Search past work across all sessions. Simple workflow: search -> filter -> fetch.
 
+## Tool Names in Claude Code
+
+Claude Code registers these as deferred MCP tools with prefixed names:
+
+- `mcp__plugin_claude-mem_mcp-search__search`
+- `mcp__plugin_claude-mem_mcp-search__timeline`
+- `mcp__plugin_claude-mem_mcp-search__get_observations`
+
+The short names `search`, `timeline`, and `get_observations` below refer to those same tools.
+If tool discovery does not surface `search`, search for `mcp-search` or the full prefixed names above.
+
 ## When to Use
 
 Use when users ask about PREVIOUS sessions (not current conversation):
@@ -21,7 +32,7 @@ Use when users ask about PREVIOUS sessions (not current conversation):
 
 ### Step 1: Search - Get Index with IDs
 
-Use the `search` MCP tool:
+Use the `search` MCP tool (`mcp__plugin_claude-mem_mcp-search__search` in Claude Code):
 
 ```
 search(query="authentication", limit=20, project="my-project")
@@ -50,7 +61,7 @@ search(query="authentication", limit=20, project="my-project")
 
 ### Step 2: Timeline - Get Context Around Interesting Results
 
-Use the `timeline` MCP tool:
+Use the `timeline` MCP tool (`mcp__plugin_claude-mem_mcp-search__timeline` in Claude Code):
 
 ```
 timeline(anchor=11131, depth_before=3, depth_after=3, project="my-project")
@@ -76,7 +87,7 @@ timeline(query="authentication", depth_before=3, depth_after=3, project="my-proj
 
 Review titles from Step 1 and context from Step 2. Pick relevant IDs. Discard the rest.
 
-Use the `get_observations` MCP tool:
+Use the `get_observations` MCP tool (`mcp__plugin_claude-mem_mcp-search__get_observations` in Claude Code):
 
 ```
 get_observations(ids=[11131, 10942])
