@@ -83,7 +83,6 @@ export class ChromaMcpManager {
    * No subprocess spawning; the server is managed by ChromaServerLifecycle.
    */
   private async connectInternal(): Promise<void> {
-    // Clean up stale client/transport
     if (this.transport) {
       try { await this.transport.close(); } catch { /* already dead */ }
     }
@@ -135,7 +134,6 @@ export class ChromaMcpManager {
     this.connected = true;
     logger.info('CHROMA_MCP', 'Connected to chroma-mcp SSE server successfully');
 
-    // Listen for transport close to mark connection as dead
     const currentTransport = this.transport;
     this.transport.onclose = () => {
       if (this.transport !== currentTransport) {
@@ -168,7 +166,6 @@ export class ChromaMcpManager {
         arguments: toolArguments
       }, undefined, { timeout: MCP_TOOL_TIMEOUT_MS });
     } catch (transportError) {
-      // SSE connection may have dropped. Reconnect and retry once.
       this.connected = false;
       this.client = null;
       this.transport = null;

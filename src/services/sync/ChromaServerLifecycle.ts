@@ -8,13 +8,15 @@
  * Fixes GitHub Issue #3: per-session stdio spawning caused ~4GB+ memory leaks.
  */
 
-import { ChildProcess, spawn } from 'child_process';
+import { ChildProcess, execSync, spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { logger } from '../../utils/logger.js';
 import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
 import { USER_SETTINGS_PATH } from '../../shared/paths.js';
+import { sanitizeEnv } from '../../supervisor/env-sanitizer.js';
+import { getSupervisor } from '../../supervisor/index.js';
 
 const DEFAULT_CHROMA_DATA_DIR = path.join(os.homedir(), '.claude-mem', 'chroma');
 const HEALTH_CHECK_INTERVAL_MS = 2_000;
@@ -22,6 +24,7 @@ const HEALTH_CHECK_TIMEOUT_MS = 30_000;
 const RESTART_BACKOFF_BASE_MS = 5_000;
 const MAX_RESTART_BACKOFF_MS = 60_000;
 const MAX_CONSECUTIVE_FAILURES = 5;
+const CHROMA_SUPERVISOR_ID = 'chroma-mcp';
 
 export class ChromaServerLifecycle {
   private process: ChildProcess | null = null;
@@ -73,10 +76,9 @@ export class ChromaServerLifecycle {
     const command = isWindows ? (process.env.ComSpec || 'cmd.exe') : 'uvx';
     const args = isWindows ? ['/c', 'uvx', ...uvxArgs] : uvxArgs;
 
-    const env: Record<string, string> = {};
-    for (const [key, value] of Object.entries(process.env)) {
-      if (value !== undefined) env[key] = value;
-    }
+    getSupervisor().assertCanSpawn('chroma mcp');
+
+    const env = this.getSpawnEnv();
     env['FASTMCP_HOST'] = '127.0.0.1';
     env['FASTMCP_PORT'] = String(this.port);
 
@@ -92,6 +94,14 @@ export class ChromaServerLifecycle {
       windowsHide: true
     });
 
+    if (this.process.pid) {
+      getSupervisor().registerProcess(CHROMA_SUPERVISOR_ID, {
+        pid: this.process.pid,
+        type: 'chroma',
+        startedAt: new Date().toISOString()
+      }, this.process);
+    }
+
     // Log stderr for diagnostics
     if (this.process.stderr) {
       this.process.stderr.on('data', (chunk: Buffer) => {
@@ -105,6 +115,7 @@ export class ChromaServerLifecycle {
     // Handle unexpected exit
     this.process.on('exit', (code, signal) => {
       logger.warn('CHROMA_LIFECYCLE', 'chroma-mcp SSE server exited', { code, signal });
+      getSupervisor().unregisterProcess(CHROMA_SUPERVISOR_ID);
       this.process = null;
       this.running = false;
 
@@ -116,6 +127,7 @@ export class ChromaServerLifecycle {
     // Handle spawn errors
     this.process.on('error', (error) => {
       logger.error('CHROMA_LIFECYCLE', 'Failed to spawn chroma-mcp SSE server', {}, error);
+      getSupervisor().unregisterProcess(CHROMA_SUPERVISOR_ID);
       this.process = null;
       this.running = false;
 
@@ -169,6 +181,101 @@ export class ChromaServerLifecycle {
       '--client-type', 'persistent',
       '--data-dir', DEFAULT_CHROMA_DATA_DIR.replace(/\\/g, '/')
     ];
+  }
+
+  /**
+   * Get or create a combined SSL certificate bundle for Zscaler/corporate proxy environments.
+   * On macOS, combines the Python certifi CA bundle with any Zscaler certificates from
+   * the system keychain. Caches the result for 24 hours at ~/.claude-mem/combined_certs.pem.
+   */
+  private getCombinedCertPath(): string | undefined {
+    const combinedCertPath = path.join(os.homedir(), '.claude-mem', 'combined_certs.pem');
+
+    if (fs.existsSync(combinedCertPath)) {
+      const stats = fs.statSync(combinedCertPath);
+      const ageMs = Date.now() - stats.mtimeMs;
+      if (ageMs < 24 * 60 * 60 * 1000) {
+        return combinedCertPath;
+      }
+    }
+
+    if (process.platform !== 'darwin') {
+      return undefined;
+    }
+
+    try {
+      let certifiPath: string | undefined;
+      try {
+        certifiPath = execSync(
+          'uvx --with certifi python -c "import certifi; print(certifi.where())"',
+          { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 10000 }
+        ).trim();
+      } catch {
+        return undefined;
+      }
+
+      if (!certifiPath || !fs.existsSync(certifiPath)) {
+        return undefined;
+      }
+
+      let zscalerCert = '';
+      try {
+        zscalerCert = execSync(
+          'security find-certificate -a -c "Zscaler" -p /Library/Keychains/System.keychain',
+          { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 5000 }
+        );
+      } catch {
+        return undefined;
+      }
+
+      if (!zscalerCert.includes('-----BEGIN CERTIFICATE-----') ||
+          !zscalerCert.includes('-----END CERTIFICATE-----')) {
+        return undefined;
+      }
+
+      const certifiContent = fs.readFileSync(certifiPath, 'utf8');
+      const tempPath = combinedCertPath + '.tmp';
+      fs.writeFileSync(tempPath, certifiContent + '\n' + zscalerCert);
+      fs.renameSync(tempPath, combinedCertPath);
+
+      logger.info('CHROMA_LIFECYCLE', 'Created combined SSL certificate bundle for Zscaler', {
+        path: combinedCertPath
+      });
+
+      return combinedCertPath;
+    } catch (error) {
+      logger.debug('CHROMA_LIFECYCLE', 'Could not create combined cert bundle', {}, error as Error);
+      return undefined;
+    }
+  }
+
+  /**
+   * Build subprocess environment with SSL certificate overrides for enterprise proxy compatibility.
+   */
+  private getSpawnEnv(): Record<string, string> {
+    const env: Record<string, string> = {};
+    for (const [key, value] of Object.entries(sanitizeEnv(process.env))) {
+      if (value !== undefined) {
+        env[key] = value;
+      }
+    }
+
+    const combinedCertPath = this.getCombinedCertPath();
+    if (!combinedCertPath) {
+      return env;
+    }
+
+    logger.info('CHROMA_LIFECYCLE', 'Using combined SSL certificates for enterprise compatibility', {
+      certPath: combinedCertPath
+    });
+
+    return {
+      ...env,
+      SSL_CERT_FILE: combinedCertPath,
+      REQUESTS_CA_BUNDLE: combinedCertPath,
+      CURL_CA_BUNDLE: combinedCertPath,
+      NODE_EXTRA_CA_CERTS: combinedCertPath
+    };
   }
 
   /**
@@ -294,6 +401,7 @@ export class ChromaServerLifecycle {
     this.process = null;
     this.running = false;
     this.stopping = false;
+    getSupervisor().unregisterProcess(CHROMA_SUPERVISOR_ID);
 
     logger.info('CHROMA_LIFECYCLE', 'chroma-mcp SSE server stopped');
   }

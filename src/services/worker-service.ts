@@ -20,6 +20,8 @@ import { getAuthMethodDescription } from '../shared/EnvManager.js';
 import { logger } from '../utils/logger.js';
 import { ChromaMcpManager } from './sync/ChromaMcpManager.js';
 import { ChromaSync } from './sync/ChromaSync.js';
+import { configureSupervisorSignalHandlers, getSupervisor, startSupervisor } from '../supervisor/index.js';
+import { sanitizeEnv } from '../supervisor/env-sanitizer.js';
 
 // Windows: avoid repeated spawn popups when startup fails (issue #921)
 const WINDOWS_SPAWN_COOLDOWN_MS = 2 * 60 * 1000;
@@ -78,7 +80,6 @@ import {
   cleanStalePidFile,
   isProcessAlive,
   spawnDaemon,
-  createSignalHandler,
   isPidFileRecent,
   touchPidFile
 } from './infrastructure/ProcessManager.js';
@@ -269,33 +270,10 @@ export class WorkerService {
    * Register signal handlers for graceful shutdown
    */
   private registerSignalHandlers(): void {
-    const shutdownRef = { value: this.isShuttingDown };
-    const handler = createSignalHandler(() => this.shutdown(), shutdownRef);
-
-    process.on('SIGTERM', () => {
-      this.isShuttingDown = shutdownRef.value;
-      handler('SIGTERM');
+    configureSupervisorSignalHandlers(async () => {
+      this.isShuttingDown = true;
+      await this.shutdown();
     });
-    process.on('SIGINT', () => {
-      this.isShuttingDown = shutdownRef.value;
-      handler('SIGINT');
-    });
-
-    // SIGHUP: sent by kernel when controlling terminal closes.
-    // Daemon mode: ignore it (survive parent shell exit).
-    // Interactive mode: treat like SIGTERM (graceful shutdown).
-    if (process.platform !== 'win32') {
-      if (process.argv.includes('--daemon')) {
-        process.on('SIGHUP', () => {
-          logger.debug('SYSTEM', 'Ignoring SIGHUP in daemon mode');
-        });
-      } else {
-        process.on('SIGHUP', () => {
-          this.isShuttingDown = shutdownRef.value;
-          handler('SIGHUP');
-        });
-      }
-    }
   }
 
   /**
@@ -357,7 +335,9 @@ export class WorkerService {
     const port = getWorkerPort();
     const host = getWorkerHost();
 
-    // Start HTTP server FIRST - make port available immediately
+    await startSupervisor();
+
+    // Start HTTP server FIRST - make it available immediately
     await this.server.listen(port, host);
 
     // Worker writes its own PID - reliable on all platforms
@@ -366,6 +346,12 @@ export class WorkerService {
     writePidFile({
       pid: process.pid,
       port,
+      startedAt: new Date().toISOString()
+    });
+
+    getSupervisor().registerProcess('worker', {
+      pid: process.pid,
+      type: 'worker',
       startedAt: new Date().toISOString()
     });
 
@@ -459,19 +445,50 @@ export class WorkerService {
 
       // Connect to MCP server
       const mcpServerPath = path.join(__dirname, 'mcp-server.cjs');
+      getSupervisor().assertCanSpawn('mcp server');
       const transport = new StdioClientTransport({
         command: 'node',
         args: [mcpServerPath],
-        env: process.env
+        env: sanitizeEnv(process.env)
       });
 
       const MCP_INIT_TIMEOUT_MS = 300000;
       const mcpConnectionPromise = this.mcpClient.connect(transport);
-      const timeoutPromise = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('MCP connection timeout after 5 minutes')), MCP_INIT_TIMEOUT_MS)
-      );
+      let timeoutId: ReturnType<typeof setTimeout>;
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timeoutId = setTimeout(
+          () => reject(new Error('MCP connection timeout after 5 minutes')),
+          MCP_INIT_TIMEOUT_MS
+        );
+      });
 
-      await Promise.race([mcpConnectionPromise, timeoutPromise]);
+      try {
+        await Promise.race([mcpConnectionPromise, timeoutPromise]);
+      } catch (connectionError) {
+        clearTimeout(timeoutId!);
+        logger.warn('WORKER', 'MCP server connection failed, cleaning up subprocess', {
+          error: connectionError instanceof Error ? connectionError.message : String(connectionError)
+        });
+        try {
+          await transport.close();
+        } catch {
+          // Best effort: the supervisor handles later process cleanup for survivors.
+        }
+        throw connectionError;
+      }
+      clearTimeout(timeoutId!);
+
+      const mcpProcess = (transport as unknown as { _process?: import('child_process').ChildProcess })._process;
+      if (mcpProcess?.pid) {
+        getSupervisor().registerProcess('mcp-server', {
+          pid: mcpProcess.pid,
+          type: 'mcp',
+          startedAt: new Date().toISOString()
+        }, mcpProcess);
+        mcpProcess.once('exit', () => {
+          getSupervisor().unregisterProcess('mcp-server');
+        });
+      }
       this.mcpReady = true;
       logger.success('WORKER', 'MCP server connected');
 
@@ -484,6 +501,7 @@ export class WorkerService {
         return activeIds;
       });
       logger.info('SYSTEM', 'Started orphan reaper (runs every 1 minute)');
+      logger.info('SYSTEM', 'Started orphan reaper (runs every 30 seconds)');
 
       // Reap stale sessions to unblock orphan process cleanup (Issue #1168)
       this.staleSessionReaperInterval = setInterval(async () => {
@@ -649,31 +667,27 @@ export class WorkerService {
 
         // Do NOT restart after unrecoverable errors - prevents infinite loops
         if (hadUnrecoverableError) {
-          logger.warn('SYSTEM', 'Skipping restart due to unrecoverable error', {
-            sessionId: session.sessionDbId
-          });
-          this.broadcastProcessingStatus();
+          this.terminateSession(session.sessionDbId, 'unrecoverable_error');
           return;
         }
 
-        // Store for pending-count check below
-        const { PendingMessageStore } = require('./sqlite/PendingMessageStore.js');
-        const pendingStore = new PendingMessageStore(this.dbManager.getSessionStore().db, 3);
-
-        // Idle timeout means no new work arrived for 3 minutes - don't restart
-        // No need to reset stale processing messages here — claimNextMessage() self-heals
-        if (session.idleTimedOut) {
-          logger.info('SYSTEM', 'Generator exited due to idle timeout, not restarting', {
-            sessionId: session.sessionDbId
-          });
-          session.idleTimedOut = false; // Reset flag
-          this.broadcastProcessingStatus();
-          return;
-        }
+        const pendingStore = this.sessionManager.getPendingMessageStore();
 
         // Check if there's pending work that needs processing with a fresh AbortController
         const pendingCount = pendingStore.getPendingCount(session.sessionDbId);
         const MAX_PENDING_RESTARTS = 3;
+
+        // Idle timeout means no new work arrived for 3 minutes - don't restart
+        // But check pendingCount first: a message may have arrived between idle
+        // abort and .finally(), and we must not abandon it
+        if (session.idleTimedOut) {
+          session.idleTimedOut = false; // Reset flag
+          if (pendingCount === 0) {
+            this.terminateSession(session.sessionDbId, 'idle_timeout');
+            return;
+          }
+          // Fall through to pending-work restart below
+        }
 
         if (pendingCount > 0) {
           // Track consecutive pending-work restarts to prevent infinite loops (e.g. FK errors)
@@ -686,7 +700,7 @@ export class WorkerService {
               consecutiveRestarts: session.consecutiveRestarts
             });
             session.consecutiveRestarts = 0;
-            this.broadcastProcessingStatus();
+            this.terminateSession(session.sessionDbId, 'max_restarts_exceeded');
             return;
           }
 
@@ -699,12 +713,11 @@ export class WorkerService {
           session.abortController = new AbortController();
           // Restart processor
           this.startSessionProcessor(session, 'pending-work-restart');
+          this.broadcastProcessingStatus();
         } else {
-          // Successful completion with no pending work — reset counter
           session.consecutiveRestarts = 0;
+          this.sessionManager.removeSessionImmediate(session.sessionDbId);
         }
-
-        this.broadcastProcessingStatus();
       });
   }
 
@@ -778,6 +791,30 @@ export class WorkerService {
     }
     this.sessionManager.removeSessionImmediate(sessionDbId);
     this.sessionEventBroadcaster.broadcastSessionCompleted(sessionDbId);
+  }
+
+  /**
+   * Terminate a session that will not restart.
+   * Enforces the restart-or-terminate invariant: every generator exit
+   * must either call startSessionProcessor() or terminateSession().
+   * No zombie sessions allowed.
+   *
+   * GENERATOR EXIT INVARIANT:
+   *   .finally() → restart? → startSessionProcessor()
+   *                    no?  → terminateSession()
+   */
+  private terminateSession(sessionDbId: number, reason: string): void {
+    const pendingStore = this.sessionManager.getPendingMessageStore();
+    const abandoned = pendingStore.markAllSessionMessagesAbandoned(sessionDbId);
+
+    logger.info('SYSTEM', 'Session terminated', {
+      sessionId: sessionDbId,
+      reason,
+      abandonedMessages: abandoned
+    });
+
+    // removeSessionImmediate fires onSessionDeletedCallback → broadcastProcessingStatus()
+    this.sessionManager.removeSessionImmediate(sessionDbId);
   }
 
   /**
@@ -920,8 +957,8 @@ export class WorkerService {
    * Broadcast processing status change to SSE clients
    */
   broadcastProcessingStatus(): void {
-    const isProcessing = this.sessionManager.isAnySessionProcessing();
     const queueDepth = this.sessionManager.getTotalActiveWork();
+    const isProcessing = queueDepth > 0;
     const activeSessions = this.sessionManager.getActiveSessionCount();
 
     logger.info('WORKER', 'Broadcasting processing status', {
@@ -946,12 +983,22 @@ export class WorkerService {
  * Ensures the worker is started and healthy.
  * This function can be called by both 'start' and 'hook' commands.
  *
- * @param port - The port the worker should run on
+ * @param port - The TCP port (used for port-in-use checks and daemon spawn)
  * @returns true if worker is healthy (existing or newly started), false on failure
  */
 async function ensureWorkerStarted(port: number): Promise<boolean> {
   // Clean stale PID file first (cheap: 1 fs read + 1 signal-0 check)
-  cleanStalePidFile();
+  const pidFileStatus = cleanStalePidFile();
+  if (pidFileStatus === 'alive') {
+    logger.info('SYSTEM', 'Worker PID file points to a live process, skipping duplicate spawn');
+    const healthy = await waitForHealth(port, getPlatformTimeout(HOOK_TIMEOUTS.PORT_IN_USE_WAIT));
+    if (healthy) {
+      logger.info('SYSTEM', 'Worker became healthy while waiting on live PID');
+      return true;
+    }
+    logger.warn('SYSTEM', 'Live PID detected but worker did not become healthy before timeout');
+    return false;
+  }
 
   // Check if worker is already running and healthy
   if (await waitForHealth(port, 1000)) {
@@ -1095,11 +1142,9 @@ async function main() {
     case 'restart': {
       logger.info('SYSTEM', 'Restarting worker');
       await httpShutdown(port);
-      const freed = await waitForPortFree(port, getPlatformTimeout(15000));
-      if (!freed) {
+      const restartFreed = await waitForPortFree(port, getPlatformTimeout(15000));
+      if (!restartFreed) {
         logger.error('SYSTEM', 'Port did not free up after shutdown, aborting restart', { port });
-        // Exit gracefully: Windows Terminal won't keep tab open on exit 0
-        // The wrapper/plugin will handle restart logic if needed
         process.exit(0);
       }
       removePidFile();
@@ -1130,9 +1175,9 @@ async function main() {
     }
 
     case 'status': {
-      const running = await isPortInUse(port);
+      const portInUse = await isPortInUse(port);
       const pidInfo = readPidFile();
-      if (running && pidInfo) {
+      if (portInUse && pidInfo) {
         console.log('Worker is running');
         console.log(`  PID: ${pidInfo.pid}`);
         console.log(`  Port: ${pidInfo.port}`);
@@ -1152,13 +1197,7 @@ async function main() {
     }
 
     case 'hook': {
-      // Auto-start worker if not running
-      const workerReady = await ensureWorkerStarted(port);
-      if (!workerReady) {
-        logger.warn('SYSTEM', 'Worker failed to start before hook, handler will retry');
-      }
-
-      // Existing logic unchanged
+      // Validate CLI args first (before any I/O)
       const platform = process.argv[3];
       const event = process.argv[4];
       if (!platform || !event) {
@@ -1168,32 +1207,20 @@ async function main() {
         process.exit(1);
       }
 
-      // Check if worker is already running on port
-      const portInUse = await isPortInUse(port);
-      let startedWorkerInProcess = false;
-
-      if (!portInUse) {
-        // Port free - start worker IN THIS PROCESS (no spawn!)
-        // This process becomes the worker and stays alive
-        try {
-          logger.info('SYSTEM', 'Starting worker in-process for hook', { event });
-          const worker = new WorkerService();
-          await worker.start();
-          startedWorkerInProcess = true;
-          // Worker is now running in this process on the port
-        } catch (error) {
-          logger.failure('SYSTEM', 'Worker failed to start in hook', {}, error as Error);
-          removePidFile();
-          process.exit(0);
-        }
+      // Ensure worker is running as a detached daemon (#1249).
+      //
+      // IMPORTANT: The hook process MUST NOT become the worker. Starting the
+      // worker in-process makes it a grandchild of Claude Code, which the
+      // sandbox kills. Instead, ensureWorkerStarted() spawns a fully detached
+      // daemon (detached: true, stdio: 'ignore', child.unref()) that survives
+      // the hook process's exit and is invisible to Claude Code's sandbox.
+      const workerReady = await ensureWorkerStarted(port);
+      if (!workerReady) {
+        logger.warn('SYSTEM', 'Worker failed to start before hook, handler will proceed gracefully');
       }
-      // If port in use, we'll use HTTP to the existing worker
 
       const { hookCommand } = await import('../cli/hook-command.js');
-      // If we started the worker in this process, skip process.exit() so we stay alive as the worker
-      await hookCommand(platform, event, { skipExit: startedWorkerInProcess });
-      // Note: if we started worker in-process, this process stays alive as the worker
-      // The break allows the event loop to continue serving requests
+      await hookCommand(platform, event);
       break;
     }
 

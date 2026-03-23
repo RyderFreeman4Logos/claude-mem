@@ -15,6 +15,7 @@ import type { ActiveSession, PendingMessage, PendingMessageWithId, ObservationDa
 import { PendingMessageStore } from '../sqlite/PendingMessageStore.js';
 import { SessionQueueProcessor } from '../queue/SessionQueueProcessor.js';
 import { getProcessBySession, ensureProcessExit } from './ProcessRegistry.js';
+import { getSupervisor } from '../../supervisor/index.js';
 
 export class SessionManager {
   private dbManager: DatabaseManager;
@@ -310,6 +311,17 @@ export class SessionManager {
       await ensureProcessExit(tracked, 5000);
     }
 
+    // 3b. Reap all supervisor-tracked processes for this session (#1351)
+    // This catches MCP servers and other child processes not tracked by the
+    // in-memory ProcessRegistry (e.g. processes registered only in supervisor.json).
+    try {
+      await getSupervisor().getRegistry().reapSession(sessionDbId);
+    } catch (error) {
+      logger.warn('SESSION', 'Supervisor reapSession failed (non-blocking)', {
+        sessionId: sessionDbId
+      }, error as Error);
+    }
+
     // 4. Cleanup
     this.sessions.delete(sessionDbId);
     this.sessionQueues.delete(sessionDbId);
@@ -338,7 +350,7 @@ export class SessionManager {
     this.sessions.delete(sessionDbId);
     this.sessionQueues.delete(sessionDbId);
 
-    logger.info('SESSION', 'Session removed (orphaned after SDK termination)', {
+    logger.info('SESSION', 'Session removed from active sessions', {
       sessionId: sessionDbId,
       project: session.project
     });
@@ -390,10 +402,11 @@ export class SessionManager {
   }
 
   /**
-   * Check if any session has pending messages (for spinner tracking)
+   * Check if any active session has pending messages (for spinner tracking).
+   * Scoped to in-memory sessions only.
    */
   hasPendingMessages(): boolean {
-    return this.getPendingStore().hasAnyPendingWork();
+    return this.getTotalQueueDepth() > 0;
   }
 
   /**
@@ -425,12 +438,12 @@ export class SessionManager {
   }
 
   /**
-   * Check if any session is actively processing (has pending messages OR active generator)
-   * Used for activity indicator to prevent spinner from stopping while SDK is processing
+   * Check if any active session has pending work.
+   * Scoped to in-memory sessions only — orphaned DB messages from dead
+   * sessions must not keep the spinner spinning forever.
    */
   isAnySessionProcessing(): boolean {
-    // hasAnyPendingWork checks for 'pending' OR 'processing'
-    return this.getPendingStore().hasAnyPendingWork();
+    return this.getTotalQueueDepth() > 0;
   }
 
   /**
