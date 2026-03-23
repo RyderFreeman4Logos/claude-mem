@@ -78,7 +78,6 @@ function repairMalformedSchema(db: Database): void {
     // with paths containing spaces or special characters. execFileSync passes
     // args directly without a shell, so dbPath and objectName are safe.
     const scriptPath = join(tmpdir(), `claude-mem-repair-${Date.now()}-${randomUUID()}.py`);
-    const scriptPath = join(tmpdir(), `claude-mem-repair-${Date.now()}-${randomUUID()}.py`);
     try {
       writeFileSync(scriptPath, `
 import sqlite3, sys
