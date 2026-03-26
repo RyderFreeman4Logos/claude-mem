@@ -1753,6 +1753,8 @@ export class SessionStore {
           observationIds.push(existing.id);
           continue;
         }
+
+
         const result = obsStmt.run(
           memorySessionId,
           project,
