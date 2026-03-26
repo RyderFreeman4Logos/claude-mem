@@ -117,6 +117,7 @@ function notifySlotAvailable(): void {
  * @param timeoutMs Max time to wait before giving up
  */
 const TOTAL_PROCESS_HARD_CAP = 10;
+
 export async function waitForSlot(maxConcurrent: number, timeoutMs: number = 60_000): Promise<void> {
   // Hard cap: refuse to spawn if too many processes exist regardless of pool accounting
   const activeCount = getActiveCount();

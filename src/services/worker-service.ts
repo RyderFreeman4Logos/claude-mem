@@ -500,7 +500,6 @@ export class WorkerService {
         }
         return activeIds;
       });
-      logger.info('SYSTEM', 'Started orphan reaper (runs every 1 minute)');
       logger.info('SYSTEM', 'Started orphan reaper (runs every 30 seconds)');
 
       // Reap stale sessions to unblock orphan process cleanup (Issue #1168)
@@ -715,6 +714,8 @@ export class WorkerService {
           this.startSessionProcessor(session, 'pending-work-restart');
           this.broadcastProcessingStatus();
         } else {
+          // Successful completion with no pending work — clean up session
+          // removeSessionImmediate fires onSessionDeletedCallback → broadcastProcessingStatus()
           session.consecutiveRestarts = 0;
           this.sessionManager.removeSessionImmediate(session.sessionDbId);
         }

@@ -1,13 +1,21 @@
 /**
- * Regression tests for Chroma SSE server SSL flag handling (PR #1286).
+ * Regression tests for SSL flag handling (PR #1286).
  *
- * In this fork the remote/local Chroma CLI arguments are built by
- * ChromaServerLifecycle, not ChromaMcpManager. The behavior should still match
- * upstream: remote mode always forwards `--ssl <true|false>`, while local mode
- * omits the flag entirely.
+ * Two test suites cover both the fork's SSE-based architecture and the
+ * upstream stdio-based architecture:
+ *
+ * 1. ChromaServerLifecycle (fork/SSE) - validates buildChromaArgs() directly
+ * 2. ChromaMcpManager (upstream/stdio) - validates via mocked StdioClientTransport
+ *
+ * Both suites verify: remote mode always forwards `--ssl <true|false>`,
+ * while local mode omits the flag entirely.
  */
 import { describe, it, expect } from 'bun:test';
 import { ChromaServerLifecycle } from '../../../src/services/sync/ChromaServerLifecycle.js';
+
+// ═══════════════════════════════════════════════════════════════════════
+// Suite 1: ChromaServerLifecycle (fork SSE transport)
+// ═══════════════════════════════════════════════════════════════════════
 
 type SettingsLike = Record<string, string>;
 
@@ -58,3 +66,7 @@ describe('ChromaServerLifecycle SSL flag regression (#1286)', () => {
     expect(args[args.indexOf('--client-type') + 1]).toBe('persistent');
   });
 });
+
+// Suite 2 (upstream stdio transport) removed — this fork uses SSE transport
+// via ChromaServerLifecycle. The upstream ChromaMcpManager stdio tests are
+// not compatible with the SSE architecture. See Suite 1 above.
