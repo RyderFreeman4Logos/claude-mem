@@ -688,19 +688,6 @@ export class WorkerService {
           // Fall through to pending-work restart below
         }
 
-        // Idle timeout means no new work arrived for 3 minutes - don't restart
-        // But check pendingCount first: a message may have arrived between idle
-        // abort and .finally(), and we must not abandon it
-        if (session.idleTimedOut) {
-          session.idleTimedOut = false; // Reset flag
-          if (pendingCount === 0) {
-            this.terminateSession(session.sessionDbId, 'idle_timeout');
-            return;
-          }
-          // Fall through to pending-work restart below
-        }
-        const MAX_PENDING_RESTARTS = 3;
-
         if (pendingCount > 0) {
           // Track consecutive pending-work restarts to prevent infinite loops (e.g. FK errors)
           session.consecutiveRestarts = (session.consecutiveRestarts || 0) + 1;
