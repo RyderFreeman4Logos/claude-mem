@@ -61,7 +61,7 @@ describe('GeminiAgent', () => {
     loadFromFileSpy = spyOn(SettingsDefaultsManager, 'loadFromFile').mockImplementation(() => ({
       ...SettingsDefaultsManager.getAllDefaults(),
       CLAUDE_MEM_GEMINI_API_KEY: 'test-api-key',
-      CLAUDE_MEM_GEMINI_MODEL: 'gemini-2.5-flash-lite',
+      CLAUDE_MEM_GEMINI_MODEL: 'gemini-3-flash-preview',
       CLAUDE_MEM_GEMINI_RATE_LIMITING_ENABLED: rateLimitingEnabled,
       CLAUDE_MEM_DATA_DIR: '/tmp/claude-mem-test',
     }));
@@ -168,7 +168,7 @@ describe('GeminiAgent', () => {
 
     expect(global.fetch).toHaveBeenCalledTimes(1);
     const url = (global.fetch as any).mock.calls[0][0];
-    expect(url).toContain('https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash-lite:generateContent');
+    expect(url).toContain('https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent');
     expect(url).toContain('key=test-api-key');
   });
 
@@ -251,7 +251,7 @@ describe('GeminiAgent', () => {
     expect(session.cumulativeInputTokens).toBeGreaterThan(0);
   });
 
-  it('should fallback to Claude on rate limit error', async () => {
+  it('should gracefully pause on rate limit error (no fallback)', async () => {
     const session = {
       sessionDbId: 1,
       contentSessionId: 'test-session',
@@ -268,10 +268,14 @@ describe('GeminiAgent', () => {
       earliestPendingTimestamp: null,
       currentProvider: null,
       startTime: Date.now(),
-      processingMessageIds: []  // CLAIM-CONFIRM pattern: track message IDs being processed
+      processingMessageIds: [],  // CLAIM-CONFIRM pattern: track message IDs being processed
+      quotaPaused: false,
     } as any;
 
-    global.fetch = mock(() => Promise.resolve(new Response('Resource has been exhausted (e.g. check quota).', { status: 429 })));
+    // Return 400 (non-retryable) with quota message so callGeminiAPI throws immediately
+    // without entering the retry loop (avoids real setTimeout delays).
+    // The catch block in startSession matches on "quota" substring regardless of status code.
+    global.fetch = mock(() => Promise.resolve(new Response('Resource has been exhausted (e.g. check quota).', { status: 400 })));
 
     const fallbackAgent = {
       startSession: mock(() => Promise.resolve())
@@ -280,9 +284,10 @@ describe('GeminiAgent', () => {
 
     await agent.startSession(session);
 
-    // Verify fallback to Claude was triggered
-    expect(fallbackAgent.startSession).toHaveBeenCalledWith(session, undefined);
-    // Note: resetStuckMessages is called by worker-service.ts, not by GeminiAgent
+    // Verify graceful pause: quotaPaused is set, NO fallback triggered
+    // (429/quota errors are temporary — messages stay pending for retry when quota resets)
+    expect(session.quotaPaused).toBe(true);
+    expect(fallbackAgent.startSession).not.toHaveBeenCalled();
   });
 
   it('should NOT fallback on other errors', async () => {
