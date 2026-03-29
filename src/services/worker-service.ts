@@ -193,6 +193,10 @@ export class WorkerService {
   // Stale session reaper interval (Issue #1168)
   private staleSessionReaperInterval: ReturnType<typeof setInterval> | null = null;
 
+  // Periodic orphan queue scanner — recovers pending messages from sessions
+  // whose in-memory processor stopped before draining the queue.
+  private orphanQueueScanInterval: ReturnType<typeof setInterval> | null = null;
+
   // AI interaction tracking for health endpoint
   private lastAiInteraction: {
     timestamp: number;
@@ -526,6 +530,21 @@ export class WorkerService {
       }).catch(error => {
         logger.error('SYSTEM', 'Auto-recovery of pending queues failed', {}, error as Error);
       });
+
+      // Periodic orphan queue scanner (every 5 min) — catches messages stranded
+      // after a session processor stops mid-queue without a worker restart.
+      this.orphanQueueScanInterval = setInterval(async () => {
+        try {
+          const result = await this.processPendingQueues(10);
+          if (result.sessionsStarted > 0) {
+            logger.info('SYSTEM', `Orphan scan recovered ${result.sessionsStarted} sessions`, {
+              sessionIds: result.startedSessionIds
+            });
+          }
+        } catch (e) {
+          logger.error('SYSTEM', 'Orphan queue scan error', { error: e instanceof Error ? e.message : String(e) });
+        }
+      }, 5 * 60 * 1000);
     } catch (error) {
       logger.error('SYSTEM', 'Background initialization failed', {}, error as Error);
       throw error;
@@ -848,22 +867,16 @@ export class WorkerService {
 
         sessionStore.db.prepare(`
           UPDATE sdk_sessions
-          SET status = 'failed', completed_at_epoch = ?
+          SET status = 'completed', completed_at_epoch = ?
           WHERE id IN (${placeholders})
         `).run(Date.now(), ...ids);
 
-        logger.info('SYSTEM', `Marked ${ids.length} stale sessions as failed`);
+        logger.info('SYSTEM', `Marked ${ids.length} stale sessions as completed`);
 
-        const msgResult = sessionStore.db.prepare(`
-          UPDATE pending_messages
-          SET status = 'failed', failed_at_epoch = ?
-          WHERE status = 'pending'
-          AND session_db_id IN (${placeholders})
-        `).run(Date.now(), ...ids);
-
-        if (msgResult.changes > 0) {
-          logger.info('SYSTEM', `Marked ${msgResult.changes} pending messages from stale sessions as failed`);
-        }
+        // NOTE: Pending messages are intentionally preserved — the orphan
+        // recovery below (and the periodic scanner) will start processors
+        // for them. Previously these were marked 'failed', which caused
+        // permanent message loss when a session processor stopped mid-queue.
       }
     } catch (error) {
       logger.error('SYSTEM', 'Failed to clean up stale sessions', {}, error as Error);
@@ -926,6 +939,12 @@ export class WorkerService {
     if (this.staleSessionReaperInterval) {
       clearInterval(this.staleSessionReaperInterval);
       this.staleSessionReaperInterval = null;
+    }
+
+    // Stop orphan queue scanner
+    if (this.orphanQueueScanInterval) {
+      clearInterval(this.orphanQueueScanInterval);
+      this.orphanQueueScanInterval = null;
     }
 
     // Reset all 'processing' messages back to 'pending' before shutdown.
