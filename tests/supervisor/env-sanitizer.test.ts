@@ -14,7 +14,7 @@ describe('sanitizeEnv', () => {
     expect(result.PATH).toBe('/usr/bin');
   });
 
-  it('strips variables with CLAUDE_CODE_ prefix', () => {
+  it('strips variables with CLAUDE_CODE_ prefix including OAuth token (least-privilege)', () => {
     const result = sanitizeEnv({
       CLAUDE_CODE_BAR: 'baz',
       CLAUDE_CODE_OAUTH_TOKEN: 'token',
@@ -22,6 +22,8 @@ describe('sanitizeEnv', () => {
     });
 
     expect(result.CLAUDE_CODE_BAR).toBeUndefined();
+    // OAuth token is NOT preserved globally — it's only passed to SDK agent
+    // via buildIsolatedEnv() to honour least-privilege principle.
     expect(result.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
     expect(result.HOME).toBe('/home/user');
   });
@@ -119,5 +121,39 @@ describe('sanitizeEnv', () => {
     expect(result.CLAUDE_CODE_SESSION).toBeUndefined();
     expect(result.CLAUDE_CODE_ENTRYPOINT).toBeUndefined();
     expect(result.MCP_SESSION_ID).toBeUndefined();
+  });
+
+  it('preserves CLAUDE_CODE_GIT_BASH_PATH through sanitization', () => {
+    const result = sanitizeEnv({
+      CLAUDE_CODE_GIT_BASH_PATH: 'C:\\Program Files\\Git\\bin\\bash.exe',
+      PATH: '/usr/bin',
+      HOME: '/home/user'
+    });
+
+    expect(result.CLAUDE_CODE_GIT_BASH_PATH).toBe('C:\\Program Files\\Git\\bin\\bash.exe');
+    expect(result.PATH).toBe('/usr/bin');
+    expect(result.HOME).toBe('/home/user');
+  });
+
+  it('selectively preserves only tooling CLAUDE_CODE_* vars while stripping auth and others', () => {
+    const result = sanitizeEnv({
+      CLAUDE_CODE_OAUTH_TOKEN: 'my-oauth-token',
+      CLAUDE_CODE_GIT_BASH_PATH: '/usr/bin/bash',
+      CLAUDE_CODE_RANDOM_OTHER: 'should-be-stripped',
+      CLAUDE_CODE_INTERNAL_FLAG: 'should-be-stripped',
+      PATH: '/usr/bin'
+    });
+
+    // OAuth token stripped (least-privilege: only passed via buildIsolatedEnv)
+    expect(result.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
+    // GIT_BASH_PATH preserved: needed by subprocesses for tooling
+    expect(result.CLAUDE_CODE_GIT_BASH_PATH).toBe('/usr/bin/bash');
+
+    // Stripped: all other CLAUDE_CODE_* vars
+    expect(result.CLAUDE_CODE_RANDOM_OTHER).toBeUndefined();
+    expect(result.CLAUDE_CODE_INTERNAL_FLAG).toBeUndefined();
+
+    // Preserved: normal env vars
+    expect(result.PATH).toBe('/usr/bin');
   });
 });
