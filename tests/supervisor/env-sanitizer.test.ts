@@ -14,7 +14,7 @@ describe('sanitizeEnv', () => {
     expect(result.PATH).toBe('/usr/bin');
   });
 
-  it('strips variables with CLAUDE_CODE_ prefix but preserves allowed ones', () => {
+  it('strips variables with CLAUDE_CODE_ prefix including OAuth token (least-privilege)', () => {
     const result = sanitizeEnv({
       CLAUDE_CODE_BAR: 'baz',
       CLAUDE_CODE_OAUTH_TOKEN: 'token',
@@ -22,7 +22,9 @@ describe('sanitizeEnv', () => {
     });
 
     expect(result.CLAUDE_CODE_BAR).toBeUndefined();
-    expect(result.CLAUDE_CODE_OAUTH_TOKEN).toBe('token');
+    // OAuth token is NOT preserved globally — it's only passed to SDK agent
+    // via buildIsolatedEnv() to honour least-privilege principle.
+    expect(result.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
     expect(result.HOME).toBe('/home/user');
   });
 
@@ -115,7 +117,7 @@ describe('sanitizeEnv', () => {
     expect(result.CLAUDECODE).toBeUndefined();
     expect(result.CLAUDECODE_FOO).toBeUndefined();
     expect(result.CLAUDE_CODE_BAR).toBeUndefined();
-    expect(result.CLAUDE_CODE_OAUTH_TOKEN).toBe('oauth-token');
+    expect(result.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
     expect(result.CLAUDE_CODE_SESSION).toBeUndefined();
     expect(result.CLAUDE_CODE_ENTRYPOINT).toBeUndefined();
     expect(result.MCP_SESSION_ID).toBeUndefined();
@@ -133,7 +135,7 @@ describe('sanitizeEnv', () => {
     expect(result.HOME).toBe('/home/user');
   });
 
-  it('selectively preserves only allowed CLAUDE_CODE_* vars while stripping others', () => {
+  it('selectively preserves only tooling CLAUDE_CODE_* vars while stripping auth and others', () => {
     const result = sanitizeEnv({
       CLAUDE_CODE_OAUTH_TOKEN: 'my-oauth-token',
       CLAUDE_CODE_GIT_BASH_PATH: '/usr/bin/bash',
@@ -142,8 +144,9 @@ describe('sanitizeEnv', () => {
       PATH: '/usr/bin'
     });
 
-    // Preserved: explicitly allowed CLAUDE_CODE_* vars
-    expect(result.CLAUDE_CODE_OAUTH_TOKEN).toBe('my-oauth-token');
+    // OAuth token stripped (least-privilege: only passed via buildIsolatedEnv)
+    expect(result.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
+    // GIT_BASH_PATH preserved: needed by subprocesses for tooling
     expect(result.CLAUDE_CODE_GIT_BASH_PATH).toBe('/usr/bin/bash');
 
     // Stripped: all other CLAUDE_CODE_* vars

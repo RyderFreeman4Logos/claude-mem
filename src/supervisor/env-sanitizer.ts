@@ -6,9 +6,11 @@ export const ENV_EXACT_MATCHES = new Set([
   'MCP_SESSION_ID',
 ]);
 
-/** Vars that start with CLAUDE_CODE_ but must be preserved for subprocess auth/tooling */
+/** Vars that start with CLAUDE_CODE_ but must be preserved for subprocess tooling.
+ *  NOTE: CLAUDE_CODE_OAUTH_TOKEN is intentionally excluded — it is passed only
+ *  to the SDK agent via buildIsolatedEnv() (EnvManager.ts) to honour least-privilege.
+ */
 export const ENV_PRESERVE = new Set([
-  'CLAUDE_CODE_OAUTH_TOKEN',
   'CLAUDE_CODE_GIT_BASH_PATH',
 ]);
 
