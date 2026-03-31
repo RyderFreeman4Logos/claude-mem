@@ -322,9 +322,16 @@ export class OpenRouterAgent {
             openRouterError: errorMessage,
             fallbackError: fallbackError instanceof Error ? fallbackError.message : String(fallbackError),
           }, fallbackError as Error);
-          // Set quotaPaused so the restart handler doesn't burn retries
-          session.quotaPaused = true;
-          return;
+          // Only set quotaPaused if the root cause was actually quota-related.
+          // Non-quota fallback failures (e.g., auth errors) should propagate
+          // normally so the restart handler can apply its own retry logic.
+          const fbMsg = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
+          const isQuota = fbMsg.includes('429') || fbMsg.includes('quota') || fbMsg.includes('RESOURCE_EXHAUSTED');
+          if (isQuota || errorMessage.includes('429') || errorMessage.includes('cooldown')) {
+            session.quotaPaused = true;
+            return;
+          }
+          throw fallbackError;
         } finally {
           session.inFallback = false;
         }
