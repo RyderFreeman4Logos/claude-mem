@@ -318,17 +318,36 @@ export class GeminiAgent {
         throw error;
       }
 
-      // Rate limit / quota exhaustion: graceful pause, DON'T fall back or restart
-      // Quota errors are temporary — messages stay pending for later retry when quota resets.
-      // Falling back to Claude wastes credits and triggers restart→abandon chains.
+      // Rate limit / quota exhaustion: fall back to Claude SDK for this batch,
+      // then resume Gemini on the next session cycle.
       const errorMsg = error instanceof Error ? error.message : String(error);
       if (errorMsg.includes('429') || errorMsg.includes('RESOURCE_EXHAUSTED') || errorMsg.includes('quota')) {
+        if (this.fallbackAgent && !session.inFallback) {
+          logger.info('SDK', 'Gemini quota exhausted, falling back to next provider for this batch', {
+            sessionDbId: session.sessionDbId,
+          });
+          // Reset history — fallback agent manages its own context
+          session.conversationHistory = [];
+          session.inFallback = true;
+          try {
+            await this.fallbackAgent.startSession(session, worker);
+            return; // fallback processed remaining messages — normal exit
+          } catch (fallbackError) {
+            logger.warn('SDK', 'Fallback provider also failed, pausing session', {
+              sessionDbId: session.sessionDbId,
+              error: fallbackError instanceof Error ? fallbackError.message : String(fallbackError),
+            });
+          } finally {
+            session.inFallback = false;
+          }
+        }
+        // No fallback available or fallback failed — pause for orphan scanner
         logger.warn('SDK', 'Gemini rate limit / quota exhausted, pausing session gracefully', {
           sessionDbId: session.sessionDbId,
           error: errorMsg
         });
         session.quotaPaused = true;
-        return; // graceful exit — processing message recovered by sweeper, pending messages stay pending
+        return;
       }
 
       logger.failure('SDK', 'Gemini agent error', { sessionDbId: session.sessionDbId }, error as Error);

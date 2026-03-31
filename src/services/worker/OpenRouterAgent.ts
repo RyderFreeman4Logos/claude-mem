@@ -304,28 +304,40 @@ export class OpenRouterAgent {
 
       const errorMessage = error instanceof Error ? error.message : String(error);
 
-      // Fallback: OpenRouter → Gemini for all non-abort errors
-      // (no Claude SDK fallback per user preference)
-      if (isGeminiAvailable() && this.geminiAgent) {
-        logger.warn('SDK', 'OpenRouter failed, falling back to Gemini', {
+      // Fallback: use wired fallback agent (avoids circular loops when
+      // this agent is itself a fallback target from the primary provider).
+      if (this.fallbackAgent && !session.inFallback) {
+        logger.warn('SDK', 'OpenRouter failed, falling back to next agent', {
           sessionDbId: session.sessionDbId,
           error: errorMessage,
-          historyLength: session.conversationHistory.length
         });
-
+        // Reset history — fallback agent manages its own context
+        session.conversationHistory = [];
+        session.inFallback = true;
         try {
-          return await this.geminiAgent.startSession(session, worker);
-        } catch (geminiError: unknown) {
-          logger.failure('SDK', 'Both OpenRouter and Gemini failed', {
+          return await this.fallbackAgent.startSession(session, worker);
+        } catch (fallbackError: unknown) {
+          logger.failure('SDK', 'OpenRouter and fallback agent both failed', {
             sessionDbId: session.sessionDbId,
             openRouterError: errorMessage,
-            geminiError: geminiError instanceof Error ? geminiError.message : String(geminiError)
-          }, geminiError as Error);
-          throw geminiError;
+            fallbackError: fallbackError instanceof Error ? fallbackError.message : String(fallbackError),
+          }, fallbackError as Error);
+          // Only set quotaPaused if the root cause was actually quota-related.
+          // Non-quota fallback failures (e.g., auth errors) should propagate
+          // normally so the restart handler can apply its own retry logic.
+          const fbMsg = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
+          const isQuota = fbMsg.includes('429') || fbMsg.includes('quota') || fbMsg.includes('RESOURCE_EXHAUSTED');
+          if (isQuota || errorMessage.includes('429') || errorMessage.includes('cooldown')) {
+            session.quotaPaused = true;
+            return;
+          }
+          throw fallbackError;
+        } finally {
+          session.inFallback = false;
         }
       }
 
-      logger.failure('SDK', 'OpenRouter agent error (no Gemini available)', { sessionDbId: session.sessionDbId }, error as Error);
+      logger.failure('SDK', 'OpenRouter agent error (no fallback available)', { sessionDbId: session.sessionDbId }, error as Error);
       throw error;
     }
   }
