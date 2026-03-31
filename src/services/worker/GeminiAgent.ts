@@ -322,20 +322,23 @@ export class GeminiAgent {
       // then resume Gemini on the next session cycle.
       const errorMsg = error instanceof Error ? error.message : String(error);
       if (errorMsg.includes('429') || errorMsg.includes('RESOURCE_EXHAUSTED') || errorMsg.includes('quota')) {
-        if (this.fallbackAgent) {
+        if (this.fallbackAgent && !session.inFallback) {
           logger.info('SDK', 'Gemini quota exhausted, falling back to next provider for this batch', {
             sessionDbId: session.sessionDbId,
           });
-          // Reset conversation history — Claude SDK manages its own context
+          // Reset history — fallback agent manages its own context
           session.conversationHistory = [];
+          session.inFallback = true;
           try {
             await this.fallbackAgent.startSession(session, worker);
             return; // fallback processed remaining messages — normal exit
           } catch (fallbackError) {
-            logger.warn('SDK', 'Claude SDK fallback also failed, pausing session', {
+            logger.warn('SDK', 'Fallback provider also failed, pausing session', {
               sessionDbId: session.sessionDbId,
               error: fallbackError instanceof Error ? fallbackError.message : String(fallbackError),
             });
+          } finally {
+            session.inFallback = false;
           }
         }
         // No fallback available or fallback failed — pause for orphan scanner

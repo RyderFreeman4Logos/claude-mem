@@ -306,12 +306,14 @@ export class OpenRouterAgent {
 
       // Fallback: use wired fallback agent (avoids circular loops when
       // this agent is itself a fallback target from the primary provider).
-      if (this.fallbackAgent) {
+      if (this.fallbackAgent && !session.inFallback) {
         logger.warn('SDK', 'OpenRouter failed, falling back to next agent', {
           sessionDbId: session.sessionDbId,
           error: errorMessage,
         });
+        // Reset history — fallback agent manages its own context
         session.conversationHistory = [];
+        session.inFallback = true;
         try {
           return await this.fallbackAgent.startSession(session, worker);
         } catch (fallbackError: unknown) {
@@ -323,6 +325,8 @@ export class OpenRouterAgent {
           // Set quotaPaused so the restart handler doesn't burn retries
           session.quotaPaused = true;
           return;
+        } finally {
+          session.inFallback = false;
         }
       }
 
