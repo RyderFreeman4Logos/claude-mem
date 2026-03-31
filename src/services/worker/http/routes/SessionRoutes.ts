@@ -240,6 +240,19 @@ export class SessionRoutes extends BaseRouteHandler {
             const MAX_CONSECUTIVE_RESTARTS = 3;
 
             if (pendingCount > 0) {
+              // Quota/rate-limit pause: release session for orphan scanner retry,
+              // don't burn restart attempts on a temporary provider outage.
+              if (session.quotaPaused) {
+                logger.info('SESSION', 'Generator paused due to quota exhaustion, deferring to orphan scanner', {
+                  sessionId: sessionDbId,
+                  pendingCount,
+                });
+                pendingStore.resetStaleProcessingMessages(0, sessionDbId);
+                session.consecutiveRestarts = 0;
+                this.sessionManager.removeSessionImmediate(sessionDbId);
+                return;
+              }
+
               // GUARD: Prevent duplicate crash recovery spawns
               if (this.crashRecoveryScheduled.has(sessionDbId)) {
                 logger.debug('SESSION', 'Crash recovery already scheduled', { sessionDbId });

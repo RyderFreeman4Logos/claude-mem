@@ -219,6 +219,10 @@ export class WorkerService {
     this.geminiAgent = new GeminiAgent(this.dbManager, this.sessionManager);
     this.openRouterAgent = new OpenRouterAgent(this.dbManager, this.sessionManager);
 
+    // Wire fallback: Gemini→OpenRouter, OpenRouter→Claude SDK.
+    // Claude SDK spawns the CLI (needs auth in daemon env), so it's last resort.
+    this.geminiAgent.setFallbackAgent(this.openRouterAgent);
+    this.openRouterAgent.setFallbackAgent(this.sdkAgent);
 
     this.paginationHelper = new PaginationHelper(this.dbManager);
     this.settingsManager = new SettingsManager(this.dbManager);
@@ -715,6 +719,22 @@ export class WorkerService {
         }
 
         if (pendingCount > 0) {
+          // Quota/rate-limit pause: don't restart, don't abandon messages.
+          // Remove session from memory so the orphan scanner can retry later
+          // when quota resets, instead of burning through restart attempts.
+          if (session.quotaPaused) {
+            logger.info('SYSTEM', 'Generator paused due to quota exhaustion, deferring to orphan scanner', {
+              sessionId: session.sessionDbId,
+              pendingCount,
+            });
+            // Reset any in-flight 'processing' messages back to 'pending'
+            // so the orphan scanner can claim them on the next cycle.
+            pendingStore.resetStaleProcessingMessages(0, session.sessionDbId);
+            session.consecutiveRestarts = 0;
+            this.sessionManager.removeSessionImmediate(session.sessionDbId);
+            return;
+          }
+
           // Track consecutive pending-work restarts to prevent infinite loops (e.g. FK errors)
           session.consecutiveRestarts = (session.consecutiveRestarts || 0) + 1;
 
