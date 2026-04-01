@@ -64,9 +64,11 @@ export class OpenRouterAgent {
   private geminiAgent: FallbackAgent | null = null;
   private fallbackAgent: FallbackAgent | null = null;
 
-  // Cooldown tracking: when proxy reports model_cooldown with reset_seconds,
-  // skip OpenRouter entirely and route to Gemini until cooldown expires
-  private static cooldownUntil: number = 0;
+  // Cooldown tracking: per-model and global (all free models)
+  // Per-model: only that model is cooling down, other models can still serve
+  // Global: "free-models-per-min" or similar — all free models share the limit
+  private static globalCooldownUntil: number = 0;
+  private static modelCooldowns: Map<string, number> = new Map();
 
   constructor(dbManager: DatabaseManager, sessionManager: SessionManager) {
     this.dbManager = dbManager;
@@ -74,17 +76,41 @@ export class OpenRouterAgent {
   }
 
   /**
-   * Check if OpenRouter is currently in cooldown
+   * Check if OpenRouter has a global cooldown (all free models rate-limited)
    */
-  static isInCooldown(): boolean {
-    return Date.now() < OpenRouterAgent.cooldownUntil;
+  static isInGlobalCooldown(): boolean {
+    return Date.now() < OpenRouterAgent.globalCooldownUntil;
   }
 
   /**
-   * Get remaining cooldown seconds (0 if not in cooldown)
+   * Get remaining global cooldown seconds (0 if not in cooldown)
    */
+  static getGlobalCooldownRemainingSeconds(): number {
+    return Math.max(0, Math.ceil((OpenRouterAgent.globalCooldownUntil - Date.now()) / 1000));
+  }
+
+  /**
+   * Check if a specific model is in cooldown
+   */
+  static isModelInCooldown(model: string): boolean {
+    const until = OpenRouterAgent.modelCooldowns.get(model);
+    if (!until) return false;
+    if (Date.now() >= until) {
+      OpenRouterAgent.modelCooldowns.delete(model);
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Legacy accessor: true when ALL free models are blocked (global cooldown)
+   */
+  static isInCooldown(): boolean {
+    return OpenRouterAgent.isInGlobalCooldown();
+  }
+
   static getCooldownRemainingSeconds(): number {
-    return Math.max(0, Math.ceil((OpenRouterAgent.cooldownUntil - Date.now()) / 1000));
+    return OpenRouterAgent.getGlobalCooldownRemainingSeconds();
   }
 
   /**
@@ -113,7 +139,7 @@ export class OpenRouterAgent {
       const remaining = OpenRouterAgent.getCooldownRemainingSeconds();
       logger.info('SDK', `OpenRouter in cooldown (${remaining}s remaining), delegating to Gemini`, {
         sessionDbId: session.sessionDbId,
-        cooldownUntil: new Date(OpenRouterAgent.cooldownUntil).toISOString()
+        cooldownUntil: new Date(OpenRouterAgent.globalCooldownUntil).toISOString()
       });
 
       if (isGeminiAvailable() && this.geminiAgent) {
@@ -418,8 +444,22 @@ export class OpenRouterAgent {
   ): Promise<{ content: string; tokensUsed?: number }> {
     const errors: Array<{ model: string; error: string }> = [];
 
+    // Global cooldown: all free models are blocked — bail out immediately
+    if (OpenRouterAgent.isInGlobalCooldown()) {
+      const remaining = OpenRouterAgent.getGlobalCooldownRemainingSeconds();
+      throw new Error(`OpenRouter global cooldown (${remaining}s remaining). All free models rate-limited.`);
+    }
+
     for (let i = 0; i < models.length; i++) {
       const model = models[i];
+
+      // Skip models that are individually cooling down
+      if (OpenRouterAgent.isModelInCooldown(model)) {
+        logger.debug('SDK', `Skipping ${model} (per-model cooldown)`);
+        errors.push({ model, error: 'per-model cooldown active' });
+        continue;
+      }
+
       try {
         logger.debug('SDK', `Trying OpenRouter model ${i + 1}/${models.length}: ${model}`);
 
@@ -447,26 +487,26 @@ export class OpenRouterAgent {
         const errorMessage = error instanceof Error ? error.message : String(error);
         errors.push({ model, error: errorMessage });
 
-        // Check if this is a quota/rate limit error that should trigger fallback
+        // Check if this is a quota/rate limit error that should trigger model fallback
         const isQuotaError = errorMessage.toLowerCase().includes('quota') ||
                             errorMessage.toLowerCase().includes('rate limit') ||
                             errorMessage.toLowerCase().includes('insufficient') ||
                             errorMessage.toLowerCase().includes('credit') ||
                             errorMessage.toLowerCase().includes('429');
 
-        // If cooldown was set (with reset_seconds), skip remaining models -
-        // they share the same proxy/credentials and will also be in cooldown
-        if (OpenRouterAgent.isInCooldown()) {
-          logger.warn('SDK', 'OpenRouter cooldown active, skipping remaining models', {
+        // Global cooldown was just set by the 429 handler — skip remaining models
+        if (OpenRouterAgent.isInGlobalCooldown()) {
+          const remaining = OpenRouterAgent.getGlobalCooldownRemainingSeconds();
+          logger.warn('SDK', 'OpenRouter global cooldown active, skipping remaining models', {
             failedModel: model,
-            remainingSeconds: OpenRouterAgent.getCooldownRemainingSeconds()
+            remainingSeconds: remaining
           });
-          throw new Error(`OpenRouter in cooldown (${OpenRouterAgent.getCooldownRemainingSeconds()}s remaining). Last error: ${errorMessage}`);
+          throw new Error(`OpenRouter global cooldown (${remaining}s remaining). Last error: ${errorMessage}`);
         }
 
         if (isQuotaError && i < models.length - 1) {
-          // Quota error and we have more models to try
-          logger.warn('SDK', `OpenRouter model quota exhausted, falling back to next model`, {
+          // Per-model quota error, try next model
+          logger.warn('SDK', `OpenRouter model quota exhausted, trying next model`, {
             failedModel: model,
             nextModel: models[i + 1],
             error: errorMessage
@@ -476,7 +516,6 @@ export class OpenRouterAgent {
 
         // Last model or non-quota error - throw
         if (i === models.length - 1) {
-          // All models failed
           logger.error('SDK', 'All OpenRouter models failed', {
             attemptedModels: models.join(', '),
             errors: errors.map(e => `${e.model}: ${e.error}`).join(' | ')
@@ -489,8 +528,11 @@ export class OpenRouterAgent {
       }
     }
 
-    // Should never reach here, but TypeScript needs it
-    throw new Error('OpenRouter fallback logic error: exhausted all models without result');
+    // All models were skipped (per-model cooldown) or exhausted
+    if (errors.length > 0) {
+      throw new Error(`All OpenRouter models exhausted or in cooldown. Errors: ${errors.map(e => `${e.model}: ${e.error}`).join(' | ')}`);
+    }
+    throw new Error('OpenRouter fallback logic error: no models attempted');
   }
 
   /**
@@ -537,17 +579,46 @@ export class OpenRouterAgent {
       const errorText = await response.text();
 
       // Parse cooldown info from 429 responses to enable proactive routing
+      // Distinguish per-model cooldown (try next model) vs global rate limit (skip all)
       if (response.status === 429) {
         try {
           const errorData = JSON.parse(errorText);
+          const errorCode = errorData.error?.code;
+          const errorMsg = errorData.error?.message || '';
           const resetSeconds = errorData.error?.reset_seconds;
-          if (resetSeconds && typeof resetSeconds === 'number') {
-            OpenRouterAgent.cooldownUntil = Date.now() + (resetSeconds * 1000);
-            logger.warn('SDK', `OpenRouter cooldown detected, switching to fallback for ${resetSeconds}s`, {
+
+          if (errorCode === 'model_cooldown') {
+            // Per-model cooldown: only THIS model is cooling down, others may work
+            if (resetSeconds && typeof resetSeconds === 'number') {
+              OpenRouterAgent.modelCooldowns.set(model, Date.now() + (resetSeconds * 1000));
+              logger.warn('SDK', `OpenRouter per-model cooldown for ${model} (${resetSeconds}s)`, {
+                model,
+                resetSeconds,
+                resetTime: errorData.error.reset_time,
+              });
+            }
+          } else if (errorMsg.includes('free-models-per-min') || errorMsg.includes('requests-per-min')) {
+            // Global rate limit: all free models share this limit
+            if (resetSeconds && typeof resetSeconds === 'number') {
+              OpenRouterAgent.globalCooldownUntil = Date.now() + (resetSeconds * 1000);
+            } else {
+              // Default 60s cooldown for global rate limits without reset_seconds
+              OpenRouterAgent.globalCooldownUntil = Date.now() + 60000;
+            }
+            logger.warn('SDK', `OpenRouter global rate limit, all free models blocked`, {
               model,
               resetSeconds,
-              resetTime: errorData.error.reset_time,
-              cooldownUntil: new Date(OpenRouterAgent.cooldownUntil).toISOString()
+              cooldownUntil: new Date(OpenRouterAgent.globalCooldownUntil).toISOString(),
+            });
+          } else {
+            // Unknown 429 type — treat as per-model to avoid over-blocking
+            if (resetSeconds && typeof resetSeconds === 'number') {
+              OpenRouterAgent.modelCooldowns.set(model, Date.now() + (resetSeconds * 1000));
+            }
+            logger.warn('SDK', `OpenRouter 429 (unknown type), treating as per-model cooldown`, {
+              model,
+              errorCode,
+              errorMsg: errorMsg.substring(0, 100),
             });
           }
         } catch { /* response may not be JSON - fall through to normal error handling */ }
