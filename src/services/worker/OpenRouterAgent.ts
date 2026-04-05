@@ -23,6 +23,7 @@ import { SessionManager } from './SessionManager.js';
 import {
   isAbortError,
   processAgentResponse,
+  shouldFallbackToClaude,
   type FallbackAgent,
   type WorkerRef
 } from './agents/index.js';
@@ -330,9 +331,11 @@ export class OpenRouterAgent {
 
       const errorMessage = error instanceof Error ? error.message : String(error);
 
+      const shouldFallback = shouldFallbackToClaude(error) || errorMessage.includes('cooldown');
+
       // Fallback: use wired fallback agent (avoids circular loops when
       // this agent is itself a fallback target from the primary provider).
-      if (this.fallbackAgent && !session.inFallback) {
+      if (shouldFallback && this.fallbackAgent && !session.inFallback) {
         logger.warn('SDK', 'OpenRouter failed, falling back to next agent', {
           sessionDbId: session.sessionDbId,
           error: errorMessage,
@@ -487,12 +490,13 @@ export class OpenRouterAgent {
         const errorMessage = error instanceof Error ? error.message : String(error);
         errors.push({ model, error: errorMessage });
 
-        // Check if this is a quota/rate limit error that should trigger model fallback
+        // Retry the next configured model for rate limits and transient upstream failures.
         const isQuotaError = errorMessage.toLowerCase().includes('quota') ||
-                            errorMessage.toLowerCase().includes('rate limit') ||
-                            errorMessage.toLowerCase().includes('insufficient') ||
-                            errorMessage.toLowerCase().includes('credit') ||
-                            errorMessage.toLowerCase().includes('429');
+          errorMessage.toLowerCase().includes('rate limit') ||
+          errorMessage.toLowerCase().includes('insufficient') ||
+          errorMessage.toLowerCase().includes('credit') ||
+          errorMessage.toLowerCase().includes('429');
+        const shouldTryNextModel = isQuotaError || shouldFallbackToClaude(error);
 
         // Global cooldown was just set by the 429 handler — skip remaining models
         if (OpenRouterAgent.isInGlobalCooldown()) {
@@ -504,9 +508,8 @@ export class OpenRouterAgent {
           throw new Error(`OpenRouter global cooldown (${remaining}s remaining). Last error: ${errorMessage}`);
         }
 
-        if (isQuotaError && i < models.length - 1) {
-          // Per-model quota error, try next model
-          logger.warn('SDK', `OpenRouter model quota exhausted, trying next model`, {
+        if (shouldTryNextModel && i < models.length - 1) {
+          logger.warn('SDK', 'OpenRouter model failed, trying next model', {
             failedModel: model,
             nextModel: models[i + 1],
             error: errorMessage
