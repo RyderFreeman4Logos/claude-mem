@@ -24,6 +24,7 @@ export interface PersistentPendingMessage {
   created_at_epoch: number;
   started_processing_at_epoch: number | null;
   completed_at_epoch: number | null;
+  failed_at_epoch?: number | null;
 }
 
 /**
@@ -236,7 +237,7 @@ export class PendingMessageStore {
   retryMessage(messageId: number): boolean {
     const stmt = this.db.prepare(`
       UPDATE pending_messages
-      SET status = 'pending', started_processing_at_epoch = NULL
+      SET status = 'pending', started_processing_at_epoch = NULL, failed_at_epoch = NULL
       WHERE id = ? AND status IN ('pending', 'processing', 'failed')
     `);
     const result = stmt.run(messageId);
@@ -352,7 +353,7 @@ export class PendingMessageStore {
       // Move back to pending for retry
       const stmt = this.db.prepare(`
         UPDATE pending_messages
-        SET status = 'pending', retry_count = retry_count + 1, started_processing_at_epoch = NULL
+        SET status = 'pending', retry_count = retry_count + 1, started_processing_at_epoch = NULL, failed_at_epoch = NULL
         WHERE id = ?
       `);
       stmt.run(messageId);
@@ -360,10 +361,10 @@ export class PendingMessageStore {
       // Max retries exceeded, mark as permanently failed
       const stmt = this.db.prepare(`
         UPDATE pending_messages
-        SET status = 'failed', completed_at_epoch = ?
+        SET status = 'failed', failed_at_epoch = ?, completed_at_epoch = ?
         WHERE id = ?
       `);
-      stmt.run(now, messageId);
+      stmt.run(now, now, messageId);
     }
   }
 
@@ -395,6 +396,79 @@ export class PendingMessageStore {
     `);
     const result = stmt.get(sessionDbId) as { count: number };
     return result.count;
+  }
+
+  /**
+   * Get failed messages for dead-letter queue display.
+   */
+  getFailedMessages(limit: number, offset: number): PersistentPendingMessage[] {
+    const stmt = this.db.prepare(`
+      SELECT * FROM pending_messages
+      WHERE status = 'failed'
+      ORDER BY COALESCE(failed_at_epoch, created_at_epoch) DESC, id DESC
+      LIMIT ? OFFSET ?
+    `);
+    return stmt.all(limit, offset) as PersistentPendingMessage[];
+  }
+
+  /**
+   * Get total failed message count.
+   */
+  getFailedMessageCount(): number {
+    const stmt = this.db.prepare(`
+      SELECT COUNT(*) as count FROM pending_messages
+      WHERE status = 'failed'
+    `);
+    const result = stmt.get() as { count: number };
+    return result.count;
+  }
+
+  /**
+   * Retry one failed message by moving it back to pending.
+   */
+  retryFailedMessage(messageId: number): { success: boolean; newMessageId?: number; error?: string } {
+    const stmt = this.db.prepare(`
+      UPDATE pending_messages
+      SET status = 'pending', started_processing_at_epoch = NULL, failed_at_epoch = NULL
+      WHERE id = ? AND status = 'failed'
+    `);
+    const result = stmt.run(messageId);
+    if (result.changes === 0) {
+      return { success: false, error: 'Failed message not found' };
+    }
+    return { success: true, newMessageId: messageId };
+  }
+
+  /**
+   * Delete one failed message from the dead-letter queue.
+   */
+  deleteFailedMessage(messageId: number): boolean {
+    const stmt = this.db.prepare(`
+      DELETE FROM pending_messages
+      WHERE id = ? AND status = 'failed'
+    `);
+    const result = stmt.run(messageId);
+    return result.changes > 0;
+  }
+
+  /**
+   * Clear all failed messages from the dead-letter queue.
+   */
+  clearFailedMessages(): number {
+    return this.clearFailed();
+  }
+
+  /**
+   * Peek at pending message types for a session (for tier routing).
+   * Returns list of { message_type, tool_name } without claiming.
+   */
+  peekPendingTypes(sessionDbId: number): Array<{ message_type: string; tool_name: string | null }> {
+    const stmt = this.db.prepare(`
+      SELECT message_type, tool_name FROM pending_messages
+      WHERE session_db_id = ? AND status IN ('pending', 'processing')
+      ORDER BY id ASC
+    `);
+    return stmt.all(sessionDbId) as Array<{ message_type: string; tool_name: string | null }>;
   }
 
   /**

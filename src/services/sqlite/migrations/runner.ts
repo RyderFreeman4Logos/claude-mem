@@ -37,6 +37,7 @@ export class MigrationRunner {
     this.addLastAttemptedAtColumn();
     this.createFailedMessagesTable();
     this.addMessageDeduplicationColumns();
+    this.createObservationFeedbackTable();
   }
 
   /**
@@ -965,5 +966,38 @@ export class MigrationRunner {
 
     this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(26, new Date().toISOString());
     logger.debug('DB', 'Message deduplication columns added successfully');
+  }
+
+  /**
+   * Create observation_feedback table for tracking observation usage signals.
+   * Foundation for tier routing optimization and future Thompson Sampling.
+   * Schema version 27.
+   */
+  private createObservationFeedbackTable(): void {
+    const applied = this.db.prepare('SELECT version FROM schema_versions WHERE version = ?').get(27) as SchemaVersion | undefined;
+    if (applied) return;
+
+    const tables = this.db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='observation_feedback'").all() as TableNameRow[];
+    if (tables.length > 0) {
+      this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(27, new Date().toISOString());
+      return;
+    }
+
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS observation_feedback (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        observation_id INTEGER NOT NULL,
+        signal_type TEXT NOT NULL,
+        session_db_id INTEGER,
+        created_at_epoch INTEGER NOT NULL,
+        metadata TEXT,
+        FOREIGN KEY (observation_id) REFERENCES observations(id) ON DELETE CASCADE
+      )
+    `);
+    this.db.run('CREATE INDEX IF NOT EXISTS idx_feedback_observation ON observation_feedback(observation_id)');
+    this.db.run('CREATE INDEX IF NOT EXISTS idx_feedback_signal ON observation_feedback(signal_type)');
+
+    this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(27, new Date().toISOString());
+    logger.debug('DB', 'Created observation_feedback table for usage tracking');
   }
 }
