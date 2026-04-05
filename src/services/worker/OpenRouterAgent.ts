@@ -346,15 +346,28 @@ export class OpenRouterAgent {
         try {
           return await this.fallbackAgent.startSession(session, worker);
         } catch (fallbackError: unknown) {
-          logger.failure('SDK', 'OpenRouter and fallback agent both failed', {
+          const fbMsg = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
+
+          // Try Gemini as last resort before giving up
+          if (this.geminiAgent) {
+            try {
+              logger.warn('SDK', 'Claude SDK fallback failed, trying Gemini', { error: fbMsg.substring(0, 100) });
+              return await this.geminiAgent.startSession(session, worker);
+            } catch (geminiError: unknown) {
+              const geminiMsg = geminiError instanceof Error ? geminiError.message : String(geminiError);
+              logger.failure('SDK', 'Gemini fallback also failed', { error: geminiMsg.substring(0, 100) });
+              // Fall through to existing quota/throw logic
+            }
+          }
+
+          logger.failure('SDK', 'OpenRouter and all fallback agents failed', {
             sessionDbId: session.sessionDbId,
             openRouterError: errorMessage,
-            fallbackError: fallbackError instanceof Error ? fallbackError.message : String(fallbackError),
+            fallbackError: fbMsg,
           }, fallbackError as Error);
           // Only set quotaPaused if the root cause was actually quota-related.
           // Non-quota fallback failures (e.g., auth errors) should propagate
           // normally so the restart handler can apply its own retry logic.
-          const fbMsg = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
           const isQuota = fbMsg.includes('429') || fbMsg.includes('quota') || fbMsg.includes('RESOURCE_EXHAUSTED');
           if (isQuota || errorMessage.includes('429') || errorMessage.includes('cooldown')) {
             session.quotaPaused = true;
@@ -490,13 +503,13 @@ export class OpenRouterAgent {
         const errorMessage = error instanceof Error ? error.message : String(error);
         errors.push({ model, error: errorMessage });
 
-        // Retry the next configured model for rate limits and transient upstream failures.
-        const isQuotaError = errorMessage.toLowerCase().includes('quota') ||
-          errorMessage.toLowerCase().includes('rate limit') ||
-          errorMessage.toLowerCase().includes('insufficient') ||
-          errorMessage.toLowerCase().includes('credit') ||
-          errorMessage.toLowerCase().includes('429');
-        const shouldTryNextModel = isQuotaError || shouldFallbackToClaude(error);
+        // Fatal errors should not try the next model — they will fail the same way
+        const isFatalError = errorMessage.toLowerCase().includes('unauthorized') ||
+          errorMessage.toLowerCase().includes('forbidden') ||
+          errorMessage.toLowerCase().includes('invalid api key') ||
+          errorMessage.toLowerCase().includes('authentication') ||
+          errorMessage.includes('401') ||
+          errorMessage.includes('403');
 
         // Global cooldown was just set by the 429 handler — skip remaining models
         if (OpenRouterAgent.isInGlobalCooldown()) {
@@ -508,7 +521,8 @@ export class OpenRouterAgent {
           throw new Error(`OpenRouter global cooldown (${remaining}s remaining). Last error: ${errorMessage}`);
         }
 
-        if (shouldTryNextModel && i < models.length - 1) {
+        // Try next model for any non-fatal error (quota, transient, server errors, etc.)
+        if (!isFatalError && i < models.length - 1) {
           logger.warn('SDK', 'OpenRouter model failed, trying next model', {
             failedModel: model,
             nextModel: models[i + 1],
@@ -517,7 +531,7 @@ export class OpenRouterAgent {
           continue;
         }
 
-        // Last model or non-quota error - throw
+        // Last model or fatal error - throw
         if (i === models.length - 1) {
           logger.error('SDK', 'All OpenRouter models failed', {
             attemptedModels: models.join(', '),
@@ -526,7 +540,7 @@ export class OpenRouterAgent {
           throw new Error(`All OpenRouter models failed. Last error: ${errorMessage}`);
         }
 
-        // Non-quota error - throw immediately
+        // Fatal error - throw immediately
         throw error;
       }
     }
