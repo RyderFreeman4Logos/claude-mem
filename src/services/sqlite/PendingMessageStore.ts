@@ -5,6 +5,21 @@ import { logger } from '../../utils/logger.js';
 /** Messages processing longer than this are considered stale and reset to pending by self-healing */
 const STALE_PROCESSING_THRESHOLD_MS = 60_000;
 
+/** Base delay for exponential backoff on retries (30 seconds) */
+const RETRY_BASE_DELAY_MS = 30_000;
+
+/** Maximum delay between retries (5 minutes) */
+const RETRY_MAX_DELAY_MS = 5 * 60 * 1000;
+
+/**
+ * Calculate exponential backoff delay: min(base * 2^(retryCount-1), maxDelay)
+ * retry 1 → 30s, retry 2 → 60s, retry 3 → 120s, retry 4 → 240s, retry 5+ → 300s
+ */
+function calculateRetryDelay(retryCount: number): number {
+  const delay = RETRY_BASE_DELAY_MS * Math.pow(2, Math.max(0, retryCount - 1));
+  return Math.min(delay, RETRY_MAX_DELAY_MS);
+}
+
 /**
  * Persistent pending message record from database
  */
@@ -25,6 +40,7 @@ export interface PersistentPendingMessage {
   started_processing_at_epoch: number | null;
   completed_at_epoch: number | null;
   failed_at_epoch?: number | null;
+  last_attempted_at_epoch?: number | null;
 }
 
 /**
@@ -47,11 +63,10 @@ export interface PersistentPendingMessage {
  */
 export class PendingMessageStore {
   private db: Database;
-  private maxRetries: number;
 
-  constructor(db: Database, maxRetries: number = 3) {
+  // _legacyMaxRetries: kept for backward compatibility with existing callers; unused internally
+  constructor(db: Database, _legacyMaxRetries?: number) {
     this.db = db;
-    this.maxRetries = maxRetries;
   }
 
   /**
@@ -110,13 +125,27 @@ export class PendingMessageStore {
         logger.info('QUEUE', `SELF_HEAL | sessionDbId=${sessionId} | recovered ${resetResult.changes} stale processing message(s)`);
       }
 
+      // Select next pending message, respecting exponential backoff for retried messages.
+      // Messages with last_attempted_at_epoch set must wait for their backoff period to elapse.
       const peekStmt = this.db.prepare(`
         SELECT * FROM pending_messages
         WHERE session_db_id = ? AND status = 'pending'
+          AND (
+            last_attempted_at_epoch IS NULL
+            OR last_attempted_at_epoch + (
+              CASE
+                WHEN retry_count <= 1 THEN ${RETRY_BASE_DELAY_MS}
+                WHEN retry_count <= 2 THEN ${RETRY_BASE_DELAY_MS * 2}
+                WHEN retry_count <= 3 THEN ${RETRY_BASE_DELAY_MS * 4}
+                WHEN retry_count <= 4 THEN ${RETRY_BASE_DELAY_MS * 8}
+                ELSE ${RETRY_MAX_DELAY_MS}
+              END
+            ) <= ?
+          )
         ORDER BY id ASC
         LIMIT 1
       `);
-      const msg = peekStmt.get(sessionId) as PersistentPendingMessage | null;
+      const msg = peekStmt.get(sessionId, now) as PersistentPendingMessage | null;
 
       if (msg) {
         // CRITICAL FIX: Mark as 'processing' instead of deleting
@@ -259,40 +288,52 @@ export class PendingMessageStore {
   }
 
   /**
-   * Mark all processing messages for a session as failed
-   * Used in error recovery when session generator crashes
-   * @returns Number of messages marked failed
+   * Re-queue all processing messages for a session after generator crash.
+   * Sets them back to 'pending' with backoff instead of permanently failing.
+   * @returns Number of messages re-queued for retry
    */
   markSessionMessagesFailed(sessionDbId: number): number {
     const now = Date.now();
 
-    // Atomic update - all processing messages for session → failed
-    // Note: This bypasses retry logic since generator failures are session-level,
-    // not message-level. Individual message failures use markFailed() instead.
+    // Re-queue processing messages with incremented retry count and backoff
     const stmt = this.db.prepare(`
       UPDATE pending_messages
-      SET status = 'failed', failed_at_epoch = ?
+      SET status = 'pending',
+          retry_count = retry_count + 1,
+          started_processing_at_epoch = NULL,
+          last_attempted_at_epoch = ?
       WHERE session_db_id = ? AND status = 'processing'
     `);
 
     const result = stmt.run(now, sessionDbId);
+    if (result.changes > 0) {
+      logger.info('QUEUE', `SESSION_AUTO_RETRY | sessionDbId=${sessionDbId} | requeued=${result.changes} processing messages for retry`);
+    }
     return result.changes;
   }
 
   /**
-   * Mark all pending and processing messages for a session as failed (abandoned).
-   * Used when SDK session is terminated and no fallback agent is available:
-   * prevents the session from appearing in getSessionsWithPendingMessages forever.
-   * @returns Number of messages marked failed
+   * Permanently fail all messages for a terminated/abandoned session.
+   * Called when a session is permanently terminated — no generator will consume these messages.
+   * Moves both processing and pending messages to the dead letter queue (status='failed').
+   * @returns Number of messages moved to dead letter queue
    */
   markAllSessionMessagesAbandoned(sessionDbId: number): number {
     const now = Date.now();
+
+    // Move all active messages to dead letter queue — session is permanently terminated
     const stmt = this.db.prepare(`
       UPDATE pending_messages
-      SET status = 'failed', failed_at_epoch = ?
-      WHERE session_db_id = ? AND status IN ('pending', 'processing')
+      SET status = 'failed',
+          failed_at_epoch = ?,
+          started_processing_at_epoch = NULL
+      WHERE session_db_id = ? AND status IN ('processing', 'pending')
     `);
     const result = stmt.run(now, sessionDbId);
+
+    if (result.changes > 0) {
+      logger.warn('QUEUE', `ABANDONED_TO_DLQ | sessionDbId=${sessionDbId} | movedToDeadLetter=${result.changes}`);
+    }
     return result.changes;
   }
 
@@ -337,34 +378,46 @@ export class PendingMessageStore {
   }
 
   /**
-   * Mark message as failed (status: pending -> failed or back to pending for retry)
-   * If retry_count < maxRetries, moves back to 'pending' for retry
-   * Otherwise marks as 'failed' permanently
+   * Mark message as failed and automatically re-queue for retry with exponential backoff.
+   * After MAX_RETRIES (20) attempts, moves message to dead letter queue (status='failed')
+   * to prevent infinite API cost on permanently broken messages.
+   * Uses last_attempted_at_epoch for backoff timing; claimNextMessage() respects this.
    */
   markFailed(messageId: number): void {
+    const MAX_RETRIES = 20;
     const now = Date.now();
 
-    // Get current retry count
     const msg = this.db.prepare('SELECT retry_count FROM pending_messages WHERE id = ?').get(messageId) as { retry_count: number } | undefined;
-
     if (!msg) return;
 
-    if (msg.retry_count < this.maxRetries) {
-      // Move back to pending for retry
+    const newRetryCount = msg.retry_count + 1;
+
+    if (newRetryCount >= MAX_RETRIES) {
+      // Permanent failure — move to dead letter queue
       const stmt = this.db.prepare(`
         UPDATE pending_messages
-        SET status = 'pending', retry_count = retry_count + 1, started_processing_at_epoch = NULL, failed_at_epoch = NULL
+        SET status = 'failed',
+            retry_count = ?,
+            failed_at_epoch = ?,
+            started_processing_at_epoch = NULL
         WHERE id = ?
       `);
-      stmt.run(messageId);
+      stmt.run(newRetryCount, now, messageId);
+      logger.warn('QUEUE', `MAX_RETRIES_EXCEEDED | messageId=${messageId} | retryCount=${newRetryCount} | moved to dead letter queue`);
     } else {
-      // Max retries exceeded, mark as permanently failed
+      // Auto-retry with exponential backoff
+      const delay = calculateRetryDelay(newRetryCount);
       const stmt = this.db.prepare(`
         UPDATE pending_messages
-        SET status = 'failed', failed_at_epoch = ?, completed_at_epoch = ?
+        SET status = 'pending',
+            retry_count = ?,
+            started_processing_at_epoch = NULL,
+            failed_at_epoch = NULL,
+            last_attempted_at_epoch = ?
         WHERE id = ?
       `);
-      stmt.run(now, now, messageId);
+      stmt.run(newRetryCount, now, messageId);
+      logger.info('QUEUE', `AUTO_RETRY | messageId=${messageId} | retryCount=${newRetryCount}/${MAX_RETRIES} | nextRetryIn=${Math.round(delay / 1000)}s`);
     }
   }
 
