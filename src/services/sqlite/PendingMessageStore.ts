@@ -8,12 +8,12 @@ const STALE_PROCESSING_THRESHOLD_MS = 60_000;
 /** Base delay for exponential backoff on retries (30 seconds) */
 const RETRY_BASE_DELAY_MS = 30_000;
 
-/** Maximum delay between retries (5 minutes) */
-const RETRY_MAX_DELAY_MS = 5 * 60 * 1000;
+/** Maximum delay between retries (2 minutes) */
+const RETRY_MAX_DELAY_MS = 2 * 60 * 1000;
 
 /**
  * Calculate exponential backoff delay: min(base * 2^(retryCount-1), maxDelay)
- * retry 1 → 30s, retry 2 → 60s, retry 3 → 120s, retry 4 → 240s, retry 5+ → 300s
+ * retry 1 → 30s, retry 2 → 60s, retry 3+ → 120s (capped at 2 min)
  */
 function calculateRetryDelay(retryCount: number): number {
   const delay = RETRY_BASE_DELAY_MS * Math.pow(2, Math.max(0, retryCount - 1));
@@ -136,8 +136,6 @@ export class PendingMessageStore {
               CASE
                 WHEN retry_count <= 1 THEN ${RETRY_BASE_DELAY_MS}
                 WHEN retry_count <= 2 THEN ${RETRY_BASE_DELAY_MS * 2}
-                WHEN retry_count <= 3 THEN ${RETRY_BASE_DELAY_MS * 4}
-                WHEN retry_count <= 4 THEN ${RETRY_BASE_DELAY_MS * 8}
                 ELSE ${RETRY_MAX_DELAY_MS}
               END
             ) <= ?
@@ -379,46 +377,30 @@ export class PendingMessageStore {
 
   /**
    * Mark message as failed and automatically re-queue for retry with exponential backoff.
-   * After MAX_RETRIES (20) attempts, moves message to dead letter queue (status='failed')
-   * to prevent infinite API cost on permanently broken messages.
+   * Retries indefinitely — the OpenRouter fallback chain (PR #19) handles model rotation
+   * and per-model cooldowns, so transient failures will eventually resolve.
    * Uses last_attempted_at_epoch for backoff timing; claimNextMessage() respects this.
    */
   markFailed(messageId: number): void {
-    const MAX_RETRIES = 20;
     const now = Date.now();
 
     const msg = this.db.prepare('SELECT retry_count FROM pending_messages WHERE id = ?').get(messageId) as { retry_count: number } | undefined;
     if (!msg) return;
 
     const newRetryCount = msg.retry_count + 1;
+    const delay = calculateRetryDelay(newRetryCount);
 
-    if (newRetryCount >= MAX_RETRIES) {
-      // Permanent failure — move to dead letter queue
-      const stmt = this.db.prepare(`
-        UPDATE pending_messages
-        SET status = 'failed',
-            retry_count = ?,
-            failed_at_epoch = ?,
-            started_processing_at_epoch = NULL
-        WHERE id = ?
-      `);
-      stmt.run(newRetryCount, now, messageId);
-      logger.warn('QUEUE', `MAX_RETRIES_EXCEEDED | messageId=${messageId} | retryCount=${newRetryCount} | moved to dead letter queue`);
-    } else {
-      // Auto-retry with exponential backoff
-      const delay = calculateRetryDelay(newRetryCount);
-      const stmt = this.db.prepare(`
-        UPDATE pending_messages
-        SET status = 'pending',
-            retry_count = ?,
-            started_processing_at_epoch = NULL,
-            failed_at_epoch = NULL,
-            last_attempted_at_epoch = ?
-        WHERE id = ?
-      `);
-      stmt.run(newRetryCount, now, messageId);
-      logger.info('QUEUE', `AUTO_RETRY | messageId=${messageId} | retryCount=${newRetryCount}/${MAX_RETRIES} | nextRetryIn=${Math.round(delay / 1000)}s`);
-    }
+    const stmt = this.db.prepare(`
+      UPDATE pending_messages
+      SET status = 'pending',
+          retry_count = ?,
+          started_processing_at_epoch = NULL,
+          failed_at_epoch = NULL,
+          last_attempted_at_epoch = ?
+      WHERE id = ?
+    `);
+    stmt.run(newRetryCount, now, messageId);
+    logger.info('QUEUE', `AUTO_RETRY | messageId=${messageId} | retryCount=${newRetryCount} | nextRetryIn=${Math.round(delay / 1000)}s`);
   }
 
   /**
