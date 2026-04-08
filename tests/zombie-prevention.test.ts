@@ -330,7 +330,7 @@ describe('Zombie Agent Prevention', () => {
   describe('Session Termination Invariant', () => {
     // Tests the restart-or-terminate invariant:
     // When a generator exits without restarting, its messages must be
-    // marked abandoned and the session removed from the active Map.
+    // re-queued for recovery and the session removed from the active Map.
 
     test('should mark messages abandoned when session is terminated', () => {
       const sessionId = createDbSession('content-terminate-1');
@@ -345,9 +345,9 @@ describe('Zombie Agent Prevention', () => {
       const abandoned = pendingStore.markAllSessionMessagesAbandoned(sessionId);
       expect(abandoned).toBe(2);
 
-      // Spinner should stop: no pending work remains
-      expect(pendingStore.hasAnyPendingWork()).toBe(false);
-      expect(pendingStore.getPendingCount(sessionId)).toBe(0);
+      // Messages stay queued so orphan recovery can pick them up
+      expect(pendingStore.hasAnyPendingWork()).toBe(true);
+      expect(pendingStore.getPendingCount(sessionId)).toBe(2);
     });
 
     test('should handle terminate with zero pending messages', () => {
@@ -364,7 +364,7 @@ describe('Zombie Agent Prevention', () => {
       expect(pendingStore.hasAnyPendingWork()).toBe(false);
     });
 
-    test('should be idempotent — double terminate marks zero on second call', () => {
+    test('should keep messages recoverable on double terminate', () => {
       const sessionId = createDbSession('content-terminate-idempotent');
       enqueueTestMessage(sessionId, 'content-terminate-idempotent');
 
@@ -372,11 +372,12 @@ describe('Zombie Agent Prevention', () => {
       const first = pendingStore.markAllSessionMessagesAbandoned(sessionId);
       expect(first).toBe(1);
 
-      // Second terminate — already failed, nothing to mark
+      // Second terminate leaves the message queued for recovery
       const second = pendingStore.markAllSessionMessagesAbandoned(sessionId);
-      expect(second).toBe(0);
+      expect(second).toBe(1);
 
-      expect(pendingStore.hasAnyPendingWork()).toBe(false);
+      expect(pendingStore.hasAnyPendingWork()).toBe(true);
+      expect(pendingStore.getPendingCount(sessionId)).toBe(1);
     });
 
     test('should remove session from Map via removeSessionImmediate', () => {
@@ -395,7 +396,7 @@ describe('Zombie Agent Prevention', () => {
       expect(sessions.has(sessionId)).toBe(false);
     });
 
-    test('should return hasAnyPendingWork false after all sessions terminated', () => {
+    test('should keep pending work visible after all sessions are terminated', () => {
       // Create multiple sessions with messages
       const sid1 = createDbSession('content-multi-term-1');
       const sid2 = createDbSession('content-multi-term-2');
@@ -413,8 +414,8 @@ describe('Zombie Agent Prevention', () => {
       pendingStore.markAllSessionMessagesAbandoned(sid2);
       pendingStore.markAllSessionMessagesAbandoned(sid3);
 
-      // Spinner must stop
-      expect(pendingStore.hasAnyPendingWork()).toBe(false);
+      // Orphan recovery should still see queued work
+      expect(pendingStore.hasAnyPendingWork()).toBe(true);
     });
 
     test('should not affect other sessions when terminating one', () => {
@@ -427,8 +428,8 @@ describe('Zombie Agent Prevention', () => {
       // Terminate only session 1
       pendingStore.markAllSessionMessagesAbandoned(sid1);
 
-      // Session 2 still has work
-      expect(pendingStore.getPendingCount(sid1)).toBe(0);
+      // Session 1 stays recoverable, and session 2 is untouched
+      expect(pendingStore.getPendingCount(sid1)).toBe(1);
       expect(pendingStore.getPendingCount(sid2)).toBe(1);
       expect(pendingStore.hasAnyPendingWork()).toBe(true);
     });
@@ -448,13 +449,14 @@ describe('Zombie Agent Prevention', () => {
       // Now we have 1 processing + 1 pending
       expect(pendingStore.getPendingCount(sessionId)).toBe(2);
 
-      // Terminate should mark BOTH as failed
+      // Terminate should re-queue both pending and processing work
       const abandoned = pendingStore.markAllSessionMessagesAbandoned(sessionId);
       expect(abandoned).toBe(2);
-      expect(pendingStore.hasAnyPendingWork()).toBe(false);
+      expect(pendingStore.hasAnyPendingWork()).toBe(true);
+      expect(pendingStore.getPendingCount(sessionId)).toBe(2);
     });
 
-    test('should enforce invariant: no pending work after terminate regardless of initial state', () => {
+    test('should preserve recoverable work after terminate regardless of initial state', () => {
       const sessionId = createDbSession('content-invariant');
 
       // Create a complex initial state: some pending, some processing, some with stale timestamps
@@ -468,10 +470,10 @@ describe('Zombie Agent Prevention', () => {
       // Verify complex state
       expect(pendingStore.getPendingCount(sessionId)).toBe(3);
 
-      // THE INVARIANT: after terminate, hasAnyPendingWork MUST be false
+      // THE INVARIANT: after terminate, work stays pending for orphan recovery
       pendingStore.markAllSessionMessagesAbandoned(sessionId);
-      expect(pendingStore.hasAnyPendingWork()).toBe(false);
-      expect(pendingStore.getPendingCount(sessionId)).toBe(0);
+      expect(pendingStore.hasAnyPendingWork()).toBe(true);
+      expect(pendingStore.getPendingCount(sessionId)).toBe(3);
     });
   });
 });
