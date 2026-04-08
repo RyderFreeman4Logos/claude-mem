@@ -10,7 +10,7 @@
 import * as p from '@clack/prompts';
 import pc from 'picocolors';
 import { execSync } from 'child_process';
-import { cpSync, existsSync, readFileSync, rmSync } from 'fs';
+import { cpSync, existsSync, lstatSync, readFileSync, rmSync } from 'fs';
 import { join } from 'path';
 
 // Non-TTY detection: @clack/prompts crashes with ENOENT in non-TTY environments
@@ -330,6 +330,16 @@ function copyPluginToMarketplace(): void {
 function copyPluginToCache(version: string): void {
   const sourcePluginDirectory = npmPackagePluginDirectory();
   const cachePath = pluginCacheDirectory(version);
+
+  // Preserve developer symlinks (local dev → plugin/)
+  try {
+    if (lstatSync(cachePath).isSymbolicLink()) {
+      log.info(`Cache path is a symlink, skipping copy: ${cachePath}`);
+      return;
+    }
+  } catch (e: unknown) {
+    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e;
+  }
 
   // Clean replace: remove stale cache before copying
   rmSync(cachePath, { recursive: true, force: true });
