@@ -197,7 +197,7 @@ export class OpenRouterAgent {
           null,
           'OpenRouter',
           undefined,  // No lastCwd yet - before message processing
-          model
+          initResponse.modelId
         );
       } else {
         logger.error('SDK', 'Empty OpenRouter init response - session may lack context', {
@@ -269,7 +269,7 @@ export class OpenRouterAgent {
             originalTimestamp,
             'OpenRouter',
             lastCwd,
-            model
+            obsResponse.modelId
           );
 
         } else if (message.type === 'summarize') {
@@ -312,7 +312,7 @@ export class OpenRouterAgent {
             originalTimestamp,
             'OpenRouter',
             lastCwd,
-            model
+            summaryResponse.modelId
           );
         }
       }
@@ -460,7 +460,7 @@ export class OpenRouterAgent {
     baseUrl: string,
     siteUrl?: string,
     appName?: string
-  ): Promise<{ content: string; tokensUsed?: number }> {
+  ): Promise<{ content: string; tokensUsed?: number; modelId: string }> {
     const errors: Array<{ model: string; error: string }> = [];
 
     // Global cooldown: all free models are blocked — bail out immediately
@@ -500,7 +500,7 @@ export class OpenRouterAgent {
           });
         }
 
-        return result;
+        return { ...result, modelId: model };
 
       } catch (error: unknown) {
         const errorMessage = error instanceof Error ? error.message : String(error);
