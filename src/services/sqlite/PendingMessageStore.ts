@@ -311,26 +311,24 @@ export class PendingMessageStore {
   }
 
   /**
-   * Permanently fail all messages for a terminated/abandoned session.
-   * Called when a session is permanently terminated — no generator will consume these messages.
-   * Moves both processing and pending messages to the dead letter queue (status='failed').
-   * @returns Number of messages moved to dead letter queue
+   * Re-queue all messages for a terminated/abandoned session.
+   * Called when a session is terminated before its active work is consumed.
+   * Moves both processing and pending messages back to the retry queue (status='pending').
+   * @returns Number of messages re-queued
    */
   markAllSessionMessagesAbandoned(sessionDbId: number): number {
-    const now = Date.now();
-
-    // Move all active messages to dead letter queue — session is permanently terminated
+    // Re-queue all active messages so the orphan queue scanner can recover them
     const stmt = this.db.prepare(`
       UPDATE pending_messages
-      SET status = 'failed',
-          failed_at_epoch = ?,
+      SET status = 'pending',
+          failed_at_epoch = NULL,
           started_processing_at_epoch = NULL
       WHERE session_db_id = ? AND status IN ('processing', 'pending')
     `);
-    const result = stmt.run(now, sessionDbId);
+    const result = stmt.run(sessionDbId);
 
     if (result.changes > 0) {
-      logger.warn('QUEUE', `ABANDONED_TO_DLQ | sessionDbId=${sessionDbId} | movedToDeadLetter=${result.changes}`);
+      logger.warn('QUEUE', `ABANDONED_REQUEUED | sessionDbId=${sessionDbId} | requeued=${result.changes}`);
     }
     return result.changes;
   }
