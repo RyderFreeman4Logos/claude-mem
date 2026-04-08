@@ -7,7 +7,7 @@
  */
 
 const { execSync } = require('child_process');
-const { existsSync, readFileSync } = require('fs');
+const { existsSync, lstatSync, readFileSync } = require('fs');
 const path = require('path');
 const os = require('os');
 
@@ -90,18 +90,29 @@ try {
   const version = getPluginVersion();
   const CACHE_VERSION_PATH = path.join(CACHE_BASE_PATH, version);
 
-  const pluginDir = path.join(rootDir, 'plugin');
-  const pluginGitignoreExcludes = getGitignoreExcludes(pluginDir);
+  let cacheIsSymlink = false;
+  try {
+    cacheIsSymlink = lstatSync(CACHE_VERSION_PATH).isSymbolicLink();
+  } catch (e) {
+    if (e.code !== 'ENOENT') throw e;
+  }
 
-  console.log(`Syncing to cache folder (version ${version})...`);
-  execSync(
-    `rsync -av --delete --exclude=.git ${pluginGitignoreExcludes} plugin/ "${CACHE_VERSION_PATH}/"`,
-    { stdio: 'inherit' }
-  );
+  if (cacheIsSymlink) {
+    console.log(`\x1b[33m%s\x1b[0m`, `Cache folder is a symlink → ${CACHE_VERSION_PATH}, skipping rsync`);
+  } else {
+    const pluginDir = path.join(rootDir, 'plugin');
+    const pluginGitignoreExcludes = getGitignoreExcludes(pluginDir);
 
-  // Install dependencies in cache directory so worker can resolve them
-  console.log(`Running bun install in cache folder (version ${version})...`);
-  execSync(`bun install`, { cwd: CACHE_VERSION_PATH, stdio: 'inherit' });
+    console.log(`Syncing to cache folder (version ${version})...`);
+    execSync(
+      `rsync -av --delete --exclude=.git ${pluginGitignoreExcludes} plugin/ "${CACHE_VERSION_PATH}/"`,
+      { stdio: 'inherit' }
+    );
+
+    // Install dependencies in cache directory so worker can resolve them
+    console.log(`Running bun install in cache folder (version ${version})...`);
+    execSync(`bun install`, { cwd: CACHE_VERSION_PATH, stdio: 'inherit' });
+  }
 
   console.log('\x1b[32m%s\x1b[0m', 'Sync complete!');
 
