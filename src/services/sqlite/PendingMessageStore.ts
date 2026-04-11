@@ -2,7 +2,7 @@ import { Database } from './sqlite-compat.js';
 import type { PendingMessage } from '../worker-types.js';
 import { logger } from '../../utils/logger.js';
 
-/** Messages processing longer than this are considered stale and reset to pending by self-healing */
+/** Messages processing longer than this are considered stale and retried by self-healing */
 const STALE_PROCESSING_THRESHOLD_MS = 60_000;
 
 /** Base delay for exponential backoff on retries (30 seconds) */
@@ -10,6 +10,45 @@ const RETRY_BASE_DELAY_MS = 30_000;
 
 /** Maximum delay between retries (2 minutes) */
 const RETRY_MAX_DELAY_MS = 2 * 60 * 1000;
+
+/** Max retries before a pending_message is gravestoned to status='failed' (prevents infinite retry loops on persistent upstream failures) */
+const MAX_RETRY_BEFORE_GRAVESTONE = 10;
+
+const SELF_HEAL_SQL = `
+  UPDATE pending_messages
+  SET
+    retry_count = retry_count + 1,
+    last_attempted_at_epoch = ?,
+    status = CASE
+      WHEN retry_count + 1 >= ? THEN 'failed'
+      ELSE 'pending'
+    END,
+    started_processing_at_epoch = NULL,
+    failed_at_epoch = CASE
+      WHEN retry_count + 1 >= ? THEN ?
+      ELSE failed_at_epoch
+    END
+  WHERE session_db_id = ? AND status = 'processing'
+    AND started_processing_at_epoch < ?
+`;
+
+const SELF_HEAL_ALL_SESSIONS_SQL = `
+  UPDATE pending_messages
+  SET
+    retry_count = retry_count + 1,
+    last_attempted_at_epoch = ?,
+    status = CASE
+      WHEN retry_count + 1 >= ? THEN 'failed'
+      ELSE 'pending'
+    END,
+    started_processing_at_epoch = NULL,
+    failed_at_epoch = CASE
+      WHEN retry_count + 1 >= ? THEN ?
+      ELSE failed_at_epoch
+    END
+  WHERE status = 'processing'
+    AND started_processing_at_epoch < ?
+`;
 
 /**
  * Calculate exponential backoff delay: min(base * 2^(retryCount-1), maxDelay)
@@ -55,18 +94,45 @@ export interface PersistentPendingMessage {
  * 3. confirmProcessed() - Deletes message after successful processing
  *
  * Self-healing:
- * - claimNextMessage() resets stale 'processing' messages (>60s) back to 'pending' before claiming
- * - This eliminates stuck messages from generator crashes without external timers
+ * - claimNextMessage() retries stale 'processing' messages (>60s) before claiming
+ * - Repeatedly stale messages are gravestoned instead of cycling forever
  *
  * Recovery:
  * - getSessionsWithPendingMessages() - Find sessions that need recovery on startup
  */
 export class PendingMessageStore {
   private db: Database;
+  private lastSelfHealLogAt = new Map<number, number>();
+  private static readonly SELF_HEAL_LOG_COALESCE_MS = 60_000;
 
   // _legacyMaxRetries: kept for backward compatibility with existing callers; unused internally
   constructor(db: Database, _legacyMaxRetries?: number) {
     this.db = db;
+  }
+
+  private resetStaleProcessing(now: number, staleCutoff: number, sessionDbId?: number): { changes: number } {
+    if (sessionDbId !== undefined) {
+      const stmt = this.db.prepare(SELF_HEAL_SQL);
+      const result = stmt.run(
+        now,
+        MAX_RETRY_BEFORE_GRAVESTONE,
+        MAX_RETRY_BEFORE_GRAVESTONE,
+        now,
+        sessionDbId,
+        staleCutoff
+      );
+      return { changes: result.changes };
+    }
+
+    const stmt = this.db.prepare(SELF_HEAL_ALL_SESSIONS_SQL);
+    const result = stmt.run(
+      now,
+      MAX_RETRY_BEFORE_GRAVESTONE,
+      MAX_RETRY_BEFORE_GRAVESTONE,
+      now,
+      staleCutoff
+    );
+    return { changes: result.changes };
   }
 
   /**
@@ -102,7 +168,7 @@ export class PendingMessageStore {
 
   /**
    * Atomically claim the next pending message by marking it as 'processing'.
-   * Self-healing: resets any stale 'processing' messages (>60s) back to 'pending' first.
+   * Self-healing: retries stale 'processing' messages (>60s) first, gravestoning them after repeated failures.
    * Message stays in DB until confirmProcessed() is called.
    * Uses a transaction to prevent race conditions.
    */
@@ -110,19 +176,17 @@ export class PendingMessageStore {
     const claimTx = this.db.transaction((sessionId: number) => {
       // Capture time inside transaction so it's fresh if WAL contention causes retry
       const now = Date.now();
-      // Self-healing: reset stale 'processing' messages back to 'pending'
-      // This recovers from generator crashes without external timers
+      // Self-healing: retry stale 'processing' messages with backoff-aware bookkeeping.
+      // Persistent failures are gravestoned after repeated recovery attempts.
       // Note: strict < means messages must be OLDER than threshold to be reset
       const staleCutoff = now - STALE_PROCESSING_THRESHOLD_MS;
-      const resetStmt = this.db.prepare(`
-        UPDATE pending_messages
-        SET status = 'pending', started_processing_at_epoch = NULL
-        WHERE session_db_id = ? AND status = 'processing'
-          AND started_processing_at_epoch < ?
-      `);
-      const resetResult = resetStmt.run(sessionId, staleCutoff);
+      const resetResult = this.resetStaleProcessing(now, staleCutoff, sessionId);
       if (resetResult.changes > 0) {
-        logger.info('QUEUE', `SELF_HEAL | sessionDbId=${sessionId} | recovered ${resetResult.changes} stale processing message(s)`);
+        const lastLogAt = this.lastSelfHealLogAt.get(sessionId) ?? 0;
+        if (now - lastLogAt >= PendingMessageStore.SELF_HEAL_LOG_COALESCE_MS) {
+          logger.info('QUEUE', `SELF_HEAL | sessionDbId=${sessionId} | recovered ${resetResult.changes} stale processing message(s) (log coalesced to 1/60s)`);
+          this.lastSelfHealLogAt.set(sessionId, now);
+        }
       }
 
       // Select next pending message, respecting exponential backoff for retried messages.
@@ -180,30 +244,15 @@ export class PendingMessageStore {
   }
 
   /**
-   * Reset stale 'processing' messages back to 'pending' for retry.
+   * Reset stale 'processing' messages for retry, gravestoning them once the retry threshold is hit.
    * Called on worker startup and periodically to recover from crashes.
    * @param thresholdMs Messages processing longer than this are considered stale (default: 5 minutes)
    * @returns Number of messages reset
    */
   resetStaleProcessingMessages(thresholdMs: number = 5 * 60 * 1000, sessionDbId?: number): number {
-    const cutoff = Date.now() - thresholdMs;
-    let stmt;
-    let result;
-    if (sessionDbId !== undefined) {
-      stmt = this.db.prepare(`
-        UPDATE pending_messages
-        SET status = 'pending', started_processing_at_epoch = NULL
-        WHERE status = 'processing' AND started_processing_at_epoch < ? AND session_db_id = ?
-      `);
-      result = stmt.run(cutoff, sessionDbId);
-    } else {
-      stmt = this.db.prepare(`
-        UPDATE pending_messages
-        SET status = 'pending', started_processing_at_epoch = NULL
-        WHERE status = 'processing' AND started_processing_at_epoch < ?
-      `);
-      result = stmt.run(cutoff);
-    }
+    const now = Date.now();
+    const cutoff = now - thresholdMs;
+    const result = this.resetStaleProcessing(now, cutoff, sessionDbId);
     if (result.changes > 0) {
       logger.info('QUEUE', `RESET_STALE | count=${result.changes} | thresholdMs=${thresholdMs}${sessionDbId !== undefined ? ` | sessionDbId=${sessionDbId}` : ''}`);
     }
