@@ -17,7 +17,7 @@ import path from 'path';
  */
 
 const TEST_PORT = 37877;
-const TEST_DATA_DIR = path.join(homedir(), '.claude-mem-test');
+const TEST_DATA_DIR = process.env.CLAUDE_MEM_DATA_DIR || path.join(homedir(), '.claude-mem-test');
 const TEST_PID_FILE = path.join(TEST_DATA_DIR, 'worker.pid');
 const WORKER_SCRIPT = path.join(__dirname, '../plugin/scripts/worker-service.cjs');
 

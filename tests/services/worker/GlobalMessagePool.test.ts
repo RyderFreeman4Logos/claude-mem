@@ -101,7 +101,6 @@ describe('GlobalMessagePool', () => {
     });
 
     const pool = new GlobalMessagePool(
-      store,
       createConcurrencyManagerStub(5),
       async (message) => {
         startedIds.push(message.id);
@@ -113,7 +112,8 @@ describe('GlobalMessagePool', () => {
         store.confirmProcessed(message.id);
         completedIds.push(message.id);
         activeWorkers -= 1;
-      }
+      },
+      async () => store.claimNextMessage()
     );
 
     pool.start();
@@ -142,12 +142,12 @@ describe('GlobalMessagePool', () => {
     });
 
     const pool = new GlobalMessagePool(
-      store,
       createConcurrencyManagerStub(1),
       async (message) => {
         await releasePromise;
         store.confirmProcessed(message.id);
-      }
+      },
+      async () => store.claimNextMessage()
     );
 
     pool.start();
@@ -201,7 +201,6 @@ describe('GlobalMessagePool', () => {
     });
 
     const pool = new GlobalMessagePool(
-      store,
       createConcurrencyManagerStub(4),
       async (message) => {
         startedTypes.push(message.message_type);
@@ -214,7 +213,8 @@ describe('GlobalMessagePool', () => {
 
         await observationRelease;
         store.confirmProcessed(message.id);
-      }
+      },
+      async () => store.claimNextMessage()
     );
 
     pool.start();
@@ -343,12 +343,12 @@ describe('GlobalMessagePool', () => {
     let started = false;
 
     const pool = new GlobalMessagePool(
-      store,
       createConcurrencyManagerStub(1),
       async (message) => {
         started = true;
         store.confirmProcessed(message.id);
       },
+      async () => store.claimNextMessage(),
       async () => claimGate
     );
 
@@ -387,7 +387,6 @@ describe('GlobalMessagePool', () => {
     const secondWaveIdSet = new Set<number>();
 
     const pool = new GlobalMessagePool(
-      store,
       concurrency.manager,
       async (message) => {
         if (!secondWaveIdSet.has(message.id)) {
@@ -403,7 +402,8 @@ describe('GlobalMessagePool', () => {
 
         store.confirmProcessed(message.id);
         completedIds.push(message.id);
-      }
+      },
+      async () => store.claimNextMessage()
     );
 
     pool.start();
@@ -441,13 +441,13 @@ describe('GlobalMessagePool', () => {
     const completedIds: number[] = [];
 
     const pool = new GlobalMessagePool(
-      store,
       concurrency.manager,
       async (message) => {
         await new Promise((resolve) => setTimeout(resolve, 200));
         store.confirmProcessed(message.id);
         completedIds.push(message.id);
-      }
+      },
+      async () => store.claimNextMessage()
     );
 
     pool.start();
@@ -488,12 +488,12 @@ describe('GlobalMessagePool', () => {
     });
 
     const pool = new GlobalMessagePool(
-      store,
       concurrency.manager,
       async (message) => {
         store.confirmProcessed(message.id);
         completedIds.push(message.id);
       },
+      async () => store.claimNextMessage(),
       async () => {
         beforeClaimCalls += 1;
         if (beforeClaimCalls === 1) {
@@ -543,7 +543,6 @@ describe('GlobalMessagePool', () => {
     });
 
     const pool = new GlobalMessagePool(
-      store,
       createConcurrencyManagerStub(3),
       async (message) => {
         startedIds.push(message.id);
@@ -556,7 +555,8 @@ describe('GlobalMessagePool', () => {
 
         await observationRelease;
         store.confirmProcessed(message.id);
-      }
+      },
+      async () => store.claimNextMessage()
     );
 
     pool.start();

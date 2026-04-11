@@ -1,7 +1,4 @@
 import { describe, it, expect, beforeEach, afterEach, spyOn, mock } from 'bun:test';
-import { writeFileSync, mkdirSync, rmSync, existsSync } from 'fs';
-import { join } from 'path';
-import { tmpdir } from 'os';
 import { GeminiAgent } from '../src/services/worker/GeminiAgent';
 import { DatabaseManager } from '../src/services/worker/DatabaseManager';
 import { SessionManager } from '../src/services/worker/SessionManager';
@@ -42,8 +39,10 @@ describe('GeminiAgent', () => {
   let mockSyncObservation: any;
   let mockSyncSummary: any;
   let mockMarkProcessed: any;
+  let mockGetPendingCount: any;
   let mockCleanupProcessed: any;
   let mockResetStuckMessages: any;
+  let mockRemoveSessionImmediate: any;
   let mockDbManager: DatabaseManager;
   let mockSessionManager: SessionManager;
 
@@ -68,7 +67,7 @@ describe('GeminiAgent', () => {
 
     getSpy = spyOn(SettingsDefaultsManager, 'get').mockImplementation((key: string) => {
       if (key === 'CLAUDE_MEM_GEMINI_API_KEY') return 'test-api-key';
-      if (key === 'CLAUDE_MEM_GEMINI_MODEL') return 'gemini-2.5-flash-lite';
+      if (key === 'CLAUDE_MEM_GEMINI_MODEL') return 'gemini-3-flash-preview';
       if (key === 'CLAUDE_MEM_GEMINI_RATE_LIMITING_ENABLED') return rateLimitingEnabled;
       if (key === 'CLAUDE_MEM_DATA_DIR') return '/tmp/claude-mem-test';
       return SettingsDefaultsManager.getAllDefaults()[key as keyof ReturnType<typeof SettingsDefaultsManager.getAllDefaults>] ?? '';
@@ -81,8 +80,10 @@ describe('GeminiAgent', () => {
     mockSyncObservation = mock(() => Promise.resolve());
     mockSyncSummary = mock(() => Promise.resolve());
     mockMarkProcessed = mock(() => {});
+    mockGetPendingCount = mock(() => 0);
     mockCleanupProcessed = mock(() => 0);
     mockResetStuckMessages = mock(() => 0);
+    mockRemoveSessionImmediate = mock(() => {});
 
     // Mock for storeObservations (plural) - the atomic transaction method called by ResponseProcessor
     mockStoreObservations = mock(() => ({
@@ -96,6 +97,7 @@ describe('GeminiAgent', () => {
       storeObservations: mockStoreObservations, // Required by ResponseProcessor.ts
       storeSummary: mockStoreSummary,
       markSessionCompleted: mockMarkSessionCompleted,
+      updateMemorySessionId: mock(() => {}),
       getSessionById: mock(() => ({ memory_session_id: 'mem-session-123' })), // Required by ResponseProcessor.ts for FK fix
       ensureMemorySessionIdRegistered: mock(() => {}) // Required by ResponseProcessor.ts for FK constraint fix (Issue #846)
     };
@@ -113,13 +115,16 @@ describe('GeminiAgent', () => {
     const mockPendingMessageStore = {
       markProcessed: mockMarkProcessed,
       confirmProcessed: mock(() => {}),  // CLAIM-CONFIRM pattern: confirm after successful storage
+      getPendingCount: mockGetPendingCount,
       cleanupProcessed: mockCleanupProcessed,
       resetStuckMessages: mockResetStuckMessages
     };
 
     mockSessionManager = {
       getMessageIterator: async function* () { yield* []; },
-      getPendingMessageStore: () => mockPendingMessageStore
+      getPendingMessageStore: () => mockPendingMessageStore,
+      syncMemorySessionId: mock(() => {}),
+      removeSessionImmediate: mockRemoveSessionImmediate
     } as unknown as SessionManager;
 
     agent = new GeminiAgent(mockDbManager, mockSessionManager);
@@ -251,7 +256,7 @@ describe('GeminiAgent', () => {
     expect(session.cumulativeInputTokens).toBeGreaterThan(0);
   });
 
-  it('should gracefully pause on rate limit error (no fallback)', async () => {
+  it('should fall back to the next provider when Gemini quota is exhausted', async () => {
     const session = {
       sessionDbId: 1,
       contentSessionId: 'test-session',
@@ -284,10 +289,8 @@ describe('GeminiAgent', () => {
 
     await agent.startSession(session);
 
-    // Verify graceful pause: quotaPaused is set, NO fallback triggered
-    // (429/quota errors are temporary — messages stay pending for retry when quota resets)
-    expect(session.quotaPaused).toBe(true);
-    expect(fallbackAgent.startSession).not.toHaveBeenCalled();
+    expect(session.quotaPaused).toBe(false);
+    expect(fallbackAgent.startSession).toHaveBeenCalledWith(session, undefined);
   });
 
   it('should NOT fallback on other errors', async () => {
@@ -406,7 +409,7 @@ describe('GeminiAgent', () => {
       loadFromFileSpy.mockImplementation(() => ({
         ...SettingsDefaultsManager.getAllDefaults(),
         CLAUDE_MEM_GEMINI_API_KEY: 'test-api-key',
-        CLAUDE_MEM_GEMINI_MODEL: 'gemini-2.5-flash-lite',
+        CLAUDE_MEM_GEMINI_MODEL: 'gemini-3-flash-preview',
         CLAUDE_MEM_GEMINI_RATE_LIMITING_ENABLED: 'false',
         CLAUDE_MEM_GEMINI_MAX_CONTEXT_MESSAGES: '20',
         CLAUDE_MEM_GEMINI_MAX_TOKENS: '1000',  // Very low: ~250 chars
@@ -451,11 +454,7 @@ describe('GeminiAgent', () => {
     it('should accept gemini-3-flash-preview as a valid model', async () => {
       // The GeminiModel type includes gemini-3-flash-preview - compile-time check
       const validModels = [
-        'gemini-2.5-flash-lite',
-        'gemini-2.5-flash',
-        'gemini-2.5-pro',
-        'gemini-2.0-flash',
-        'gemini-2.0-flash-lite',
+        'gemini-3-flash',
         'gemini-3-flash-preview'
       ];
 

@@ -37,9 +37,6 @@ import { isPluginDisabledInClaudeSettings } from '../shared/plugin-state.js';
 // Version injected at build time by esbuild define
 declare const __DEFAULT_PACKAGE_VERSION__: string;
 const packageVersion = typeof __DEFAULT_PACKAGE_VERSION__ !== 'undefined' ? __DEFAULT_PACKAGE_VERSION__ : '0.0.0-dev';
-// Worker-local gate for synchronous SQLite hot paths. Limit 2 keeps pool workers live
-// while sharply reducing event-loop blocking contention.
-const SQLITE_GATE_LIMIT = 2;
 
 // Infrastructure imports
 import {
@@ -90,8 +87,9 @@ import { FormattingService } from './worker/FormattingService.js';
 import { TimelineService } from './worker/TimelineService.js';
 import { SessionEventBroadcaster } from './worker/events/SessionEventBroadcaster.js';
 import { ConcurrencyManager } from './worker/ConcurrencyManager.js';
-import { AsyncSemaphore } from './worker/AsyncSemaphore.js';
 import { GlobalMessagePool } from './worker/GlobalMessagePool.js';
+import { SqliteWriter } from './worker/storage/SqliteWriter.js';
+import type { StorageCoordinator } from './worker/storage/StorageTypes.js';
 import { DEFAULT_CONFIG_PATH, DEFAULT_STATE_PATH, expandHomePath, loadTranscriptWatchConfig, writeSampleConfig } from './transcripts/config.js';
 import { TranscriptWatcher } from './transcripts/watcher.js';
 
@@ -155,7 +153,7 @@ export class WorkerService {
   private sessionEventBroadcaster: SessionEventBroadcaster;
   private concurrencyManager: ConcurrencyManager;
   private globalMessagePool: GlobalMessagePool | null = null;
-  public readonly sqliteGate = new AsyncSemaphore(SQLITE_GATE_LIMIT);
+  public storageCoordinator?: StorageCoordinator;
   private shutdownPromise: Promise<void> | null = null;
 
   // Route handlers
@@ -409,12 +407,19 @@ export class WorkerService {
         logger.info('SYSTEM', `Reset ${resetCount} stale processing messages to pending`);
       }
 
+      const dbPath = this.dbManager.getSessionStore().db.filename;
+      if (!dbPath || dbPath === ':memory:') {
+        throw new Error('Worker storage coordinator requires a file-backed SQLite database');
+      }
+
+      this.storageCoordinator = new SqliteWriter(dbPath);
+      await this.storageCoordinator.start();
+
       this.globalMessagePool = new GlobalMessagePool(
-        pendingStore,
         this.concurrencyManager,
         async (message) => this.processClaimedSessionMessage(message),
+        async () => this.storageCoordinator?.claimNextMessage() ?? null,
         async () => this.waitForClaimSlotIfNeeded(),
-        this.sqliteGate
       );
       this.globalMessagePool.start();
 
@@ -713,7 +718,7 @@ export class WorkerService {
     return {
       sessionDbId: baseSession.sessionDbId,
       contentSessionId: baseSession.contentSessionId,
-      memorySessionId: null,
+      memorySessionId: baseSession.memorySessionId,
       project: baseSession.project,
       platformSource: baseSession.platformSource,
       userPrompt: baseSession.userPrompt,
@@ -731,6 +736,7 @@ export class WorkerService {
       processingMessageIds: [],
       preclaimedMessages: [initialMessage],
       claimAdditionalMessagesFromStore: false,
+      deferredPersistCount: 0,
       lastGeneratorActivity: Date.now()
     };
   }
@@ -1162,6 +1168,11 @@ export class WorkerService {
     if (this.globalMessagePool) {
       await this.globalMessagePool.stop();
       this.globalMessagePool = null;
+    }
+
+    if (this.storageCoordinator) {
+      await this.storageCoordinator.shutdown();
+      this.storageCoordinator = undefined;
     }
 
     // Reset all 'processing' messages back to 'pending' before shutdown.

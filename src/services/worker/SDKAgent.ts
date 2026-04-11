@@ -168,6 +168,7 @@ export class SDKAgent {
         if (message.session_id && message.session_id !== session.memorySessionId) {
           const previousId = session.memorySessionId;
           session.memorySessionId = message.session_id;
+          this.sessionManager.syncMemorySessionId(session.sessionDbId, message.session_id);
           // Persist to database IMMEDIATELY for FK constraint compliance
           // This must happen BEFORE any observations referencing this ID are stored
           this.dbManager.getSessionStore().ensureMemorySessionIdRegistered(

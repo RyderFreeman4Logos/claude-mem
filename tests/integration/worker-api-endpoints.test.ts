@@ -11,6 +11,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, spyOn, mock } from 'bun:test';
+import { createServer as createNetServer } from 'net';
 import { logger } from '../../src/utils/logger.js';
 
 // Mock middleware to avoid complex dependencies
@@ -27,12 +28,36 @@ import type { ServerOptions } from '../../src/services/server/Server.js';
 // Suppress logger output during tests
 let loggerSpies: ReturnType<typeof spyOn>[] = [];
 
+async function getAvailablePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const probe = createNetServer();
+    probe.unref();
+    probe.once('error', reject);
+    probe.listen(0, '127.0.0.1', () => {
+      const address = probe.address();
+      if (!address || typeof address === 'string') {
+        probe.close();
+        reject(new Error('Failed to resolve an ephemeral test port'));
+        return;
+      }
+
+      probe.close((error) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve(address.port);
+      });
+    });
+  });
+}
+
 describe('Worker API Endpoints Integration', () => {
   let server: Server;
   let testPort: number;
   let mockOptions: ServerOptions;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     loggerSpies = [
       spyOn(logger, 'info').mockImplementation(() => {}),
       spyOn(logger, 'debug').mockImplementation(() => {}),
@@ -65,7 +90,7 @@ describe('Worker API Endpoints Integration', () => {
       }),
     };
 
-    testPort = 40000 + Math.floor(Math.random() * 10000);
+    testPort = await getAvailablePort();
   });
 
   afterEach(async () => {

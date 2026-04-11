@@ -39,6 +39,14 @@ const EXCLUDED_PATTERNS = [
   /cli\/handlers\/user-message\.ts$/,  // User message handler uses console.error for user-visible context
   /services\/transcripts\/cli\.ts$/,  // CLI transcript subcommands use console.log for user-visible interactive output
   /SessionCleanupHelper\.ts$/,  // Pure helper function (reset state + broadcast), no logging needed
+  /services\/integrations\/McpIntegrations\.ts$/,  // CLI-facing integration helpers intentionally write user-visible output
+  /services\/smart-file-read\/parser\.ts$/,  // Parser CLI/debug output is intentionally console-based
+  /npx-cli\/commands\/install\.ts$/,  // Interactive installer outputs to the terminal directly
+  /npx-cli\/commands\/runtime\.ts$/,  // Runtime doctor command is a user-facing CLI
+  /pending-messages-schema\.ts$/,  // Pure schema helpers do not need observability
+  /AsyncSemaphore\.ts$/,  // Tiny synchronization primitive with no side effects
+  /StorageTypes\.ts$/,  // Type-only worker contract definitions
+  /sqlite-writer-entry\.ts$/,  // Worker bootstrap entrypoint keeps stderr/stdout behavior minimal
 ];
 
 // Files that should always use logger (core business logic)

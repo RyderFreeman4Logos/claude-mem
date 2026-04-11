@@ -1,25 +1,29 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'fs';
-import { tmpdir } from 'os';
 import { join } from 'path';
-import type { Database } from 'bun:sqlite';
 import { logger } from '../../src/utils/logger.js';
 import { Server } from '../../src/services/server/Server.js';
-import { ClaudeMemDatabase } from '../../src/services/sqlite/Database.js';
-import { SessionStore } from '../../src/services/sqlite/SessionStore.js';
+import { DatabaseManager } from '../../src/services/worker/DatabaseManager.js';
+import { SessionManager } from '../../src/services/worker/SessionManager.js';
+import { OpenRouterAgent } from '../../src/services/worker/OpenRouterAgent.js';
 import { createSDKSession } from '../../src/services/sqlite/Sessions.js';
-import { PendingMessageStore } from '../../src/services/sqlite/PendingMessageStore.js';
 import type { PendingMessage } from '../../src/services/worker-types.js';
 import { GlobalMessagePool } from '../../src/services/worker/GlobalMessagePool.js';
-import { AsyncSemaphore } from '../../src/services/worker/AsyncSemaphore.js';
+import { SqliteWriter } from '../../src/services/worker/storage/SqliteWriter.js';
 import type { ConcurrencyManager } from '../../src/services/worker/ConcurrencyManager.js';
+import { WorkerService } from '../../src/services/worker-service.js';
+import { SettingsDefaultsManager } from '../../src/shared/SettingsDefaultsManager.js';
+import { ModeManager } from '../../src/services/domain/ModeManager.js';
+import { MockOpenRouterProxy } from '../helpers/mock-openrouter-proxy.js';
 
-const MESSAGE_COUNT = 6000;
-const PROVIDER_DELAY_MS = 50;
+const MESSAGE_COUNT = 60;
+const EXPECTED_REQUESTS = MESSAGE_COUNT * 2;
+const PROVIDER_DELAY_MS = 150;
+const PERSIST_DELAY_MS = 60;
 const POOL_CONCURRENCY = 10;
-const PROBE_INTERVAL_MS = 1000;
-const PROBE_DURATION_MS = 30_000;
+const PROBE_INTERVAL_MS = 200;
 const HEALTH_TIMEOUT_MS = 500;
+const DRAIN_TIMEOUT_MS = 20_000;
 
 function createConcurrencyManagerStub(desiredConcurrency: number): ConcurrencyManager {
   return {
@@ -32,6 +36,19 @@ function createConcurrencyManagerStub(desiredConcurrency: number): ConcurrencyMa
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitFor(predicate: () => boolean, timeoutMs: number, message: string): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    if (predicate()) {
+      return;
+    }
+    await delay(25);
+  }
+
+  throw new Error(message);
 }
 
 async function fetchJsonWithTimeout(url: string, timeoutMs: number): Promise<{
@@ -53,14 +70,26 @@ async function fetchJsonWithTimeout(url: string, timeoutMs: number): Promise<{
   };
 }
 
-describe('Health under sustained global pool load', () => {
+function computeP95(values: number[]): number {
+  if (values.length === 0) {
+    return 0;
+  }
+
+  const sorted = [...values].sort((left, right) => left - right);
+  const index = Math.min(sorted.length - 1, Math.ceil(sorted.length * 0.95) - 1);
+  return sorted[index];
+}
+
+describe('Health under sustained real sender load', () => {
   let loggerSpies: ReturnType<typeof spyOn>[] = [];
-  let database: ClaudeMemDatabase | null = null;
-  let sessionStore: SessionStore | null = null;
-  let db: Database | null = null;
+  let tempDir: string | null = null;
+  let dbManager: DatabaseManager | null = null;
+  let sessionManager: SessionManager | null = null;
+  let storageCoordinator: SqliteWriter | null = null;
   let server: Server | null = null;
   let pool: GlobalMessagePool | null = null;
-  let tempDir: string | null = null;
+  let proxy: MockOpenRouterProxy | null = null;
+  let originalEnv: Record<string, string | undefined> = {};
 
   beforeEach(() => {
     loggerSpies = [
@@ -68,7 +97,18 @@ describe('Health under sustained global pool load', () => {
       spyOn(logger, 'debug').mockImplementation(() => {}),
       spyOn(logger, 'warn').mockImplementation(() => {}),
       spyOn(logger, 'error').mockImplementation(() => {}),
+      spyOn(logger, 'success').mockImplementation(() => {}),
+      spyOn(logger, 'failure').mockImplementation(() => {}),
+      spyOn(logger, 'dataOut').mockImplementation(() => {})
     ];
+
+    originalEnv = {
+      CLAUDE_MEM_OPENROUTER_API_KEY: process.env.CLAUDE_MEM_OPENROUTER_API_KEY,
+      CLAUDE_MEM_OPENROUTER_MODEL: process.env.CLAUDE_MEM_OPENROUTER_MODEL,
+      CLAUDE_MEM_OPENROUTER_BASE_URL: process.env.CLAUDE_MEM_OPENROUTER_BASE_URL,
+      CLAUDE_MEM_PROVIDER: process.env.CLAUDE_MEM_PROVIDER,
+      CLAUDE_MEM_CHROMA_ENABLED: process.env.CLAUDE_MEM_CHROMA_ENABLED
+    };
   });
 
   afterEach(async () => {
@@ -83,44 +123,66 @@ describe('Health under sustained global pool load', () => {
       try {
         await server.close();
       } catch {
-        // Ignore cleanup errors after the assertions complete.
+        // Best-effort cleanup after failed startup/assertions.
       }
       server = null;
     }
 
-    if (sessionStore) {
-      sessionStore.db.close();
-      sessionStore = null;
+    if (storageCoordinator) {
+      await storageCoordinator.shutdown();
+      storageCoordinator = null;
     }
 
-    if (database) {
-      database.close();
-      database = null;
+    if (proxy) {
+      await proxy.stop();
+      proxy = null;
     }
+
+    if (dbManager) {
+      await dbManager.close();
+      dbManager = null;
+    }
+
+    sessionManager = null;
 
     if (tempDir) {
       rmSync(tempDir, { recursive: true, force: true });
       tempDir = null;
     }
+
+    for (const [key, value] of Object.entries(originalEnv)) {
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+    SettingsDefaultsManager.clearCache();
   });
 
-  test('keeps /api/health responsive for 30 seconds while processing 6000 messages', async () => {
-    tempDir = mkdtempSync(join(tmpdir(), 'claude-mem-health-'));
+  test('keeps sender concurrency near target while persistence backlog drains independently', async () => {
+    tempDir = mkdtempSync(join(process.cwd(), '.tmp-health-under-load-'));
     const dbPath = join(tempDir, 'health-under-load.sqlite');
-
-    database = new ClaudeMemDatabase(dbPath);
-    db = database.db;
-    sessionStore = new SessionStore(dbPath);
-
-    const pendingStore = new PendingMessageStore(db, 3);
-    const sqliteGate = new AsyncSemaphore(2);
     const contentSessionId = 'health-under-load-session';
     const project = 'health-under-load-project';
-    const sessionDbId = createSDKSession(db, contentSessionId, project, 'Sustained load prompt');
-    const memorySessionId = `memory-${sessionDbId}`;
 
-    const port = 40000 + Math.floor(Math.random() * 10000);
-    const healthUrl = `http://127.0.0.1:${port}/api/health`;
+    proxy = new MockOpenRouterProxy(PROVIDER_DELAY_MS);
+    await proxy.start();
+
+    process.env.CLAUDE_MEM_OPENROUTER_API_KEY = 'test-openrouter-key';
+    process.env.CLAUDE_MEM_OPENROUTER_MODEL = 'test/mock-model';
+    process.env.CLAUDE_MEM_OPENROUTER_BASE_URL = proxy.getUrl();
+    process.env.CLAUDE_MEM_PROVIDER = 'openrouter';
+    process.env.CLAUDE_MEM_CHROMA_ENABLED = 'false';
+    SettingsDefaultsManager.clearCache();
+
+    dbManager = new DatabaseManager(dbPath);
+    await dbManager.initialize();
+    sessionManager = new SessionManager(dbManager);
+
+    const sessionStore = dbManager.getSessionStore();
+    const sessionDbId = createSDKSession(sessionStore.db, contentSessionId, project, 'Sustained load prompt');
+    const pendingStore = sessionManager.getPendingMessageStore();
 
     for (let index = 0; index < MESSAGE_COUNT; index += 1) {
       const message: PendingMessage = {
@@ -128,47 +190,43 @@ describe('Health under sustained global pool load', () => {
         tool_name: 'LoadTestTool',
         tool_input: { index },
         tool_response: { index },
-        prompt_number: index + 1
+        prompt_number: index + 1,
+        cwd: process.cwd()
       };
       pendingStore.enqueue(sessionDbId, contentSessionId, message);
     }
 
-    let processedCount = 0;
+    storageCoordinator = new SqliteWriter(dbPath, { commitDelayMs: PERSIST_DELAY_MS });
+    await storageCoordinator.start();
+
+    ModeManager.getInstance().loadMode('code');
+    const openRouterAgent = new OpenRouterAgent(dbManager, sessionManager);
+    const broadcastProcessingStatus = () => {};
+    const fakeWorkerService = {
+      sdkAgent: {},
+      sessionManager,
+      openRouterAgent,
+      storageCoordinator,
+      sseBroadcaster: {
+        broadcast: () => {}
+      },
+      createIsolatedClaimedSession: (WorkerService.prototype as any).createIsolatedClaimedSession,
+      getActiveAgent: () => openRouterAgent,
+      applyTierRouting: () => {},
+      broadcastProcessingStatus,
+      lastAiInteraction: null
+    };
 
     pool = new GlobalMessagePool(
-      pendingStore,
       createConcurrencyManagerStub(POOL_CONCURRENCY),
       async (message) => {
-        await delay(PROVIDER_DELAY_MS);
-
-        await sqliteGate.run('store', () => {
-          sessionStore!.ensureMemorySessionIdRegistered(sessionDbId, memorySessionId);
-          sessionStore!.storeObservations(
-            memorySessionId,
-            project,
-            [{
-              type: 'discovery',
-              title: `Processed message ${message.id}`,
-              subtitle: null,
-              facts: [`message:${message.id}`],
-              narrative: `Stored observation for message ${message.id}`,
-              concepts: ['load-test'],
-              files_read: ['tests/integration/health-under-load.test.ts'],
-              files_modified: []
-            }],
-            null,
-            message.prompt_number ?? 1,
-            0,
-            message.created_at_epoch
-          );
-          pendingStore.confirmProcessed(message.id);
-        });
-
-        processedCount += 1;
+        await (WorkerService.prototype as any).processClaimedSessionMessage.call(fakeWorkerService, message);
       },
-      undefined,
-      sqliteGate
+      async () => storageCoordinator!.claimNextMessage()
     );
+
+    const port = 40000 + Math.floor(Math.random() * 10000);
+    const healthUrl = `http://127.0.0.1:${port}/api/health`;
 
     server = new Server({
       getInitializationComplete: () => true,
@@ -177,30 +235,24 @@ describe('Health under sustained global pool load', () => {
       onRestart: async () => {},
       workerPath: '/test/worker-service.cjs',
       getAiStatus: () => ({
-        provider: 'claude',
-        authMethod: 'cli',
+        provider: 'openrouter',
+        authMethod: 'test',
         lastInteraction: null
       }),
       getPoolStatus: () => pool!.getStatus()
     });
 
     await server.listen(port, '127.0.0.1');
-    pool.start();
 
     const probeLatencies: number[] = [];
-    const tickValues: number[] = [];
     const processingSnapshots: number[] = [];
-    const probeDeadline = Date.now() + PROBE_DURATION_MS;
-
-    try {
-      while (Date.now() < probeDeadline) {
+    let stopProbing = false;
+    const probeLoop = (async () => {
+      while (!stopProbing) {
         const probeStartedAt = Date.now();
         const { response, body, latencyMs } = await fetchJsonWithTimeout(healthUrl, HEALTH_TIMEOUT_MS);
-
         probeLatencies.push(latencyMs);
-        tickValues.push(body.pool.lastTickMs ?? 0);
         processingSnapshots.push(body.pool.processingCount ?? 0);
-
         expect(response.status).toBe(200);
         expect(latencyMs).toBeLessThan(HEALTH_TIMEOUT_MS);
 
@@ -209,27 +261,50 @@ describe('Health under sustained global pool load', () => {
           await delay(remainingSleepMs);
         }
       }
+    })();
 
-      expect(probeLatencies.length).toBeGreaterThanOrEqual(25);
-      expect(probeLatencies.every((latencyMs) => latencyMs < HEALTH_TIMEOUT_MS)).toBe(true);
-      expect(processedCount).toBeGreaterThan(500);
-      expect(processingSnapshots.some((count) => count > 0)).toBe(true);
+    const loadStartedAt = Date.now();
+    pool.start();
 
-      const observedTicks = tickValues.filter((tick) => tick > 0);
-      expect(observedTicks.length).toBeGreaterThan(0);
-      expect(Math.max(...observedTicks)).toBeGreaterThan(Math.min(...observedTicks));
-      expect(pool.getStatus().poolSize).toBe(POOL_CONCURRENCY);
+    try {
+      await waitFor(
+        () => proxy!.getMetrics().totalRequests >= EXPECTED_REQUESTS,
+        DRAIN_TIMEOUT_MS,
+        `Expected ${EXPECTED_REQUESTS} OpenRouter requests to be issued, saw ${proxy!.getMetrics().totalRequests}`
+      );
+      const senderPhaseDurationMs = Date.now() - loadStartedAt;
+      const senderMetrics = proxy.getMetrics();
+
+      await waitFor(
+        () => pendingStore.getPendingCount(sessionDbId) === 0
+          && storageCoordinator!.getStatus().persistQueueDepth === 0
+          && storageCoordinator!.getStatus().inflightPersists === 0,
+        DRAIN_TIMEOUT_MS,
+        'Persist backlog did not drain to zero'
+      );
+
+      stopProbing = true;
+      await probeLoop;
+
+      const highInFlightSamples = senderMetrics.inFlightSamples.filter((value) => value >= POOL_CONCURRENCY - 2);
+      const baselineSequentialMs = MESSAGE_COUNT * PROVIDER_DELAY_MS * 2;
+      const recvQueueP95 = computeP95(senderMetrics.recvQueueSamples);
+
+      expect(probeLatencies.length).toBeGreaterThanOrEqual(10);
+      expect(processingSnapshots.some((count) => count >= 1)).toBe(true);
+      expect(senderMetrics.maxInFlight).toBeGreaterThanOrEqual(POOL_CONCURRENCY - 1);
+      expect(highInFlightSamples.length / Math.max(1, senderMetrics.inFlightSamples.length)).toBeGreaterThanOrEqual(0.8);
+      expect(senderPhaseDurationMs).toBeLessThan(baselineSequentialMs / 3);
+
+      if (senderMetrics.recvQueueSamples.length > 0) {
+        expect(recvQueueP95).toBe(0);
+        expect(Math.max(...senderMetrics.recvQueueSamples)).toBeLessThanOrEqual(1);
+      }
+
+      expect(pendingStore.getPendingCount(sessionDbId)).toBe(0);
     } finally {
-      await pool.stop();
-      pool = null;
+      stopProbing = true;
+      await probeLoop.catch(() => {});
     }
-
-    const processingRow = db.query(`
-      SELECT COUNT(*) as count
-      FROM pending_messages
-      WHERE status = 'processing'
-    `).get() as { count: number };
-
-    expect(processingRow.count).toBe(0);
-  }, 60_000);
+  }, 30_000);
 });

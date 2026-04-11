@@ -11,6 +11,7 @@ import { MigrationRunner } from './migrations/runner.js';
 // SQLite configuration constants
 const SQLITE_MMAP_SIZE_BYTES = 256 * 1024 * 1024; // 256MB
 const SQLITE_CACHE_SIZE_PAGES = 10_000;
+const SQLITE_BUSY_TIMEOUT_MS = 5_000;
 
 export interface Migration {
   version: number;
@@ -164,6 +165,7 @@ export class ClaudeMemDatabase {
     this.db.run('PRAGMA journal_mode = WAL');
     this.db.run('PRAGMA synchronous = NORMAL');
     this.db.run('PRAGMA foreign_keys = ON');
+    this.db.run(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS}`);
     this.db.run('PRAGMA temp_store = memory');
     this.db.run(`PRAGMA mmap_size = ${SQLITE_MMAP_SIZE_BYTES}`);
     this.db.run(`PRAGMA cache_size = ${SQLITE_CACHE_SIZE_PAGES}`);

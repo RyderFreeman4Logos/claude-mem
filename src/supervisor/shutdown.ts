@@ -8,7 +8,7 @@ import { HOOK_TIMEOUTS } from '../shared/hook-constants.js';
 import { isPidAlive, type ManagedProcessRecord, type ProcessRegistry } from './process-registry.js';
 
 const execFileAsync = promisify(execFile);
-const DATA_DIR = path.join(homedir(), '.claude-mem');
+const DATA_DIR = process.env.CLAUDE_MEM_DATA_DIR || path.join(homedir(), '.claude-mem');
 const PID_FILE = path.join(DATA_DIR, 'worker.pid');
 
 type TreeKillFn = (pid: number, signal?: string, callback?: (error?: Error | null) => void) => void;

@@ -21,7 +21,7 @@ import { getSupervisor, validateWorkerPidFile, type ValidateWorkerPidStatus } fr
 const execAsync = promisify(exec);
 
 // Standard paths for PID file management
-const DATA_DIR = path.join(homedir(), '.claude-mem');
+const DATA_DIR = process.env.CLAUDE_MEM_DATA_DIR || path.join(homedir(), '.claude-mem');
 const PID_FILE = path.join(DATA_DIR, 'worker.pid');
 
 // Orphaned process cleanup patterns and thresholds

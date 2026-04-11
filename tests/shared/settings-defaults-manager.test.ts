@@ -21,6 +21,16 @@ describe('SettingsDefaultsManager', () => {
   let tempDir: string;
   let settingsPath: string;
 
+  const getExpectedResolvedDefaults = () => {
+    const defaults = SettingsDefaultsManager.getAllDefaults();
+    for (const key of Object.keys(defaults) as Array<keyof typeof defaults>) {
+      if (process.env[key] !== undefined) {
+        defaults[key] = process.env[key]!;
+      }
+    }
+    return defaults;
+  };
+
   beforeEach(() => {
     // Create unique temp directory for each test
     tempDir = join(tmpdir(), `settings-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -45,7 +55,7 @@ describe('SettingsDefaultsManager', () => {
         const result = SettingsDefaultsManager.loadFromFile(settingsPath);
 
         expect(existsSync(settingsPath)).toBe(true);
-        expect(result).toEqual(SettingsDefaultsManager.getAllDefaults());
+        expect(result).toEqual(getExpectedResolvedDefaults());
       });
 
       it('should write valid JSON to the created file', () => {
@@ -85,7 +95,7 @@ describe('SettingsDefaultsManager', () => {
 
         expect(existsSync(join(tempDir, 'nested', 'deep'))).toBe(true);
         expect(existsSync(nestedPath)).toBe(true);
-        expect(result).toEqual(SettingsDefaultsManager.getAllDefaults());
+        expect(result).toEqual(getExpectedResolvedDefaults());
       });
 
       it('should create deeply nested directories recursively', () => {
@@ -162,7 +172,7 @@ describe('SettingsDefaultsManager', () => {
 
         const result = SettingsDefaultsManager.loadFromFile(settingsPath);
 
-        expect(result).toEqual(SettingsDefaultsManager.getAllDefaults());
+        expect(result).toEqual(getExpectedResolvedDefaults());
       });
 
       it('should return defaults when file contains invalid JSON', () => {
@@ -170,7 +180,7 @@ describe('SettingsDefaultsManager', () => {
 
         const result = SettingsDefaultsManager.loadFromFile(settingsPath);
 
-        expect(result).toEqual(SettingsDefaultsManager.getAllDefaults());
+        expect(result).toEqual(getExpectedResolvedDefaults());
       });
 
       it('should return defaults when file contains only whitespace', () => {
@@ -178,7 +188,7 @@ describe('SettingsDefaultsManager', () => {
 
         const result = SettingsDefaultsManager.loadFromFile(settingsPath);
 
-        expect(result).toEqual(SettingsDefaultsManager.getAllDefaults());
+        expect(result).toEqual(getExpectedResolvedDefaults());
       });
 
       it('should return defaults when file contains null', () => {
@@ -186,7 +196,7 @@ describe('SettingsDefaultsManager', () => {
 
         const result = SettingsDefaultsManager.loadFromFile(settingsPath);
 
-        expect(result).toEqual(SettingsDefaultsManager.getAllDefaults());
+        expect(result).toEqual(getExpectedResolvedDefaults());
       });
 
       it('should return defaults when file contains array instead of object', () => {
@@ -194,7 +204,7 @@ describe('SettingsDefaultsManager', () => {
 
         const result = SettingsDefaultsManager.loadFromFile(settingsPath);
 
-        expect(result).toEqual(SettingsDefaultsManager.getAllDefaults());
+        expect(result).toEqual(getExpectedResolvedDefaults());
       });
 
       it('should return defaults when file contains primitive value', () => {
@@ -202,7 +212,7 @@ describe('SettingsDefaultsManager', () => {
 
         const result = SettingsDefaultsManager.loadFromFile(settingsPath);
 
-        expect(result).toEqual(SettingsDefaultsManager.getAllDefaults());
+        expect(result).toEqual(getExpectedResolvedDefaults());
       });
     });
 
@@ -246,7 +256,7 @@ describe('SettingsDefaultsManager', () => {
 
         const result = SettingsDefaultsManager.loadFromFile(settingsPath);
 
-        expect(result).toEqual(SettingsDefaultsManager.getAllDefaults());
+        expect(result).toEqual(getExpectedResolvedDefaults());
       });
 
       it('should ignore unknown keys in file', () => {

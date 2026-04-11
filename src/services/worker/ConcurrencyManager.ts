@@ -1,10 +1,11 @@
-import { watch, type FSWatcher } from 'fs';
+import { existsSync, readFileSync, watch, type FSWatcher } from 'fs';
+import { basename, dirname } from 'path';
 import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
 import { USER_SETTINGS_PATH } from '../../shared/paths.js';
 import { logger } from '../../utils/logger.js';
 
 const DEFAULT_CONCURRENCY = 3;
-const RELOAD_DEBOUNCE_MS = 1000;
+const RELOAD_DEBOUNCE_MS = 250;
 const COMPONENT_NAME = 'ConcurrencyManager';
 
 type ConcurrencyChangeListener = (nextConcurrency: number) => void;
@@ -17,6 +18,7 @@ export class ConcurrencyManager {
   private watcher: FSWatcher | null = null;
   private reloadTimer: ReturnType<typeof setTimeout> | null = null;
   private watching = false;
+  private pendingReloadEventType: 'change' | 'rename' | 'unknown' = 'unknown';
 
   constructor(
     private settingsPath: string = USER_SETTINGS_PATH
@@ -94,15 +96,43 @@ export class ConcurrencyManager {
     }
 
     try {
-      this.watcher = watch(this.settingsPath, () => {
+      const settingsDir = dirname(this.settingsPath);
+      const settingsBaseName = basename(this.settingsPath);
+
+      this.watcher = watch(settingsDir, (eventType, filename) => {
+        const normalizedName = typeof filename === 'string'
+          ? filename
+          : filename?.toString();
+
+        if (eventType === 'change' && normalizedName && basename(normalizedName) !== settingsBaseName) {
+          return;
+        }
+
+        if (eventType !== 'change' && eventType !== 'rename') {
+          return;
+        }
+
+        this.pendingReloadEventType = eventType;
+
         if (this.reloadTimer) {
           clearTimeout(this.reloadTimer);
         }
 
         this.reloadTimer = setTimeout(() => {
           this.reloadTimer = null;
-          this.reloadFromSettings();
+          const queuedEventType = this.pendingReloadEventType;
+          this.pendingReloadEventType = 'unknown';
+          this.reloadFromSettings(queuedEventType);
         }, RELOAD_DEBOUNCE_MS);
+      });
+      this.watcher.on('error', (error) => {
+        logger.warn('SYSTEM', `${COMPONENT_NAME} watcher error`, {
+          settingsPath: this.settingsPath
+        }, error as Error);
+
+        if (this.watching) {
+          this.restartWatcher();
+        }
       });
     } catch (error) {
       logger.warn('SYSTEM', 'Failed to watch settings.json for concurrency updates', {
@@ -111,9 +141,23 @@ export class ConcurrencyManager {
     }
   }
 
-  private reloadFromSettings(): void {
+  private reloadFromSettings(eventType: 'change' | 'rename' | 'unknown'): void {
     const next = this.readDesiredConcurrency();
-    this.setDesiredConcurrency(next);
+    const previous = this.desiredConcurrency;
+
+    if (next !== previous) {
+      this.desiredConcurrency = next;
+      logger.info('SYSTEM', 'ConcurrencyManager reloaded desired worker concurrency from settings', {
+        from: previous,
+        to: next,
+        settingsPath: this.settingsPath,
+        eventType
+      });
+
+      for (const listener of this.listeners) {
+        listener(next);
+      }
+    }
 
     if (this.watching) {
       this.restartWatcher();
@@ -122,13 +166,27 @@ export class ConcurrencyManager {
 
   private readDesiredConcurrency(): number {
     try {
-      const settings = SettingsDefaultsManager.loadFromFile(this.settingsPath);
-      return this.normalizeConcurrency(settings.CLAUDE_MEM_CONCURRENT_MESSAGES);
+      if (process.env.CLAUDE_MEM_CONCURRENT_MESSAGES !== undefined) {
+        return this.normalizeConcurrency(process.env.CLAUDE_MEM_CONCURRENT_MESSAGES);
+      }
+
+      if (!existsSync(this.settingsPath)) {
+        return DEFAULT_CONCURRENCY;
+      }
+
+      const rawSettings = JSON.parse(readFileSync(this.settingsPath, 'utf-8'));
+      const flatSettings = rawSettings && typeof rawSettings === 'object' && !Array.isArray(rawSettings)
+        ? ('env' in rawSettings && rawSettings.env && typeof rawSettings.env === 'object' && !Array.isArray(rawSettings.env)
+          ? rawSettings.env
+          : rawSettings)
+        : null;
+
+      return this.normalizeConcurrency(flatSettings?.CLAUDE_MEM_CONCURRENT_MESSAGES);
     } catch (error) {
       logger.warn('SYSTEM', 'Failed to load concurrent message setting, using default', {
         settingsPath: this.settingsPath
       }, error as Error);
-      return DEFAULT_CONCURRENCY;
+      return this.normalizeConcurrency(SettingsDefaultsManager.get('CLAUDE_MEM_CONCURRENT_MESSAGES'));
     }
   }
 

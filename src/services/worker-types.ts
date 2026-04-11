@@ -47,6 +47,9 @@ export interface ActiveSession {
   preclaimedMessages: PendingMessageWithId[];
   // Global-pool isolated runs disable store claims so each worker handles only its claimed message.
   claimAdditionalMessagesFromStore?: boolean;
+  // Deferred persistence lets sender-side workers release their HTTP slot
+  // before SQLite commits complete in the dedicated writer actor.
+  deferredPersistCount?: number;
   // SDK global-pool runs can pre-wait on the agent slot before the claim enters processing.
   skipSdkSlotWait?: boolean;
   // Tier routing: model override per session based on queue complexity

@@ -1,11 +1,11 @@
 import { logger } from '../../utils/logger.js';
-import type { PersistentPendingMessage, PendingMessageStore } from '../sqlite/PendingMessageStore.js';
+import type { PersistentPendingMessage } from '../sqlite/PendingMessageStore.js';
 import { ConcurrencyManager } from './ConcurrencyManager.js';
-import type { AsyncSemaphore } from './AsyncSemaphore.js';
 
 const IDLE_POLL_MS = 1000;
 
 type MessageProcessor = (message: PersistentPendingMessage) => Promise<void>;
+type MessageClaimer = (workerId: number) => Promise<PersistentPendingMessage | null>;
 type ClaimGate = () => Promise<void>;
 
 interface WorkerHandle {
@@ -41,11 +41,10 @@ export class GlobalMessagePool {
   private lastYieldMs: number | null = null;
 
   constructor(
-    private pendingStore: PendingMessageStore,
     private concurrencyManager: ConcurrencyManager,
     private processMessage: MessageProcessor,
+    private claimMessage: MessageClaimer,
     private beforeClaim?: ClaimGate,
-    private sqliteGate?: AsyncSemaphore
   ) {}
 
   getStatus(): GlobalMessagePoolStatus {
@@ -192,16 +191,6 @@ export class GlobalMessagePool {
 
       try {
         await this.processMessage(message);
-
-        if (this.pendingStore.getMessageStatus(message.id) === 'processing') {
-          logger.warn('QUEUE', 'Message returned without confirmation, re-queueing with backoff', {
-            workerId,
-            sessionDbId,
-            messageId: message.id,
-            type: message.message_type
-          });
-          this.pendingStore.markFailed(message.id);
-        }
       } catch (error) {
         logger.error('QUEUE', 'Global message worker failed', {
           workerId,
@@ -209,10 +198,6 @@ export class GlobalMessagePool {
           messageId: message.id,
           type: message.message_type
         }, error as Error);
-
-        if (this.pendingStore.getMessageStatus(message.id) === 'processing') {
-          this.pendingStore.markFailed(message.id);
-        }
       } finally {
         this.processingWorkerIds.delete(workerId);
         this.lastCompletionMs = Date.now();
@@ -240,17 +225,11 @@ export class GlobalMessagePool {
   }
 
   private async claimNextMessage(workerId: number): Promise<PersistentPendingMessage | null> {
-    if (!this.sqliteGate) {
-      return this.pendingStore.claimNextMessage();
+    if (!this.running || this.retiringWorkers.has(workerId)) {
+      return null;
     }
 
-    return this.sqliteGate.run('claim', () => {
-      if (!this.running || this.retiringWorkers.has(workerId)) {
-        return null;
-      }
-
-      return this.pendingStore.claimNextMessage();
-    });
+    return this.claimMessage(workerId);
   }
 
   private async yieldToEventLoop(): Promise<void> {
