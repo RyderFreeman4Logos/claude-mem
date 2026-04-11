@@ -37,6 +37,9 @@ import { isPluginDisabledInClaudeSettings } from '../shared/plugin-state.js';
 // Version injected at build time by esbuild define
 declare const __DEFAULT_PACKAGE_VERSION__: string;
 const packageVersion = typeof __DEFAULT_PACKAGE_VERSION__ !== 'undefined' ? __DEFAULT_PACKAGE_VERSION__ : '0.0.0-dev';
+// Worker-local gate for synchronous SQLite hot paths. Limit 2 keeps pool workers live
+// while sharply reducing event-loop blocking contention.
+const SQLITE_GATE_LIMIT = 2;
 
 // Infrastructure imports
 import {
@@ -87,6 +90,7 @@ import { FormattingService } from './worker/FormattingService.js';
 import { TimelineService } from './worker/TimelineService.js';
 import { SessionEventBroadcaster } from './worker/events/SessionEventBroadcaster.js';
 import { ConcurrencyManager } from './worker/ConcurrencyManager.js';
+import { AsyncSemaphore } from './worker/AsyncSemaphore.js';
 import { GlobalMessagePool } from './worker/GlobalMessagePool.js';
 import { DEFAULT_CONFIG_PATH, DEFAULT_STATE_PATH, expandHomePath, loadTranscriptWatchConfig, writeSampleConfig } from './transcripts/config.js';
 import { TranscriptWatcher } from './transcripts/watcher.js';
@@ -151,6 +155,8 @@ export class WorkerService {
   private sessionEventBroadcaster: SessionEventBroadcaster;
   private concurrencyManager: ConcurrencyManager;
   private globalMessagePool: GlobalMessagePool | null = null;
+  public readonly sqliteGate = new AsyncSemaphore(SQLITE_GATE_LIMIT);
+  private shutdownPromise: Promise<void> | null = null;
 
   // Route handlers
   private searchRoutes: SearchRoutes | null = null;
@@ -230,9 +236,10 @@ export class WorkerService {
     this.server = new Server({
       getInitializationComplete: () => this.initializationCompleteFlag,
       getMcpReady: () => this.mcpReady,
-      onShutdown: () => this.shutdown(),
-      onRestart: () => this.shutdown(),
+      onShutdown: (reason) => this.shutdown(reason),
+      onRestart: (reason) => this.shutdown(reason),
       workerPath: __filename,
+      getPoolStatus: () => this.globalMessagePool?.getStatus() ?? null,
       getAiStatus: () => {
         let provider = 'claude';
         if (isOpenRouterSelected() && isOpenRouterAvailable()) provider = 'openrouter';
@@ -262,9 +269,8 @@ export class WorkerService {
    * Register signal handlers for graceful shutdown
    */
   private registerSignalHandlers(): void {
-    configureSupervisorSignalHandlers(async () => {
-      this.isShuttingDown = true;
-      await this.shutdown();
+    configureSupervisorSignalHandlers(async (signal) => {
+      await this.shutdown(`signal:${signal}`);
     });
   }
 
@@ -407,7 +413,8 @@ export class WorkerService {
         pendingStore,
         this.concurrencyManager,
         async (message) => this.processClaimedSessionMessage(message),
-        async () => this.waitForClaimSlotIfNeeded()
+        async () => this.waitForClaimSlotIfNeeded(),
+        this.sqliteGate
       );
       this.globalMessagePool.start();
 
@@ -1102,7 +1109,32 @@ export class WorkerService {
   /**
    * Shutdown the worker service
    */
-  async shutdown(): Promise<void> {
+  async shutdown(source: string = 'unknown'): Promise<void> {
+    logger.info('SHUTDOWN', 'Worker shutdown requested', {
+      source,
+      initialized: this.initializationCompleteFlag,
+      isShuttingDown: this.isShuttingDown,
+      pool: this.globalMessagePool?.getStatus() ?? null
+    });
+
+    if (this.shutdownPromise) {
+      logger.warn('SHUTDOWN', 'Worker shutdown already in progress', { source });
+      return this.shutdownPromise;
+    }
+
+    this.isShuttingDown = true;
+    this.shutdownPromise = this.performShutdown(source).finally(() => {
+      logger.info('SHUTDOWN', 'Worker shutdown complete', {
+        source,
+        initialized: this.initializationCompleteFlag,
+        pool: this.globalMessagePool?.getStatus() ?? null
+      });
+    });
+
+    return this.shutdownPromise;
+  }
+
+  private async performShutdown(source: string): Promise<void> {
     if (this.transcriptWatcher) {
       this.transcriptWatcher.stop();
       this.transcriptWatcher = null;
@@ -1141,10 +1173,12 @@ export class WorkerService {
         const pendingStore = new PendingMessageStore(this.dbManager.getSessionStore().db, 3);
         const resetCount = pendingStore.resetStaleProcessingMessages(0);
         if (resetCount > 0) {
-          logger.info('SHUTDOWN', `Reset ${resetCount} processing messages to pending for recovery`);
+          logger.info('SHUTDOWN', `Reset ${resetCount} processing messages to pending for recovery`, {
+            source
+          });
         }
       } catch (error) {
-        logger.error('SHUTDOWN', 'Failed to reset processing messages', {}, error as Error);
+        logger.error('SHUTDOWN', 'Failed to reset processing messages', { source }, error as Error);
       }
     }
 

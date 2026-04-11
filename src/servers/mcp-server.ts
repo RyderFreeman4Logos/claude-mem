@@ -191,15 +191,44 @@ async function callWorkerAPIPost(
 /**
  * Verify Worker is accessible
  */
-async function verifyWorkerConnection(): Promise<boolean> {
+async function verifyWorkerConnection(): Promise<{ ok: boolean; workerPath?: string }> {
   try {
     const response = await workerHttpRequest('/api/health');
-    return response.ok;
+    if (!response.ok) {
+      return { ok: false };
+    }
+
+    const health = await response.json() as { workerPath?: string };
+    return {
+      ok: true,
+      workerPath: typeof health.workerPath === 'string' ? health.workerPath : undefined
+    };
   } catch (error) {
     // Expected during worker startup or if worker is down
     logger.debug('SYSTEM', 'Worker health check failed', {}, error as Error);
-    return false;
+    return { ok: false };
   }
+}
+
+function logWorkerPathMismatch(actualWorkerPath?: string): void {
+  if (!actualWorkerPath) {
+    return;
+  }
+
+  const expectedWorkerPath = resolve(WORKER_SCRIPT_PATH);
+  const normalizedActualPath = resolve(actualWorkerPath);
+
+  if (normalizedActualPath === expectedWorkerPath) {
+    return;
+  }
+
+  logger.warn('SYSTEM', 'mcp-server connected to a worker from a different bundle path', {
+    expectedWorkerPath,
+    actualWorkerPath: normalizedActualPath,
+    mcpServerDir,
+    port: getWorkerPort(),
+    note: 'connected worker is healthy but from a different bundle path'
+  });
 }
 
 /**
@@ -207,11 +236,18 @@ async function verifyWorkerConnection(): Promise<boolean> {
  * Claude hooks already start the worker; this path makes Codex turnkey.
  */
 async function ensureWorkerConnection(): Promise<boolean> {
-  if (await verifyWorkerConnection()) {
+  const existingHealth = await verifyWorkerConnection();
+  if (existingHealth.ok) {
+    logWorkerPathMismatch(existingHealth.workerPath);
     return true;
   }
 
-  logger.warn('SYSTEM', 'Worker not available, attempting auto-start for MCP client');
+  const port = getWorkerPort();
+  logger.warn('SYSTEM', 'Worker not available, attempting auto-start for MCP client', {
+    expectedWorkerPath: WORKER_SCRIPT_PATH,
+    mcpServerDir,
+    port
+  });
 
   // Validate the worker bundle path lazily here (rather than at module load)
   // so that tests/tools that import this module without booting the MCP
@@ -220,7 +256,6 @@ async function ensureWorkerConnection(): Promise<boolean> {
   errorIfWorkerScriptMissing();
 
   try {
-    const port = getWorkerPort();
     const started = await ensureWorkerStarted(port, WORKER_SCRIPT_PATH);
     if (!started) {
       logger.error(
@@ -228,6 +263,14 @@ async function ensureWorkerConnection(): Promise<boolean> {
         'Worker auto-start returned false — MCP tools that require the worker (search, timeline, get_observations) will fail until the worker is running. Check earlier log lines for the specific failure reason (Bun not found, missing worker bundle, port conflict, etc.).'
       );
     }
+
+    if (started) {
+      const startedHealth = await verifyWorkerConnection();
+      if (startedHealth.ok) {
+        logWorkerPathMismatch(startedHealth.workerPath);
+      }
+    }
+
     return started;
   } catch (error) {
     logger.error(

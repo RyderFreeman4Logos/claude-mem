@@ -87,56 +87,63 @@ export async function processAgentResponse(
 
   // Get session store for atomic transaction
   const sessionStore = dbManager.getSessionStore();
+  const pendingStore = sessionManager.getPendingMessageStore();
 
   // CRITICAL: Must use memorySessionId (not contentSessionId) for FK constraint
   if (!session.memorySessionId) {
     throw new Error('Cannot store observations: memorySessionId not yet captured');
   }
 
-  // SAFETY NET (Issue #846 / Multi-terminal FK fix):
-  // The PRIMARY fix is in SDKAgent.ts where ensureMemorySessionIdRegistered() is called
-  // immediately when the SDK returns a memory_session_id. This call is a defensive safety net
-  // in case the DB was somehow not updated (race condition, crash, etc.).
-  // In multi-terminal scenarios, createSDKSession() now resets memory_session_id to NULL
-  // for each new generator, ensuring clean isolation.
-  sessionStore.ensureMemorySessionIdRegistered(session.sessionDbId, session.memorySessionId);
+  const storeResponse = () => {
+    // SAFETY NET (Issue #846 / Multi-terminal FK fix):
+    // The PRIMARY fix is in SDKAgent.ts where ensureMemorySessionIdRegistered() is called
+    // immediately when the SDK returns a memory_session_id. This call is a defensive safety net
+    // in case the DB was somehow not updated (race condition, crash, etc.).
+    // In multi-terminal scenarios, createSDKSession() now resets memory_session_id to NULL
+    // for each new generator, ensuring clean isolation.
+    sessionStore.ensureMemorySessionIdRegistered(session.sessionDbId, session.memorySessionId!);
 
-  // Log pre-storage with session ID chain for verification
-  logger.info('DB', `STORING | sessionDbId=${session.sessionDbId} | memorySessionId=${session.memorySessionId} | obsCount=${observations.length} | hasSummary=${!!summaryForStore}`, {
-    sessionId: session.sessionDbId,
-    memorySessionId: session.memorySessionId
-  });
+    // Log pre-storage with session ID chain for verification
+    logger.info('DB', `STORING | sessionDbId=${session.sessionDbId} | memorySessionId=${session.memorySessionId} | obsCount=${observations.length} | hasSummary=${!!summaryForStore}`, {
+      sessionId: session.sessionDbId,
+      memorySessionId: session.memorySessionId
+    });
 
-  // ATOMIC TRANSACTION: Store observations + summary ONCE
-  // Messages are marked 'processing' on claim and completed after successful processing
-  const result = sessionStore.storeObservations(
-    session.memorySessionId,
-    session.project,
-    observations,
-    summaryForStore,
-    session.lastPromptNumber,
-    discoveryTokens,
-    originalTimestamp ?? undefined,
-    modelId
-  );
+    // ATOMIC TRANSACTION: Store observations + summary ONCE
+    // Messages are marked 'processing' on claim and completed after successful processing
+    const result = sessionStore.storeObservations(
+      session.memorySessionId!,
+      session.project,
+      observations,
+      summaryForStore,
+      session.lastPromptNumber,
+      discoveryTokens,
+      originalTimestamp ?? undefined,
+      modelId
+    );
 
-  // Log storage result with IDs for end-to-end traceability
-  logger.info('DB', `STORED | sessionDbId=${session.sessionDbId} | memorySessionId=${session.memorySessionId} | obsCount=${result.observationIds.length} | obsIds=[${result.observationIds.join(',')}] | summaryId=${result.summaryId || 'none'}`, {
-    sessionId: session.sessionDbId,
-    memorySessionId: session.memorySessionId
-  });
+    // Log storage result with IDs for end-to-end traceability
+    logger.info('DB', `STORED | sessionDbId=${session.sessionDbId} | memorySessionId=${session.memorySessionId} | obsCount=${result.observationIds.length} | obsIds=[${result.observationIds.join(',')}] | summaryId=${result.summaryId || 'none'}`, {
+      sessionId: session.sessionDbId,
+      memorySessionId: session.memorySessionId
+    });
 
-  // CLAIM-CONFIRM: Now that storage succeeded, confirm all processing messages (delete from queue)
-  // This is the critical step that prevents message loss on generator crash
-  const pendingStore = sessionManager.getPendingMessageStore();
-  for (const messageId of session.processingMessageIds) {
-    pendingStore.confirmProcessed(messageId);
-  }
-  if (session.processingMessageIds.length > 0) {
-    logger.debug('QUEUE', `CONFIRMED_BATCH | sessionDbId=${session.sessionDbId} | count=${session.processingMessageIds.length} | ids=[${session.processingMessageIds.join(',')}]`);
-  }
-  // Clear the tracking array after confirmation
-  session.processingMessageIds = [];
+    // CLAIM-CONFIRM: Now that storage succeeded, confirm all processing messages (delete from queue)
+    // This is the critical step that prevents message loss on generator crash
+    for (const messageId of session.processingMessageIds) {
+      pendingStore.confirmProcessed(messageId);
+    }
+    if (session.processingMessageIds.length > 0) {
+      logger.debug('QUEUE', `CONFIRMED_BATCH | sessionDbId=${session.sessionDbId} | count=${session.processingMessageIds.length} | ids=[${session.processingMessageIds.join(',')}]`);
+    }
+    session.processingMessageIds = [];
+
+    return result;
+  };
+
+  const result = worker?.sqliteGate
+    ? await worker.sqliteGate.run('store', storeResponse)
+    : storeResponse();
 
   // AFTER transaction commits - async operations (can fail safely without data loss)
   await syncAndBroadcastObservations(

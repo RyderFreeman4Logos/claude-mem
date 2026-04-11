@@ -28,7 +28,7 @@ class Supervisor {
   private stopPromise: Promise<void> | null = null;
   private signalHandlersRegistered = false;
   private shutdownInitiated = false;
-  private shutdownHandler: (() => Promise<void>) | null = null;
+  private shutdownHandler: ((signal: string) => Promise<void>) | null = null;
 
   constructor(registry: ProcessRegistry) {
     this.registry = registry;
@@ -48,7 +48,7 @@ class Supervisor {
     startHealthChecker();
   }
 
-  configureSignalHandlers(shutdownHandler: () => Promise<void>): void {
+  configureSignalHandlers(shutdownHandler: (signal: string) => Promise<void>): void {
     this.shutdownHandler = shutdownHandler;
 
     if (this.signalHandlersRegistered) return;
@@ -65,7 +65,7 @@ class Supervisor {
 
       try {
         if (this.shutdownHandler) {
-          await this.shutdownHandler();
+          await this.shutdownHandler(signal);
         } else {
           await this.stop();
         }
@@ -146,7 +146,7 @@ export function getSupervisor(): Supervisor {
   return supervisorSingleton;
 }
 
-export function configureSupervisorSignalHandlers(shutdownHandler: () => Promise<void>): void {
+export function configureSupervisorSignalHandlers(shutdownHandler: (signal: string) => Promise<void>): void {
   supervisorSingleton.configureSignalHandlers(shutdownHandler);
 }
 
