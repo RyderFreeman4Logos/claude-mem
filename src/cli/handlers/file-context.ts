@@ -6,7 +6,7 @@
  */
 
 import type { EventHandler, NormalizedHookInput, HookResult } from '../types.js';
-import { ensureWorkerRunning, workerHttpRequest } from '../../shared/worker-utils.js';
+import { workerHttpRequest } from '../../shared/worker-utils.js';
 import { logger } from '../../utils/logger.js';
 import { parseJsonArray } from '../../shared/timeline-formatting.js';
 import { statSync } from 'fs';
@@ -24,6 +24,10 @@ const FETCH_LOOKAHEAD_LIMIT = 40;
 
 /** Maximum observations to show in the timeline. */
 const DISPLAY_LIMIT = 15;
+
+/** PreToolUse must stay well below hook latency that would stall tool dispatch. */
+const PRETOOLUSE_WORKER_HEALTH_TIMEOUT_MS = 50;
+const PRETOOLUSE_WORKER_READ_TIMEOUT_MS = 100;
 
 const TYPE_ICONS: Record<string, string> = {
   decision: '\u2696\uFE0F',
@@ -104,6 +108,37 @@ function deduplicateObservations(
   scored.sort((a, b) => b.specificityScore - a.specificityScore);
 
   return scored.slice(0, displayLimit).map(s => s.obs);
+}
+
+async function isPreToolUseWorkerHealthy(): Promise<boolean> {
+  try {
+    const response = await workerHttpRequest('/api/health', {
+      method: 'GET',
+      timeoutMs: PRETOOLUSE_WORKER_HEALTH_TIMEOUT_MS,
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function workerHttpRequestWithTimeout<T>(
+  request: Promise<T>,
+  timeoutMs: number
+): Promise<T | null> {
+  return new Promise((resolve, reject) => {
+    const timeoutId = setTimeout(() => resolve(null), timeoutMs);
+    request.then(
+      (result) => {
+        clearTimeout(timeoutId);
+        resolve(result);
+      },
+      (error) => {
+        clearTimeout(timeoutId);
+        reject(error);
+      }
+    );
+  });
 }
 
 function formatFileTimeline(observations: ObservationRow[], filePath: string): string {
@@ -192,9 +227,9 @@ export const fileContextHandler: EventHandler = {
       return { continue: true, suppressOutput: true };
     }
 
-    // Ensure worker is running
-    const workerReady = await ensureWorkerRunning();
-    if (!workerReady) {
+    // PreToolUse must never wait on slow worker startup or long health checks.
+    const workerHealthy = await isPreToolUseWorkerHealthy();
+    if (!workerHealthy) {
       return { continue: true, suppressOutput: true };
     }
 
@@ -212,9 +247,20 @@ export const fileContextHandler: EventHandler = {
       }
       queryParams.set('limit', String(FETCH_LOOKAHEAD_LIMIT));
 
-      const response = await workerHttpRequest(`/api/observations/by-file?${queryParams.toString()}`, {
-        method: 'GET',
-      });
+      const response = await workerHttpRequestWithTimeout(
+        workerHttpRequest(`/api/observations/by-file?${queryParams.toString()}`, {
+          method: 'GET',
+        }),
+        PRETOOLUSE_WORKER_READ_TIMEOUT_MS
+      );
+
+      if (response === null) {
+        logger.debug('HOOK', 'File context query timed out, skipping priming', {
+          filePath,
+          timeoutMs: PRETOOLUSE_WORKER_READ_TIMEOUT_MS,
+        });
+        return { continue: true, suppressOutput: true };
+      }
 
       if (!response.ok) {
         logger.warn('HOOK', 'File context query failed, skipping', { status: response.status, filePath });

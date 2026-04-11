@@ -15,13 +15,6 @@ import { normalizePlatformSource } from '../../shared/platform-source.js';
 
 export const observationHandler: EventHandler = {
   async execute(input: NormalizedHookInput): Promise<HookResult> {
-    // Ensure worker is running before any other logic
-    const workerReady = await ensureWorkerRunning();
-    if (!workerReady) {
-      // Worker not available - skip observation gracefully
-      return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
-    }
-
     const { sessionId, cwd, toolName, toolInput, toolResponse } = input;
     const platformSource = normalizePlatformSource(input.platform);
 
@@ -46,33 +39,40 @@ export const observationHandler: EventHandler = {
       return { continue: true, suppressOutput: true };
     }
 
-    // Send to worker - worker handles privacy check and database operations
-    try {
-      const response = await workerHttpRequest('/api/sessions/observations', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contentSessionId: sessionId,
-          platformSource,
-          tool_name: toolName,
-          tool_input: toolInput,
-          tool_response: toolResponse,
-          cwd
-        })
+    // Fire-and-forget observation enqueue — PostToolUse does not need the worker response.
+    void ensureWorkerRunning()
+      .then(async (workerReady) => {
+        if (!workerReady) {
+          logger.debug('HOOK', 'Observation enqueue skipped, worker not healthy', { toolName });
+          return;
+        }
+
+        const response = await workerHttpRequest('/api/sessions/observations', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contentSessionId: sessionId,
+            platformSource,
+            tool_name: toolName,
+            tool_input: toolInput,
+            tool_response: toolResponse,
+            cwd
+          })
+        });
+
+        if (!response.ok) {
+          logger.warn('HOOK', 'Observation storage failed, skipping', { status: response.status, toolName });
+          return;
+        }
+
+        logger.debug('HOOK', 'Observation sent successfully', { toolName });
+      })
+      .catch((error) => {
+        logger.warn('HOOK', 'Observation enqueue fire-and-forget failed', {
+          error: error instanceof Error ? error.message : String(error),
+          toolName,
+        });
       });
-
-      if (!response.ok) {
-        // Log but don't throw — observation storage failure should not block tool use
-        logger.warn('HOOK', 'Observation storage failed, skipping', { status: response.status, toolName });
-        return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
-      }
-
-      logger.debug('HOOK', 'Observation sent successfully', { toolName });
-    } catch (error) {
-      // Worker unreachable — skip observation gracefully
-      logger.warn('HOOK', 'Observation fetch error, skipping', { error: error instanceof Error ? error.message : String(error) });
-      return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
-    }
 
     return { continue: true, suppressOutput: true };
   }
