@@ -143,4 +143,65 @@ describe('PendingMessageStore - Self-Healing claimNextMessage', () => {
     const session1Msg = db.query('SELECT status FROM pending_messages WHERE id = ?').get(stuckInSession1) as { status: string };
     expect(session1Msg.status).toBe('processing');
   });
+
+  test('global claims are unique across concurrent claimers', async () => {
+    const otherSessionIds = Array.from({ length: 9 }, (_, index) =>
+      createSDKSession(db, `global-claim-${index}`, 'test-project', 'Test')
+    );
+
+    const messageIds = [
+      enqueueMessage(),
+      ...otherSessionIds.map((otherSessionId, index) => store.enqueue(otherSessionId, `global-claim-${index}`, {
+        type: 'observation',
+        tool_name: 'TestTool',
+        tool_input: { index },
+        tool_response: { index },
+        prompt_number: 1,
+      }))
+    ];
+
+    const claimed = await Promise.all(
+      Array.from({ length: 10 }, () => Promise.resolve(store.claimNextMessage()))
+    );
+
+    const claimedIds = claimed
+      .map((message) => message?.id ?? null)
+      .filter((messageId): messageId is number => messageId !== null);
+
+    expect(claimedIds).toHaveLength(10);
+    expect(new Set(claimedIds).size).toBe(10);
+    expect(new Set(claimedIds)).toEqual(new Set(messageIds));
+  });
+
+  test('summarize messages stay blocked until their session queue is empty', () => {
+    const otherSessionId = createSDKSession(db, 'other-summary-session', 'test-project', 'Test');
+    const observationId = enqueueMessage();
+    const summarizeId = enqueueMessage({
+      type: 'summarize',
+      tool_name: undefined,
+      tool_input: undefined,
+      tool_response: undefined,
+      last_assistant_message: 'done'
+    });
+    const otherSessionMessageId = store.enqueue(otherSessionId, 'other-summary-session', {
+      type: 'observation',
+      tool_name: 'TestTool',
+      tool_input: { test: 'input' },
+      tool_response: { test: 'response' },
+      prompt_number: 1,
+    });
+
+    const firstClaim = store.claimNextMessage();
+    expect(firstClaim?.id).toBe(observationId);
+
+    const secondClaim = store.claimNextMessage();
+    expect(secondClaim?.id).toBe(otherSessionMessageId);
+    expect(secondClaim?.id).not.toBe(summarizeId);
+
+    store.confirmProcessed(observationId);
+    store.confirmProcessed(otherSessionMessageId);
+
+    const thirdClaim = store.claimNextMessage();
+    expect(thirdClaim?.id).toBe(summarizeId);
+  });
 });

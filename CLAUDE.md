@@ -10,11 +10,13 @@ Claude-mem is a Claude Code plugin providing persistent memory across sessions. 
 
 **Worker Service** (`src/services/worker-service.ts`) - Express API on port 37777, Bun-managed, handles AI processing asynchronously
 
+Pending messages are consumed by a global worker pool. `CLAUDE_MEM_CONCURRENT_MESSAGES` in `~/.claude-mem/settings.json` controls the pool size (default `3`) and hot-reloads without restarting the worker. This is separate from `CLAUDE_MEM_MAX_CONCURRENT_AGENTS`, which still limits Claude SDK subprocess slots.
+
 **Note: Worker service is safe to restart.** Claude-mem features full queue recovery via PR #24 (commit `ce34b858`):
 
 - **Startup reset**: `WorkerService.initializeBackground()` resets any stale `processing` messages back to `pending` on startup
 - **Shutdown reset**: `WorkerService.shutdown()` does the same cleanup on graceful shutdown
-- **Orphan scanner**: A periodic scanner runs every 5 minutes to catch messages stranded by unexpected termination
+- **Global pool recovery**: The global pending-message pool continuously re-checks the queue and self-heals stale `processing` rows before claiming new work
 - **Claim-confirm pattern**: Messages are only `DELETE`d from `pending_messages` after their observations are successfully stored, so crashes mid-processing leave the queue in a recoverable state
 
 Restart the worker when:
@@ -49,7 +51,7 @@ npm run build-and-sync        # Build, sync to marketplace, restart worker
 
 ## Configuration
 
-Settings are managed in `~/.claude-mem/settings.json`. The file is auto-created with defaults on first run.
+Settings are managed in `~/.claude-mem/settings.json`. The file is auto-created with defaults on first run. `CLAUDE_MEM_CONCURRENT_MESSAGES` hot-reloads from this file; provider/model changes still require a worker restart.
 
 ## File Locations
 

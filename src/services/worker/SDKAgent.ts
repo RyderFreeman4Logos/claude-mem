@@ -369,7 +369,7 @@ export class SDKAgent {
     };
 
     // Consume pending messages from SessionManager (event-driven, no polling)
-    for await (const message of this.sessionManager.getMessageIterator(session.sessionDbId)) {
+    for await (const message of this.sessionManager.getMessageIterator(session.sessionDbId, { drainMode: true })) {
       // CLAIM-CONFIRM: Track message ID for confirmProcessed() after successful storage
       // The message is now in 'processing' status in DB until ResponseProcessor calls confirmProcessed()
       session.processingMessageIds.push(message._persistentId);

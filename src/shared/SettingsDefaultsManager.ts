@@ -56,6 +56,7 @@ export interface SettingsDefaults {
   CLAUDE_MEM_TRANSCRIPTS_ENABLED: string;  // 'true' | 'false' - enable transcript watcher ingestion for Codex and other transcript-based clients
   CLAUDE_MEM_TRANSCRIPTS_CONFIG_PATH: string;  // Path to transcript watcher config JSON
   // Process Management
+  CLAUDE_MEM_CONCURRENT_MESSAGES: string;  // Global pending-message workers (default: 3, range: 1-50)
   CLAUDE_MEM_MAX_CONCURRENT_AGENTS: string;  // Max concurrent Claude SDK agent subprocesses (default: 2)
   // Exclusion Settings
   CLAUDE_MEM_EXCLUDED_PROJECTS: string;  // Comma-separated glob patterns for excluded project paths
@@ -135,6 +136,7 @@ export class SettingsDefaultsManager {
     CLAUDE_MEM_TRANSCRIPTS_ENABLED: 'true',
     CLAUDE_MEM_TRANSCRIPTS_CONFIG_PATH: join(homedir(), '.claude-mem', 'transcript-watch.json'),
     // Process Management
+    CLAUDE_MEM_CONCURRENT_MESSAGES: '3',  // Global pending-message workers
     CLAUDE_MEM_MAX_CONCURRENT_AGENTS: '2',  // Max concurrent Claude SDK agent subprocesses
     // Exclusion Settings
     CLAUDE_MEM_EXCLUDED_PROJECTS: '',  // Comma-separated glob patterns for excluded project paths
@@ -292,7 +294,7 @@ export class SettingsDefaultsManager {
       const result: SettingsDefaults = { ...this.DEFAULTS };
       for (const key of Object.keys(this.DEFAULTS) as Array<keyof SettingsDefaults>) {
         if (flatSettings[key] !== undefined) {
-          result[key] = flatSettings[key];
+          result[key] = this.normalizeSettingValue(key, flatSettings[key]);
         }
       }
 
@@ -346,5 +348,17 @@ export class SettingsDefaultsManager {
     }
     this.fileWatchers.clear();
     console.error('[SETTINGS] All caches cleared and watchers closed');
+  }
+
+  private static normalizeSettingValue(key: keyof SettingsDefaults, value: unknown): string {
+    if (key === 'CLAUDE_MEM_CONCURRENT_MESSAGES') {
+      const parsed = parseInt(String(value ?? ''), 10);
+      if (!Number.isFinite(parsed) || parsed < 1 || parsed > 50) {
+        return this.DEFAULTS.CLAUDE_MEM_CONCURRENT_MESSAGES;
+      }
+      return String(parsed);
+    }
+
+    return String(value);
   }
 }

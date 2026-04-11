@@ -161,6 +161,7 @@ export class SessionManager {
       currentProvider: null,  // Will be set when generator starts
       consecutiveRestarts: 0,  // Track consecutive restart attempts to prevent infinite loops
       processingMessageIds: [],  // CLAIM-CONFIRM: Track message IDs for confirmProcessed()
+      preclaimedMessages: [],
       lastGeneratorActivity: Date.now()  // Initialize for stale detection (Issue #1099)
     };
 
@@ -424,12 +425,7 @@ export class SessionManager {
    * Get total queue depth across all sessions (for activity indicator)
    */
   getTotalQueueDepth(): number {
-    let total = 0;
-    // We can iterate over active sessions to get their pending count
-    for (const session of this.sessions.values()) {
-      total += this.getPendingStore().getPendingCount(session.sessionDbId);
-    }
-    return total;
+    return this.getPendingStore().getTotalPendingCount();
   }
 
   /**
@@ -458,7 +454,10 @@ export class SessionManager {
    * Messages are marked as 'processing' when yielded and must be marked 'processed'
    * by the SDK agent after successful completion.
    */
-  async *getMessageIterator(sessionDbId: number): AsyncIterableIterator<PendingMessageWithId> {
+  async *getMessageIterator(
+    sessionDbId: number,
+    options: { drainMode?: boolean } = {}
+  ): AsyncIterableIterator<PendingMessageWithId> {
     // Auto-initialize from database if needed (handles worker restarts)
     let session = this.sessions.get(sessionDbId);
     if (!session) {
@@ -471,6 +470,7 @@ export class SessionManager {
     }
 
     const processor = new SessionQueueProcessor(this.getPendingStore(), emitter);
+    const initialMessages = session.preclaimedMessages.splice(0);
 
     // Use the robust iterator - messages are deleted on claim (no tracking needed)
     // CRITICAL: Pass onIdleTimeout callback that triggers abort to kill the subprocess
@@ -478,6 +478,8 @@ export class SessionManager {
     for await (const message of processor.createIterator({
       sessionDbId,
       signal: session.abortController.signal,
+      drainMode: options.drainMode,
+      initialMessages,
       onIdleTimeout: () => {
         logger.info('SESSION', 'Triggering abort due to idle timeout to kill subprocess', { sessionDbId });
         session.idleTimedOut = true;

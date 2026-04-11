@@ -109,6 +109,8 @@ export class SettingsRoutes extends BaseRouteHandler {
       'CLAUDE_MEM_LOG_LEVEL',
       'CLAUDE_MEM_PYTHON_VERSION',
       'CLAUDE_CODE_PATH',
+      // Global queue concurrency
+      'CLAUDE_MEM_CONCURRENT_MESSAGES',
       // Token Economics
       'CLAUDE_MEM_CONTEXT_SHOW_READ_TOKENS',
       'CLAUDE_MEM_CONTEXT_SHOW_WORK_TOKENS',
@@ -290,6 +292,13 @@ export class SettingsRoutes extends BaseRouteHandler {
       const validHostPattern = /^(127\.0\.0\.1|0\.0\.0\.0|localhost|\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/;
       if (!validHostPattern.test(host)) {
         return { valid: false, error: 'CLAUDE_MEM_WORKER_HOST must be a valid IP address (e.g., 127.0.0.1, 0.0.0.0)' };
+      }
+    }
+
+    if (settings.CLAUDE_MEM_CONCURRENT_MESSAGES) {
+      const count = parseInt(settings.CLAUDE_MEM_CONCURRENT_MESSAGES, 10);
+      if (isNaN(count) || count < 1 || count > 50) {
+        return { valid: false, error: 'CLAUDE_MEM_CONCURRENT_MESSAGES must be between 1 and 50' };
       }
     }
 
