@@ -13,6 +13,10 @@ import {
   LatestPromptResult
 } from '../../types/database.js';
 import type { PendingMessageStore } from './PendingMessageStore.js';
+import {
+  PENDING_MESSAGES_ADD_PRIORITY_COLUMN_SQL,
+  PENDING_MESSAGES_PRIORITY_COLUMN_DEF
+} from './pending-messages-schema.js';
 import { computeObservationContentHash, findDuplicateObservation } from './observations/store.js';
 import { parseFileList } from './observations/files.js';
 import { DEFAULT_PLATFORM_SOURCE, normalizePlatformSource, sortPlatformSources } from '../../shared/platform-source.js';
@@ -552,7 +556,7 @@ export class SessionStore {
         prompt_number INTEGER,
         status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'processing', 'processed', 'failed')),
         retry_count INTEGER NOT NULL DEFAULT 0,
-        priority INTEGER NOT NULL DEFAULT 0,
+        ${PENDING_MESSAGES_PRIORITY_COLUMN_DEF},
         created_at_epoch INTEGER NOT NULL,
         started_processing_at_epoch INTEGER,
         completed_at_epoch INTEGER,
@@ -580,7 +584,7 @@ export class SessionStore {
     if (applied && hasColumn) return;
 
     if (!hasColumn) {
-      this.db.run('ALTER TABLE pending_messages ADD COLUMN priority INTEGER NOT NULL DEFAULT 0');
+      this.db.run(PENDING_MESSAGES_ADD_PRIORITY_COLUMN_SQL);
       logger.debug('DB', 'Added priority column to pending_messages table');
     }
 
