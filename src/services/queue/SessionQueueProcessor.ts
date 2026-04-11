@@ -14,6 +14,8 @@ export interface CreateIteratorOptions {
   drainMode?: boolean;
   /** Pre-claimed messages to yield before claiming more work from the store. */
   initialMessages?: PendingMessageWithId[];
+  /** When false, return after initialMessages instead of draining the store. */
+  claimAdditionalMessagesFromStore?: boolean;
 }
 
 export class SessionQueueProcessor {
@@ -39,7 +41,8 @@ export class SessionQueueProcessor {
       signal,
       onIdleTimeout,
       drainMode = false,
-      initialMessages = []
+      initialMessages = [],
+      claimAdditionalMessagesFromStore = true
     } = options;
     let lastActivityTime = Date.now();
     const bufferedMessages = [...initialMessages];
@@ -51,6 +54,10 @@ export class SessionQueueProcessor {
           lastActivityTime = Date.now();
           yield bufferedMessage;
           continue;
+        }
+
+        if (!claimAdditionalMessagesFromStore) {
+          return;
         }
 
         // Atomically claim next pending message (marks as 'processing')

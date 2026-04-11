@@ -43,8 +43,10 @@ export interface ActiveSession {
   // CLAIM-CONFIRM FIX: Track IDs of messages currently being processed
   // These IDs will be confirmed (deleted) after successful storage
   processingMessageIds: number[];
-  // Pre-claimed messages injected by the global pool before session-local draining begins.
+  // Initial messages injected before iterator-based draining begins.
   preclaimedMessages: PendingMessageWithId[];
+  // Global-pool isolated runs disable store claims so each worker handles only its claimed message.
+  claimAdditionalMessagesFromStore?: boolean;
   // Tier routing: model override per session based on queue complexity
   modelOverride?: string;
 }

@@ -10,7 +10,7 @@ Claude-mem is a Claude Code plugin providing persistent memory across sessions. 
 
 **Worker Service** (`src/services/worker-service.ts`) - Express API on port 37777, Bun-managed, handles AI processing asynchronously
 
-Pending messages are consumed by a global worker pool. `CLAUDE_MEM_CONCURRENT_MESSAGES` in `~/.claude-mem/settings.json` controls the pool size (default `3`) and hot-reloads without restarting the worker. This is separate from `CLAUDE_MEM_MAX_CONCURRENT_AGENTS`, which still limits Claude SDK subprocess slots.
+Pending messages are consumed by a global worker pool that parallelizes across and within sessions. `CLAUDE_MEM_CONCURRENT_MESSAGES` in `~/.claude-mem/settings.json` controls the pool size (default `3`) and hot-reloads without restarting the worker. Summarize messages still wait for earlier observations in the same session. This is separate from `CLAUDE_MEM_MAX_CONCURRENT_AGENTS`, which still limits Claude SDK subprocess slots.
 
 **Note: Worker service is safe to restart.** Claude-mem features full queue recovery via PR #24 (commit `ce34b858`):
 

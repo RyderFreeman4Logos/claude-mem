@@ -456,7 +456,12 @@ export class SessionManager {
    */
   async *getMessageIterator(
     sessionDbId: number,
-    options: { drainMode?: boolean } = {}
+    options: {
+      drainMode?: boolean;
+      signal?: AbortSignal;
+      initialMessages?: PendingMessageWithId[];
+      claimAdditionalMessagesFromStore?: boolean;
+    } = {}
   ): AsyncIterableIterator<PendingMessageWithId> {
     // Auto-initialize from database if needed (handles worker restarts)
     let session = this.sessions.get(sessionDbId);
@@ -470,33 +475,24 @@ export class SessionManager {
     }
 
     const processor = new SessionQueueProcessor(this.getPendingStore(), emitter);
-    const initialMessages = session.preclaimedMessages.splice(0);
+    const initialMessages = options.initialMessages ?? session.preclaimedMessages.splice(0);
+    const signal = options.signal ?? session.abortController.signal;
 
-    // Use the robust iterator - messages are deleted on claim (no tracking needed)
+    // Use the robust iterator over initial claimed work plus optional store draining.
     // CRITICAL: Pass onIdleTimeout callback that triggers abort to kill the subprocess
     // Without this, the iterator returns but the Claude subprocess stays alive as a zombie
     for await (const message of processor.createIterator({
       sessionDbId,
-      signal: session.abortController.signal,
+      signal,
       drainMode: options.drainMode,
       initialMessages,
+      claimAdditionalMessagesFromStore: options.claimAdditionalMessagesFromStore,
       onIdleTimeout: () => {
         logger.info('SESSION', 'Triggering abort due to idle timeout to kill subprocess', { sessionDbId });
         session.idleTimedOut = true;
         session.abortController.abort();
       }
     })) {
-      // Track earliest timestamp for accurate observation timestamps
-      // This ensures backlog messages get their original timestamps, not current time
-      if (session.earliestPendingTimestamp === null) {
-        session.earliestPendingTimestamp = message._originalTimestamp;
-      } else {
-        session.earliestPendingTimestamp = Math.min(session.earliestPendingTimestamp, message._originalTimestamp);
-      }
-
-      // Update generator activity for stale detection (Issue #1099)
-      session.lastGeneratorActivity = Date.now();
-
       yield message;
     }
   }

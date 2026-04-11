@@ -83,10 +83,6 @@ export interface PersistentPendingMessage {
   last_attempted_at_epoch?: number | null;
 }
 
-export interface ClaimNextMessageOptions {
-  excludeSessionDbIds?: number[];
-}
-
 /**
  * PendingMessageStore - Persistent work queue for SDK messages
  *
@@ -175,10 +171,9 @@ export class PendingMessageStore {
    * Self-healing: retries stale 'processing' messages (>60s) first, gravestoning them after repeated failures.
    * Message stays in DB until confirmProcessed() is called.
    * Uses a transaction to prevent race conditions.
-   */
+  */
   claimNextMessage(
-    sessionDbId?: number,
-    options: ClaimNextMessageOptions = {}
+    sessionDbId?: number
   ): PersistentPendingMessage | null {
     const claimTx = this.db.transaction((targetSessionId?: number) => {
       // Capture time inside transaction so it's fresh if WAL contention causes retry
@@ -199,10 +194,6 @@ export class PendingMessageStore {
           this.lastSelfHealLogAt.set(logKey, now);
         }
       }
-
-      const excludedSessions = targetSessionId === undefined
-        ? (options.excludeSessionDbIds ?? []).filter((value, index, all) => all.indexOf(value) === index)
-        : [];
 
       // Select next pending message, respecting exponential backoff for retried messages.
       // Messages with last_attempted_at_epoch set must wait for their backoff period to elapse.
@@ -232,6 +223,7 @@ export class PendingMessageStore {
             WHERE blocker.session_db_id = pending_messages.session_db_id
               AND blocker.id != pending_messages.id
               AND blocker.status IN ('pending', 'processing')
+              AND blocker.message_type != 'summarize'
           )
         )`
       ];
@@ -243,13 +235,6 @@ export class PendingMessageStore {
       }
 
       params.push(now);
-
-      if (excludedSessions.length > 0) {
-        whereClauses.push(
-          `session_db_id NOT IN (${excludedSessions.map(() => '?').join(', ')})`
-        );
-        params.push(...excludedSessions);
-      }
 
       const peekStmt = this.db.prepare(`
         SELECT * FROM pending_messages

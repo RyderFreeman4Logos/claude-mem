@@ -103,6 +103,7 @@ import { MemoryRoutes } from './worker/http/routes/MemoryRoutes.js';
 // Process management for zombie cleanup (Issue #737)
 import { startOrphanReaper, reapOrphanedProcesses, getProcessBySession, ensureProcessExit } from './worker/ProcessRegistry.js';
 import type { PersistentPendingMessage } from './sqlite/PendingMessageStore.js';
+import type { ActiveSession } from './worker-types.js';
 
 /**
  * Build JSON status output for hook framework communication.
@@ -635,17 +636,12 @@ export class WorkerService {
   }
 
   private async processClaimedSessionMessage(message: PersistentPendingMessage): Promise<void> {
-    const session = this.sessionManager.initializeSession(message.session_db_id);
     const pendingStore = this.sessionManager.getPendingMessageStore();
+    const session = this.createIsolatedClaimedSession(message);
     const agent = this.getActiveAgent();
-
-    if (session.abortController.signal.aborted) {
-      session.abortController = new AbortController();
-    }
 
     session.idleTimedOut = false;
     session.quotaPaused = false;
-    session.preclaimedMessages.push(pendingStore.toPendingMessageWithId(message));
 
     this.applyTierRouting(session);
 
@@ -653,7 +649,8 @@ export class WorkerService {
       sessionId: session.sessionDbId,
       messageId: message.id,
       type: message.message_type,
-      provider: agent.constructor.name
+      provider: agent.constructor.name,
+      claimAdditionalMessagesFromStore: session.claimAdditionalMessagesFromStore ?? true
     });
 
     const run = agent.startSession(session, this);
@@ -688,6 +685,36 @@ export class WorkerService {
 
       this.broadcastProcessingStatus();
     }
+  }
+
+  private createIsolatedClaimedSession(message: PersistentPendingMessage): ActiveSession {
+    const baseSession = this.sessionManager.initializeSession(message.session_db_id);
+    const pendingStore = this.sessionManager.getPendingMessageStore();
+    const initialMessage = pendingStore.toPendingMessageWithId(message);
+
+    return {
+      sessionDbId: baseSession.sessionDbId,
+      contentSessionId: baseSession.contentSessionId,
+      memorySessionId: null,
+      project: baseSession.project,
+      platformSource: baseSession.platformSource,
+      userPrompt: baseSession.userPrompt,
+      pendingMessages: [],
+      abortController: new AbortController(),
+      generatorPromise: null,
+      lastPromptNumber: initialMessage.prompt_number ?? baseSession.lastPromptNumber,
+      startTime: Date.now(),
+      cumulativeInputTokens: 0,
+      cumulativeOutputTokens: 0,
+      earliestPendingTimestamp: null,
+      conversationHistory: [],
+      currentProvider: null,
+      consecutiveRestarts: 0,
+      processingMessageIds: [],
+      preclaimedMessages: [initialMessage],
+      claimAdditionalMessagesFromStore: false,
+      lastGeneratorActivity: Date.now()
+    };
   }
 
   /**

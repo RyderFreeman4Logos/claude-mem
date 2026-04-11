@@ -16,7 +16,6 @@ export class GlobalMessagePool {
   private nextWorkerId = 1;
   private workers = new Map<number, WorkerHandle>();
   private retiringWorkers = new Set<number>();
-  private busySessions = new Set<number>();
   private waiters = new Set<() => void>();
   private unsubscribeFromChanges: (() => void) | null = null;
 
@@ -66,7 +65,6 @@ export class GlobalMessagePool {
 
     this.workers.clear();
     this.retiringWorkers.clear();
-    this.busySessions.clear();
   }
 
   notify(): void {
@@ -119,9 +117,7 @@ export class GlobalMessagePool {
         return;
       }
 
-      const message = this.pendingStore.claimNextMessage(undefined, {
-        excludeSessionDbIds: Array.from(this.busySessions)
-      });
+      const message = this.pendingStore.claimNextMessage();
 
       if (!message) {
         await this.waitForWork();
@@ -129,7 +125,6 @@ export class GlobalMessagePool {
       }
 
       const sessionDbId = message.session_db_id;
-      this.busySessions.add(sessionDbId);
 
       try {
         await this.processMessage(message);
@@ -155,7 +150,6 @@ export class GlobalMessagePool {
           this.pendingStore.markFailed(message.id);
         }
       } finally {
-        this.busySessions.delete(sessionDbId);
         this.notify();
       }
     }
