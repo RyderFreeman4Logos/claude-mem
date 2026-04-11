@@ -75,6 +75,7 @@ export interface PersistentPendingMessage {
   prompt_number: number | null;
   status: 'pending' | 'processing' | 'processed' | 'failed';
   retry_count: number;
+  priority: number;
   created_at_epoch: number;
   started_processing_at_epoch: number | null;
   completed_at_epoch: number | null;
@@ -139,15 +140,15 @@ export class PendingMessageStore {
    * Enqueue a new message (persist before processing)
    * @returns The database ID of the persisted message
    */
-  enqueue(sessionDbId: number, contentSessionId: string, message: PendingMessage): number {
+  enqueue(sessionDbId: number, contentSessionId: string, message: PendingMessage, priority: number = 0): number {
     const now = Date.now();
     const stmt = this.db.prepare(`
       INSERT INTO pending_messages (
         session_db_id, content_session_id, message_type,
         tool_name, tool_input, tool_response, cwd,
         last_assistant_message,
-        prompt_number, status, retry_count, created_at_epoch
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?)
+        prompt_number, status, retry_count, priority, created_at_epoch
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)
     `);
 
     const result = stmt.run(
@@ -160,6 +161,7 @@ export class PendingMessageStore {
       message.cwd || null,
       message.last_assistant_message || null,
       message.prompt_number || null,
+      priority,
       now
     );
 
@@ -191,6 +193,12 @@ export class PendingMessageStore {
 
       // Select next pending message, respecting exponential backoff for retried messages.
       // Messages with last_attempted_at_epoch set must wait for their backoff period to elapse.
+      // ORDER BY priority DESC, id ASC:
+      // - Higher priority items (e.g. SessionStart/compact) cut to the front
+      // - Within the same priority, FIFO by insertion order preserves causal invariant
+      //   (created_at_epoch propagates through _originalTimestamp to observation.created_at_epoch)
+      // - Low-priority backlog drains normally once high-priority queue is empty
+      // - Ref: https://github.com/RyderFreeman4Logos/claude-mem/issues/26 part 2
       const peekStmt = this.db.prepare(`
         SELECT * FROM pending_messages
         WHERE session_db_id = ? AND status = 'pending'
@@ -204,7 +212,7 @@ export class PendingMessageStore {
               END
             ) <= ?
           )
-        ORDER BY id ASC
+        ORDER BY priority DESC, id ASC
         LIMIT 1
       `);
       const msg = peekStmt.get(sessionId, now) as PersistentPendingMessage | null;

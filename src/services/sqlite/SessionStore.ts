@@ -57,6 +57,7 @@ export class SessionStore {
     this.createUserPromptsTable();
     this.ensureDiscoveryTokensColumn();
     this.createPendingMessagesTable();
+    this.addPendingMessagePriorityColumn();
     this.renameSessionIdColumns();
     this.repairSessionIdColumnRename();
     this.addFailedAtEpochColumn();
@@ -551,6 +552,7 @@ export class SessionStore {
         prompt_number INTEGER,
         status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'processing', 'processed', 'failed')),
         retry_count INTEGER NOT NULL DEFAULT 0,
+        priority INTEGER NOT NULL DEFAULT 0,
         created_at_epoch INTEGER NOT NULL,
         started_processing_at_epoch INTEGER,
         completed_at_epoch INTEGER,
@@ -565,6 +567,24 @@ export class SessionStore {
     this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(16, new Date().toISOString());
 
     logger.debug('DB', 'pending_messages table created successfully');
+  }
+
+  /**
+   * Add priority column to pending_messages for priority-ordered queue claims (migration 28)
+   */
+  private addPendingMessagePriorityColumn(): void {
+    const applied = this.db.prepare('SELECT version FROM schema_versions WHERE version = ?').get(28) as SchemaVersion | undefined;
+    const tableInfo = this.db.query('PRAGMA table_info(pending_messages)').all() as TableColumnInfo[];
+    const hasColumn = tableInfo.some(col => col.name === 'priority');
+
+    if (applied && hasColumn) return;
+
+    if (!hasColumn) {
+      this.db.run('ALTER TABLE pending_messages ADD COLUMN priority INTEGER NOT NULL DEFAULT 0');
+      logger.debug('DB', 'Added priority column to pending_messages table');
+    }
+
+    this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(28, new Date().toISOString());
   }
 
   /**

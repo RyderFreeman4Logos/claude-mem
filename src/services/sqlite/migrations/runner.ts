@@ -39,6 +39,7 @@ export class MigrationRunner {
     this.createFailedMessagesTable();
     this.addMessageDeduplicationColumns();
     this.createObservationFeedbackTable();
+    this.addPendingMessagePriorityColumn();
     this.addSessionPlatformSourceColumn();
   }
 
@@ -526,6 +527,7 @@ export class MigrationRunner {
         prompt_number INTEGER,
         status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'processing', 'processed', 'failed')),
         retry_count INTEGER NOT NULL DEFAULT 0,
+        priority INTEGER NOT NULL DEFAULT 0,
         created_at_epoch INTEGER NOT NULL,
         started_processing_at_epoch INTEGER,
         completed_at_epoch INTEGER,
@@ -1000,6 +1002,24 @@ export class MigrationRunner {
 
     this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(27, new Date().toISOString());
     logger.debug('DB', 'Created observation_feedback table for usage tracking');
+  }
+
+  /**
+   * Add priority column to pending_messages for priority-ordered queue claims (migration 28)
+   */
+  private addPendingMessagePriorityColumn(): void {
+    const applied = this.db.prepare('SELECT version FROM schema_versions WHERE version = ?').get(28) as SchemaVersion | undefined;
+    const tableInfo = this.db.query('PRAGMA table_info(pending_messages)').all() as TableColumnInfo[];
+    const hasColumn = tableInfo.some(col => col.name === 'priority');
+
+    if (applied && hasColumn) return;
+
+    if (!hasColumn) {
+      this.db.run('ALTER TABLE pending_messages ADD COLUMN priority INTEGER NOT NULL DEFAULT 0');
+      logger.debug('DB', 'Added priority column to pending_messages table');
+    }
+
+    this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(28, new Date().toISOString());
   }
 
   /**
