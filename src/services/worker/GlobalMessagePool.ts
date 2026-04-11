@@ -174,15 +174,7 @@ export class GlobalMessagePool {
         continue;
       }
 
-      if (!this.running || this.retiringWorkers.has(workerId)) {
-        return;
-      }
-
       const message = await this.claimNextMessage(workerId);
-
-      if (!this.running || this.retiringWorkers.has(workerId)) {
-        return;
-      }
 
       if (!message) {
         this.activeWorkerIds.delete(workerId);
@@ -191,6 +183,8 @@ export class GlobalMessagePool {
         continue;
       }
 
+      // A claimed message must be finished or explicitly failed before the worker
+      // can honor retire/stop signals; otherwise the row stays stuck in processing.
       const sessionDbId = message.session_db_id;
       this.processingWorkerIds.add(workerId);
       this.lastClaimMs = Date.now();

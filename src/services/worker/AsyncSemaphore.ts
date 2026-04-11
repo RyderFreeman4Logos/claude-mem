@@ -52,7 +52,7 @@ export class AsyncSemaphore {
 
       const next = this.waiters.shift();
       if (next) {
-        queueMicrotask(next);
+        setImmediate(next);
         return;
       }
 
