@@ -51,6 +51,18 @@ describe('Worker API Endpoints Integration', () => {
         authMethod: 'cli',
         lastInteraction: null,
       }),
+      getPoolStatus: () => ({
+        running: true,
+        desiredConcurrency: 10,
+        poolSize: 10,
+        activeWorkers: 8,
+        processingCount: 6,
+        retiringWorkers: 1,
+        lastTickMs: 1000,
+        lastClaimMs: 1001,
+        lastCompletionMs: 1002,
+        lastYieldMs: 1003,
+      }),
     };
 
     testPort = 40000 + Math.floor(Math.random() * 10000);
@@ -84,6 +96,15 @@ describe('Worker API Endpoints Integration', () => {
         expect(body).toHaveProperty('mcpReady', true);
         expect(body).toHaveProperty('platform');
         expect(body).toHaveProperty('pid');
+        expect(body).toHaveProperty('pool');
+        expect(body.pool).toMatchObject({
+          running: true,
+          desiredConcurrency: 10,
+          poolSize: 10,
+          activeWorkers: 8,
+          processingCount: 6,
+          lastTickMs: 1000,
+        });
         expect(typeof body.platform).toBe('string');
         expect(typeof body.pid).toBe('number');
       });
@@ -107,6 +128,69 @@ describe('Worker API Endpoints Integration', () => {
         expect(body.status).toBe('ok'); // Health always returns ok
         expect(body.initialized).toBe(false);
         expect(body.mcpReady).toBe(false);
+        expect(body.pool).toEqual({
+          running: false,
+          desiredConcurrency: null,
+          poolSize: null,
+          activeWorkers: null,
+          processingCount: null,
+          lastTickMs: null,
+        });
+      });
+    });
+
+    describe('GET /api/pool/status', () => {
+      it('should return detailed pool status', async () => {
+        server = new Server(mockOptions);
+        await server.listen(testPort, '127.0.0.1');
+
+        const response = await fetch(`http://127.0.0.1:${testPort}/api/pool/status`);
+        expect(response.status).toBe(200);
+
+        const body = await response.json();
+        expect(body).toEqual({
+          running: true,
+          desiredConcurrency: 10,
+          poolSize: 10,
+          activeWorkers: 8,
+          processingCount: 6,
+          retiringWorkers: 1,
+          lastTickMs: 1000,
+          lastClaimMs: 1001,
+          lastCompletionMs: 1002,
+          lastYieldMs: 1003,
+        });
+      });
+
+      it('should return fallback pool status before initialization', async () => {
+        const uninitOptions: ServerOptions = {
+          getInitializationComplete: () => false,
+          getMcpReady: () => false,
+          onShutdown: mock(() => Promise.resolve()),
+          onRestart: mock(() => Promise.resolve()),
+          workerPath: '/test/worker-service.cjs',
+          getAiStatus: () => ({ provider: 'claude', authMethod: 'cli', lastInteraction: null }),
+        };
+
+        server = new Server(uninitOptions);
+        await server.listen(testPort, '127.0.0.1');
+
+        const response = await fetch(`http://127.0.0.1:${testPort}/api/pool/status`);
+        expect(response.status).toBe(200);
+
+        const body = await response.json();
+        expect(body).toEqual({
+          running: false,
+          desiredConcurrency: null,
+          poolSize: null,
+          activeWorkers: null,
+          processingCount: null,
+          retiringWorkers: null,
+          lastTickMs: null,
+          lastClaimMs: null,
+          lastCompletionMs: null,
+          lastYieldMs: null,
+        });
       });
     });
 

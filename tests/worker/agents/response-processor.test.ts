@@ -3,7 +3,7 @@ import { logger } from '../../../src/utils/logger.js';
 
 // Mock modules that cause import chain issues - MUST be before imports
 // Use full paths from test file location
-mock.module('../../../src/services/worker-service.js', () => ({
+mock.module('../../../src/services/integrations/CursorHooksInstaller.js', () => ({
   updateCursorContextForProject: () => Promise.resolve(),
 }));
 
@@ -46,6 +46,7 @@ describe('ResponseProcessor', () => {
   let mockChromaSyncSummary: ReturnType<typeof mock>;
   let mockBroadcast: ReturnType<typeof mock>;
   let mockBroadcastProcessingStatus: ReturnType<typeof mock>;
+  let mockConfirmProcessed: ReturnType<typeof mock>;
   let mockDbManager: DatabaseManager;
   let mockSessionManager: SessionManager;
   let mockWorker: WorkerRef;
@@ -68,6 +69,7 @@ describe('ResponseProcessor', () => {
 
     mockChromaSyncObservation = mock(() => Promise.resolve());
     mockChromaSyncSummary = mock(() => Promise.resolve());
+    mockConfirmProcessed = mock(() => {});
 
     mockDbManager = {
       getSessionStore: () => ({
@@ -87,7 +89,7 @@ describe('ResponseProcessor', () => {
       },
       getPendingMessageStore: () => ({
         markProcessed: mock(() => {}),
-        confirmProcessed: mock(() => {}),  // CLAIM-CONFIRM pattern: confirm after successful storage
+        confirmProcessed: mockConfirmProcessed,  // CLAIM-CONFIRM pattern: confirm after successful storage
         cleanupProcessed: mock(() => 0),
         resetStuckMessages: mock(() => 0),
       }),
@@ -209,6 +211,50 @@ describe('ResponseProcessor', () => {
       expect(observations).toHaveLength(2);
       expect(observations[0].type).toBe('discovery');
       expect(observations[1].type).toBe('bugfix');
+    });
+  });
+
+  describe('sqlite gate', () => {
+    it('uses the shared sqlite gate for synchronous storage when available', async () => {
+      const sqliteGateRun = mock(async (_label: string, task: () => unknown) => task());
+      const session = createMockSession({ processingMessageIds: [101, 102] });
+      const responseText = `
+        <observation>
+          <type>discovery</type>
+          <title>Stored behind sqlite gate</title>
+          <narrative>Gate should wrap FK registration, storage, and confirmations.</narrative>
+          <facts></facts>
+          <concepts></concepts>
+          <files_read></files_read>
+          <files_modified></files_modified>
+        </observation>
+      `;
+
+      mockWorker = {
+        sqliteGate: {
+          run: sqliteGateRun,
+        },
+        sseBroadcaster: {
+          broadcast: mockBroadcast,
+        },
+        broadcastProcessingStatus: mockBroadcastProcessingStatus,
+      };
+
+      await processAgentResponse(
+        responseText,
+        session,
+        mockDbManager,
+        mockSessionManager,
+        mockWorker,
+        100,
+        null,
+        'TestAgent'
+      );
+
+      expect(sqliteGateRun).toHaveBeenCalledTimes(1);
+      expect(sqliteGateRun.mock.calls[0][0]).toBe('store');
+      expect(mockStoreObservations).toHaveBeenCalledTimes(1);
+      expect(mockConfirmProcessed).toHaveBeenCalledTimes(2);
     });
   });
 

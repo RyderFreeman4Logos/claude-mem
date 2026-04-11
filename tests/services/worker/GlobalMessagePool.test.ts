@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import type { Database } from 'bun:sqlite';
 import { WorkerService } from '../../../src/services/worker-service.js';
 import { ClaudeMemDatabase } from '../../../src/services/sqlite/Database.js';
@@ -129,6 +129,51 @@ describe('GlobalMessagePool', () => {
       expect(new Set(completedIds)).toEqual(new Set(messageIds));
     } finally {
       releaseWorkers();
+      await pool.stop();
+    }
+  });
+
+  test('reports pool status while workers are active and records a yield timestamp', async () => {
+    enqueueMessage({ prompt_number: 1 });
+
+    let releaseWorker!: () => void;
+    const releasePromise = new Promise<void>((resolve) => {
+      releaseWorker = resolve;
+    });
+
+    const pool = new GlobalMessagePool(
+      store,
+      createConcurrencyManagerStub(1),
+      async (message) => {
+        await releasePromise;
+        store.confirmProcessed(message.id);
+      }
+    );
+
+    pool.start();
+
+    try {
+      await waitFor(() => pool.getStatus().processingCount === 1);
+
+      const activeStatus = pool.getStatus();
+      expect(activeStatus.running).toBe(true);
+      expect(activeStatus.desiredConcurrency).toBe(1);
+      expect(activeStatus.poolSize).toBe(1);
+      expect(activeStatus.activeWorkers).toBe(1);
+      expect(activeStatus.processingCount).toBe(1);
+      expect(activeStatus.lastTickMs).not.toBeNull();
+      expect(activeStatus.lastClaimMs).not.toBeNull();
+
+      releaseWorker();
+
+      await waitFor(() => pool.getStatus().lastYieldMs !== null);
+
+      const completedStatus = pool.getStatus();
+      expect(completedStatus.processingCount).toBe(0);
+      expect(completedStatus.lastCompletionMs).not.toBeNull();
+      expect(completedStatus.lastYieldMs).not.toBeNull();
+    } finally {
+      releaseWorker();
       await pool.stop();
     }
   });
@@ -326,6 +371,7 @@ describe('GlobalMessagePool', () => {
 
   test('retires excess workers after in-flight messages finish when concurrency shrinks', async () => {
     const concurrency = createMutableConcurrencyManagerStub(3);
+    const pendingCountSpy = spyOn(store, 'getTotalPendingCount');
     const firstWaveIds = Array.from({ length: 3 }, (_, index) => enqueueMessage({ prompt_number: index + 1 }));
 
     let firstWaveActive = 0;
@@ -381,7 +427,9 @@ describe('GlobalMessagePool', () => {
 
       expect(secondWaveMaxActive).toBe(1);
       expect(new Set(completedIds)).toEqual(new Set([...firstWaveIds, ...secondWaveIds]));
+      expect(pendingCountSpy).not.toHaveBeenCalled();
     } finally {
+      pendingCountSpy.mockRestore();
       releaseFirstWave();
       await pool.stop();
     }

@@ -13,12 +13,17 @@ import type { ParsedObservation, ParsedSummary } from '../../../sdk/parser.js';
 // Worker Reference Type
 // ============================================================================
 
+export interface SqliteGate {
+  run<T>(label: string, task: () => T | Promise<T>): Promise<T>;
+}
+
 /**
  * Worker reference for SSE broadcasting and status updates
  * Both sseBroadcaster and broadcastProcessingStatus are optional
  * to allow agents to run without a full worker context (e.g., testing)
  */
 export interface WorkerRef {
+  sqliteGate?: SqliteGate;
   sseBroadcaster?: {
     broadcast(event: SSEEventPayload): void;
   };

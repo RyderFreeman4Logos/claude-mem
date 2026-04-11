@@ -1,6 +1,7 @@
 import { logger } from '../../utils/logger.js';
 import type { PersistentPendingMessage, PendingMessageStore } from '../sqlite/PendingMessageStore.js';
 import { ConcurrencyManager } from './ConcurrencyManager.js';
+import type { AsyncSemaphore } from './AsyncSemaphore.js';
 
 const IDLE_POLL_MS = 1000;
 
@@ -12,6 +13,19 @@ interface WorkerHandle {
   promise: Promise<void>;
 }
 
+export interface GlobalMessagePoolStatus {
+  running: boolean;
+  desiredConcurrency: number;
+  poolSize: number;
+  activeWorkers: number;
+  processingCount: number;
+  retiringWorkers: number;
+  lastTickMs: number | null;
+  lastClaimMs: number | null;
+  lastCompletionMs: number | null;
+  lastYieldMs: number | null;
+}
+
 export class GlobalMessagePool {
   private running = false;
   private nextWorkerId = 1;
@@ -19,13 +33,35 @@ export class GlobalMessagePool {
   private retiringWorkers = new Set<number>();
   private waiters = new Set<() => void>();
   private unsubscribeFromChanges: (() => void) | null = null;
+  private activeWorkerIds = new Set<number>();
+  private processingWorkerIds = new Set<number>();
+  private lastTickMs: number | null = null;
+  private lastClaimMs: number | null = null;
+  private lastCompletionMs: number | null = null;
+  private lastYieldMs: number | null = null;
 
   constructor(
     private pendingStore: PendingMessageStore,
     private concurrencyManager: ConcurrencyManager,
     private processMessage: MessageProcessor,
-    private beforeClaim?: ClaimGate
+    private beforeClaim?: ClaimGate,
+    private sqliteGate?: AsyncSemaphore
   ) {}
+
+  getStatus(): GlobalMessagePoolStatus {
+    return {
+      running: this.running,
+      desiredConcurrency: this.concurrencyManager.getDesiredConcurrency(),
+      poolSize: this.workers.size,
+      activeWorkers: this.activeWorkerIds.size,
+      processingCount: this.processingWorkerIds.size,
+      retiringWorkers: this.retiringWorkers.size,
+      lastTickMs: this.lastTickMs,
+      lastClaimMs: this.lastClaimMs,
+      lastCompletionMs: this.lastCompletionMs,
+      lastYieldMs: this.lastYieldMs
+    };
+  }
 
   start(): void {
     if (this.running) {
@@ -108,9 +144,13 @@ export class GlobalMessagePool {
     const promise = this.workerLoop(workerId).finally(() => {
       this.workers.delete(workerId);
       this.retiringWorkers.delete(workerId);
+      this.activeWorkerIds.delete(workerId);
+      this.processingWorkerIds.delete(workerId);
+      this.touch();
     });
 
     this.workers.set(workerId, { id: workerId, promise });
+    this.touch();
   }
 
   private async workerLoop(workerId: number): Promise<void> {
@@ -119,10 +159,8 @@ export class GlobalMessagePool {
         return;
       }
 
-      if (this.pendingStore.getTotalPendingCount() === 0) {
-        await this.waitForWork();
-        continue;
-      }
+      this.activeWorkerIds.add(workerId);
+      this.touch();
 
       try {
         await this.beforeClaim?.();
@@ -130,6 +168,8 @@ export class GlobalMessagePool {
         logger.error('QUEUE', 'Global message worker failed before claim', {
           workerId
         }, error as Error);
+        this.activeWorkerIds.delete(workerId);
+        this.touch();
         await this.waitForWork();
         continue;
       }
@@ -138,14 +178,23 @@ export class GlobalMessagePool {
         return;
       }
 
-      const message = this.pendingStore.claimNextMessage();
+      const message = await this.claimNextMessage(workerId);
+
+      if (!this.running || this.retiringWorkers.has(workerId)) {
+        return;
+      }
 
       if (!message) {
+        this.activeWorkerIds.delete(workerId);
+        this.touch();
         await this.waitForWork();
         continue;
       }
 
       const sessionDbId = message.session_db_id;
+      this.processingWorkerIds.add(workerId);
+      this.lastClaimMs = Date.now();
+      this.touch(this.lastClaimMs);
 
       try {
         await this.processMessage(message);
@@ -171,7 +220,11 @@ export class GlobalMessagePool {
           this.pendingStore.markFailed(message.id);
         }
       } finally {
+        this.processingWorkerIds.delete(workerId);
+        this.lastCompletionMs = Date.now();
+        this.touch(this.lastCompletionMs);
         this.notify();
+        await this.yieldToEventLoop();
       }
     }
   }
@@ -190,5 +243,31 @@ export class GlobalMessagePool {
 
       this.waiters.add(onWake);
     });
+  }
+
+  private async claimNextMessage(workerId: number): Promise<PersistentPendingMessage | null> {
+    if (!this.sqliteGate) {
+      return this.pendingStore.claimNextMessage();
+    }
+
+    return this.sqliteGate.run('claim', () => {
+      if (!this.running || this.retiringWorkers.has(workerId)) {
+        return null;
+      }
+
+      return this.pendingStore.claimNextMessage();
+    });
+  }
+
+  private async yieldToEventLoop(): Promise<void> {
+    await new Promise<void>((resolve) => {
+      setImmediate(resolve);
+    });
+    this.lastYieldMs = Date.now();
+    this.touch(this.lastYieldMs);
+  }
+
+  private touch(timestamp: number = Date.now()): void {
+    this.lastTickMs = timestamp;
   }
 }

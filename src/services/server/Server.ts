@@ -47,6 +47,32 @@ export interface AiStatus {
   } | null;
 }
 
+export interface PoolStatusSnapshot {
+  running: boolean;
+  desiredConcurrency: number;
+  poolSize: number;
+  activeWorkers: number;
+  processingCount: number;
+  retiringWorkers: number;
+  lastTickMs: number | null;
+  lastClaimMs: number | null;
+  lastCompletionMs: number | null;
+  lastYieldMs: number | null;
+}
+
+interface PoolStatusPayload {
+  running: boolean;
+  desiredConcurrency: number | null;
+  poolSize: number | null;
+  activeWorkers: number | null;
+  processingCount: number | null;
+  retiringWorkers: number | null;
+  lastTickMs: number | null;
+  lastClaimMs: number | null;
+  lastCompletionMs: number | null;
+  lastYieldMs: number | null;
+}
+
 /**
  * Options for initializing the server
  */
@@ -56,13 +82,15 @@ export interface ServerOptions {
   /** Whether MCP is ready (for health/readiness info) */
   getMcpReady: () => boolean;
   /** Shutdown function for admin endpoints */
-  onShutdown: () => Promise<void>;
+  onShutdown: (reason?: string) => Promise<void>;
   /** Restart function for admin endpoints */
-  onRestart: () => Promise<void>;
+  onRestart: (reason?: string) => Promise<void>;
   /** Filesystem path to the worker entry point */
   workerPath: string;
   /** Callback to get current AI provider status */
   getAiStatus: () => AiStatus;
+  /** Callback to get current global pool status */
+  getPoolStatus?: () => PoolStatusSnapshot | null;
 }
 
 /**
@@ -163,6 +191,7 @@ export class Server {
   private setupCoreRoutes(): void {
     // Health check endpoint - always responds, even during initialization
     this.app.get('/api/health', (_req: Request, res: Response) => {
+      const pool = this.getPoolStatusPayload();
       res.status(200).json({
         status: 'ok',
         version: BUILT_IN_VERSION,
@@ -175,7 +204,19 @@ export class Server {
         initialized: this.options.getInitializationComplete(),
         mcpReady: this.options.getMcpReady(),
         ai: this.options.getAiStatus(),
+        pool: {
+          running: pool.running,
+          desiredConcurrency: pool.desiredConcurrency,
+          poolSize: pool.poolSize,
+          activeWorkers: pool.activeWorkers,
+          processingCount: pool.processingCount,
+          lastTickMs: pool.lastTickMs,
+        },
       });
+    });
+
+    this.app.get('/api/pool/status', (_req: Request, res: Response) => {
+      res.status(200).json(this.getPoolStatusPayload());
     });
 
     // Readiness check endpoint - returns 503 until full initialization completes
@@ -240,6 +281,10 @@ export class Server {
     // Admin endpoints for process management (localhost-only)
     this.app.post('/api/admin/restart', requireLocalhost, async (_req: Request, res: Response) => {
       res.json({ status: 'restarting' });
+      logger.info('SYSTEM', 'Admin requested worker restart', {
+        source: 'admin-restart',
+        pid: process.pid
+      });
 
       // Handle Windows managed mode via IPC
       const isWindowsManaged = process.platform === 'win32' &&
@@ -255,7 +300,7 @@ export class Server {
         // This process just needs to shut down and exit.
         setTimeout(async () => {
           try {
-            await this.options.onRestart();
+            await this.options.onRestart('admin-restart');
           } finally {
             process.exit(0);
           }
@@ -265,6 +310,10 @@ export class Server {
 
     this.app.post('/api/admin/shutdown', requireLocalhost, async (_req: Request, res: Response) => {
       res.json({ status: 'shutting_down' });
+      logger.info('SYSTEM', 'Admin requested worker shutdown', {
+        source: 'admin-shutdown',
+        pid: process.pid
+      });
 
       // Handle Windows managed mode via IPC
       const isWindowsManaged = process.platform === 'win32' &&
@@ -278,7 +327,7 @@ export class Server {
         // Unix or standalone Windows - handle shutdown ourselves
         setTimeout(async () => {
           try {
-            await this.options.onShutdown();
+            await this.options.onShutdown('admin-shutdown');
           } finally {
             // CRITICAL: Exit the process after shutdown completes (or fails).
             // Without this, the daemon stays alive as a zombie — background tasks
@@ -359,5 +408,25 @@ export class Server {
     if (endIdx === -1) return content.substring(startIdx);
 
     return content.substring(startIdx, endIdx).trim();
+  }
+
+  private getPoolStatusPayload(): PoolStatusPayload {
+    const status = this.options.getPoolStatus?.() ?? null;
+    if (status) {
+      return status;
+    }
+
+    return {
+      running: false,
+      desiredConcurrency: null,
+      poolSize: null,
+      activeWorkers: null,
+      processingCount: null,
+      retiringWorkers: null,
+      lastTickMs: null,
+      lastClaimMs: null,
+      lastCompletionMs: null,
+      lastYieldMs: null,
+    };
   }
 }
