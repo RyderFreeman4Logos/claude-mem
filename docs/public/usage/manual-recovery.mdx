@@ -57,14 +57,15 @@ Messages progress through these lifecycle states:
 1. **pending** → Queued, waiting to process
 2. **processing** → Currently being processed by SDK agent
 3. **processed** → Completed successfully
-4. **failed** → Failed after 3 retry attempts
+4. **failed** → Permanently marked failed after 10 stale recovery cycles
 
 ### Stuck Detection
 
-Messages in `processing` state for **>5 minutes** are considered stuck:
+Messages in `processing` state for **>60 seconds** are treated as stale by self-heal:
 
-- They're automatically reset to `pending` on worker startup and graceful shutdown
-- Startup recovery and the 5-minute orphan scanner will retry them automatically
+- Each stale recovery bumps `retry_count` and moves the message back to `pending`
+- After 10 stale recovery cycles, the message is permanently marked `failed` to prevent infinite loops
+- Startup/shutdown recovery and the 5-minute orphan scanner can also reclaim stranded work
 - The CLI/API tools let you inspect status or trigger recovery immediately if needed
 - They appear in the `stuckCount` field when checking queue status
 
@@ -249,7 +250,7 @@ sqlite3 ~/.claude-mem/claude-mem.db "
 
 1. **Verify worker health**:
    ```bash
-   curl http://localhost:37777/health
+   curl http://localhost:37777/api/health
    ```
 
 2. **Check worker logs for errors**:
@@ -385,7 +386,7 @@ sqlite3 ~/.claude-mem/claude-mem.db "
 # Run every hour to process stuck queues
 
 # Check if worker is healthy
-if curl -f http://localhost:37777/health > /dev/null 2>&1; then
+if curl -f http://localhost:37777/api/health > /dev/null 2>&1; then
   # Auto-process up to 5 sessions
   bun scripts/check-pending-queue.ts --process --limit 5
 else

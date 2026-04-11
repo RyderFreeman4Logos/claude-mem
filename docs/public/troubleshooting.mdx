@@ -38,7 +38,7 @@ The skill includes comprehensive diagnostics, automated repair sequences, and de
 
 2. Verify worker is healthy:
    ```bash
-   curl http://localhost:37777/health
+   curl http://localhost:37777/api/health
    ```
 
 3. Check worker logs for errors:
@@ -368,9 +368,9 @@ Messages progress through these states:
 1. **pending** - Queued, waiting to process
 2. **processing** - Currently being processed by SDK agent
 3. **processed** - Completed successfully
-4. **failed** - Failed after 3 retry attempts
+4. **failed** - Permanently marked failed after 10 stale recovery cycles
 
-**Stuck Detection**: Messages in `processing` state for >5 minutes are considered stuck. Claude-mem resets them to `pending` on startup and graceful shutdown, auto-recovers pending queues on startup, and the 5-minute orphan scanner retries any sessions stranded without a restart.
+**Stuck Detection**: Messages that remain in `processing` for >60 seconds are treated as stale by self-heal. Each stale recovery bumps `retry_count` and moves the message back to `pending`. After 10 stale recovery cycles, the message is permanently marked `failed` to prevent infinite loops. Startup/shutdown recovery and the 5-minute orphan scanner still reclaim stranded work after crashes or restarts.
 
 #### Recovery Strategy
 
@@ -394,7 +394,7 @@ If recovery fails or messages remain stuck:
 
 1. **Verify worker is healthy**:
    ```bash
-   curl http://localhost:37777/health
+   curl http://localhost:37777/api/health
    # Should return: {"status":"ok","uptime":12345,"port":37777}
    ```
 
@@ -958,7 +958,7 @@ npm run worker:logs
 cat ~/.claude-mem/worker.port
 
 # Test worker health
-curl http://localhost:37777/health
+curl http://localhost:37777/api/health
 ```
 
 ### Database Inspection
