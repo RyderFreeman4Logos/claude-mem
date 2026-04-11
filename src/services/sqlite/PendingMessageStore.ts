@@ -1,5 +1,5 @@
 import { Database } from './sqlite-compat.js';
-import type { PendingMessage } from '../worker-types.js';
+import type { PendingMessage, PendingMessageWithId } from '../worker-types.js';
 import { logger } from '../../utils/logger.js';
 
 /** Messages processing longer than this are considered stale and retried by self-healing */
@@ -18,7 +18,7 @@ const SELF_HEAL_SQL = `
   UPDATE pending_messages
   SET
     retry_count = retry_count + 1,
-    last_attempted_at_epoch = ?,
+    last_attempted_at_epoch = NULL,
     status = CASE
       WHEN retry_count + 1 >= ? THEN 'failed'
       ELSE 'pending'
@@ -36,7 +36,7 @@ const SELF_HEAL_ALL_SESSIONS_SQL = `
   UPDATE pending_messages
   SET
     retry_count = retry_count + 1,
-    last_attempted_at_epoch = ?,
+    last_attempted_at_epoch = NULL,
     status = CASE
       WHEN retry_count + 1 >= ? THEN 'failed'
       ELSE 'pending'
@@ -115,7 +115,6 @@ export class PendingMessageStore {
     if (sessionDbId !== undefined) {
       const stmt = this.db.prepare(SELF_HEAL_SQL);
       const result = stmt.run(
-        now,
         MAX_RETRY_BEFORE_GRAVESTONE,
         MAX_RETRY_BEFORE_GRAVESTONE,
         now,
@@ -127,7 +126,6 @@ export class PendingMessageStore {
 
     const stmt = this.db.prepare(SELF_HEAL_ALL_SESSIONS_SQL);
     const result = stmt.run(
-      now,
       MAX_RETRY_BEFORE_GRAVESTONE,
       MAX_RETRY_BEFORE_GRAVESTONE,
       now,
@@ -173,21 +171,27 @@ export class PendingMessageStore {
    * Self-healing: retries stale 'processing' messages (>60s) first, gravestoning them after repeated failures.
    * Message stays in DB until confirmProcessed() is called.
    * Uses a transaction to prevent race conditions.
-   */
-  claimNextMessage(sessionDbId: number): PersistentPendingMessage | null {
-    const claimTx = this.db.transaction((sessionId: number) => {
+  */
+  claimNextMessage(
+    sessionDbId?: number
+  ): PersistentPendingMessage | null {
+    const claimTx = this.db.transaction((targetSessionId?: number) => {
       // Capture time inside transaction so it's fresh if WAL contention causes retry
       const now = Date.now();
       // Self-healing: retry stale 'processing' messages with backoff-aware bookkeeping.
       // Persistent failures are gravestoned after repeated recovery attempts.
       // Note: strict < means messages must be OLDER than threshold to be reset
       const staleCutoff = now - STALE_PROCESSING_THRESHOLD_MS;
-      const resetResult = this.resetStaleProcessing(now, staleCutoff, sessionId);
+      const resetResult = this.resetStaleProcessing(now, staleCutoff, targetSessionId);
       if (resetResult.changes > 0) {
-        const lastLogAt = this.lastSelfHealLogAt.get(sessionId) ?? 0;
+        const logKey = targetSessionId ?? -1;
+        const lastLogAt = this.lastSelfHealLogAt.get(logKey) ?? 0;
         if (now - lastLogAt >= PendingMessageStore.SELF_HEAL_LOG_COALESCE_MS) {
-          logger.info('QUEUE', `SELF_HEAL | sessionDbId=${sessionId} | recovered ${resetResult.changes} stale processing message(s) (log coalesced to 1/60s)`);
-          this.lastSelfHealLogAt.set(sessionId, now);
+          logger.info(
+            'QUEUE',
+            `SELF_HEAL | scope=${targetSessionId ?? 'global'} | recovered ${resetResult.changes} stale processing message(s) (log coalesced to 1/60s)`
+          );
+          this.lastSelfHealLogAt.set(logKey, now);
         }
       }
 
@@ -199,37 +203,61 @@ export class PendingMessageStore {
       //   (created_at_epoch propagates through _originalTimestamp to observation.created_at_epoch)
       // - Low-priority backlog drains normally once high-priority queue is empty
       // - Ref: https://github.com/RyderFreeman4Logos/claude-mem/issues/26 part 2
+      const whereClauses = [
+        `status = 'pending'`,
+        `(
+          last_attempted_at_epoch IS NULL
+          OR last_attempted_at_epoch + (
+            CASE
+              WHEN retry_count <= 1 THEN ${RETRY_BASE_DELAY_MS}
+              WHEN retry_count <= 2 THEN ${RETRY_BASE_DELAY_MS * 2}
+              ELSE ${RETRY_MAX_DELAY_MS}
+            END
+          ) <= ?
+        )`,
+        `(
+          message_type != 'summarize'
+          OR NOT EXISTS (
+            SELECT 1
+            FROM pending_messages blocker
+            WHERE blocker.session_db_id = pending_messages.session_db_id
+              AND blocker.id != pending_messages.id
+              AND blocker.status IN ('pending', 'processing')
+              AND blocker.message_type != 'summarize'
+          )
+        )`
+      ];
+      const params: Array<number> = [];
+
+      if (targetSessionId !== undefined) {
+        whereClauses.unshift(`session_db_id = ?`);
+        params.push(targetSessionId);
+      }
+
+      params.push(now);
+
       const peekStmt = this.db.prepare(`
         SELECT * FROM pending_messages
-        WHERE session_db_id = ? AND status = 'pending'
-          AND (
-            last_attempted_at_epoch IS NULL
-            OR last_attempted_at_epoch + (
-              CASE
-                WHEN retry_count <= 1 THEN ${RETRY_BASE_DELAY_MS}
-                WHEN retry_count <= 2 THEN ${RETRY_BASE_DELAY_MS * 2}
-                ELSE ${RETRY_MAX_DELAY_MS}
-              END
-            ) <= ?
-          )
+        WHERE ${whereClauses.join('\n          AND ')}
         ORDER BY priority DESC, id ASC
         LIMIT 1
       `);
-      const msg = peekStmt.get(sessionId, now) as PersistentPendingMessage | null;
+      const msg = peekStmt.get(...params) as PersistentPendingMessage | null;
 
       if (msg) {
-        // CRITICAL FIX: Mark as 'processing' instead of deleting
-        // Message will be deleted by confirmProcessed() after successful store
         const updateStmt = this.db.prepare(`
           UPDATE pending_messages
           SET status = 'processing', started_processing_at_epoch = ?
-          WHERE id = ?
+          WHERE id = ? AND status = 'pending'
         `);
-        updateStmt.run(now, msg.id);
+        const updateResult = updateStmt.run(now, msg.id);
+        if (updateResult.changes === 0) {
+          return null;
+        }
 
         // Log claim with minimal info (avoid logging full payload)
-        logger.info('QUEUE', `CLAIMED | sessionDbId=${sessionId} | messageId=${msg.id} | type=${msg.message_type}`, {
-          sessionId: sessionId
+        logger.info('QUEUE', `CLAIMED | sessionDbId=${msg.session_db_id} | messageId=${msg.id} | type=${msg.message_type}`, {
+          sessionId: msg.session_db_id
         });
       }
       return msg;
@@ -489,6 +517,29 @@ export class PendingMessageStore {
   }
 
   /**
+   * Get total pending + processing message count across all sessions.
+   */
+  getTotalPendingCount(): number {
+    const stmt = this.db.prepare(`
+      SELECT COUNT(*) as count FROM pending_messages
+      WHERE status IN ('pending', 'processing')
+    `);
+    const result = stmt.get() as { count: number };
+    return result.count;
+  }
+
+  /**
+   * Get the current queue status for a message.
+   */
+  getMessageStatus(messageId: number): PersistentPendingMessage['status'] | null {
+    const stmt = this.db.prepare(`
+      SELECT status FROM pending_messages WHERE id = ?
+    `);
+    const result = stmt.get(messageId) as { status: PersistentPendingMessage['status'] } | undefined;
+    return result?.status ?? null;
+  }
+
+  /**
    * Get failed messages for dead-letter queue display.
    */
   getFailedMessages(limit: number, offset: number): PersistentPendingMessage[] {
@@ -648,6 +699,14 @@ export class PendingMessageStore {
       prompt_number: persistent.prompt_number || undefined,
       cwd: persistent.cwd || undefined,
       last_assistant_message: persistent.last_assistant_message || undefined
+    };
+  }
+
+  toPendingMessageWithId(persistent: PersistentPendingMessage): PendingMessageWithId {
+    return {
+      ...this.toPendingMessage(persistent),
+      _persistentId: persistent.id,
+      _originalTimestamp: persistent.created_at_epoch
     };
   }
 }

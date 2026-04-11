@@ -43,6 +43,12 @@ export interface ActiveSession {
   // CLAIM-CONFIRM FIX: Track IDs of messages currently being processed
   // These IDs will be confirmed (deleted) after successful storage
   processingMessageIds: number[];
+  // Initial messages injected before iterator-based draining begins.
+  preclaimedMessages: PendingMessageWithId[];
+  // Global-pool isolated runs disable store claims so each worker handles only its claimed message.
+  claimAdditionalMessagesFromStore?: boolean;
+  // SDK global-pool runs can pre-wait on the agent slot before the claim enters processing.
+  skipSdkSlotWait?: boolean;
   // Tier routing: model override per session based on queue complexity
   modelOverride?: string;
 }

@@ -96,58 +96,11 @@ export class SessionRoutes extends BaseRouteHandler {
   private static readonly STALE_GENERATOR_THRESHOLD_MS = 30_000; // 30 seconds (#1099)
 
   private ensureGeneratorRunning(sessionDbId: number, source: string): void {
-    const session = this.sessionManager.getSession(sessionDbId);
-    if (!session) return;
-
-    // GUARD: Prevent duplicate spawns
-    if (this.spawnInProgress.get(sessionDbId)) {
-      logger.debug('SESSION', 'Spawn already in progress, skipping', { sessionDbId, source });
-      return;
-    }
-
-    const selectedProvider = this.getSelectedProvider();
-
-    // Start generator if not running
-    if (!session.generatorPromise) {
-      // Apply tier routing before starting the generator
-      this.applyTierRouting(session);
-      this.spawnInProgress.set(sessionDbId, true);
-      this.startGeneratorWithProvider(session, selectedProvider, source);
-      return;
-    }
-
-    // Generator is running - check if stale (no activity for 30s) to prevent queue stall (#1099)
-    const timeSinceActivity = Date.now() - session.lastGeneratorActivity;
-    if (timeSinceActivity > SessionRoutes.STALE_GENERATOR_THRESHOLD_MS) {
-      logger.warn('SESSION', 'Stale generator detected, aborting to prevent queue stall (#1099)', {
-        sessionId: sessionDbId,
-        timeSinceActivityMs: timeSinceActivity,
-        thresholdMs: SessionRoutes.STALE_GENERATOR_THRESHOLD_MS,
-        source
-      });
-      // Abort the stale generator and reset state
-      session.abortController.abort();
-      session.generatorPromise = null;
-      session.abortController = new AbortController();
-      session.lastGeneratorActivity = Date.now();
-      // Start a fresh generator
-      this.applyTierRouting(session);
-      this.spawnInProgress.set(sessionDbId, true);
-      this.startGeneratorWithProvider(session, selectedProvider, 'stale-recovery');
-      return;
-    }
-
-    // Generator is running - check if provider changed
-    if (session.currentProvider && session.currentProvider !== selectedProvider) {
-      logger.info('SESSION', `Provider changed, will switch after current generator finishes`, {
-        sessionId: sessionDbId,
-        currentProvider: session.currentProvider,
-        selectedProvider,
-        historyLength: session.conversationHistory.length
-      });
-      // Let current generator finish naturally, next one will use new provider
-      // The shared conversationHistory ensures context is preserved
-    }
+    logger.debug('SESSION', 'Delegating queued work to global message pool', {
+      sessionDbId,
+      source
+    });
+    this.workerService.notifyGlobalMessagePool(source);
   }
 
   /**

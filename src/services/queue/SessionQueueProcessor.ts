@@ -10,6 +10,12 @@ export interface CreateIteratorOptions {
   signal: AbortSignal;
   /** Called when idle timeout occurs - should trigger abort to kill subprocess */
   onIdleTimeout?: () => void;
+  /** Process currently queued work and return immediately when the queue becomes empty. */
+  drainMode?: boolean;
+  /** Pre-claimed messages to yield before claiming more work from the store. */
+  initialMessages?: PendingMessageWithId[];
+  /** When false, return after initialMessages instead of draining the store. */
+  claimAdditionalMessagesFromStore?: boolean;
 }
 
 export class SessionQueueProcessor {
@@ -30,11 +36,30 @@ export class SessionQueueProcessor {
    * Just returning from the iterator is NOT enough - the subprocess stays alive!
    */
   async *createIterator(options: CreateIteratorOptions): AsyncIterableIterator<PendingMessageWithId> {
-    const { sessionDbId, signal, onIdleTimeout } = options;
+    const {
+      sessionDbId,
+      signal,
+      onIdleTimeout,
+      drainMode = false,
+      initialMessages = [],
+      claimAdditionalMessagesFromStore = true
+    } = options;
     let lastActivityTime = Date.now();
+    const bufferedMessages = [...initialMessages];
 
     while (!signal.aborted) {
       try {
+        const bufferedMessage = bufferedMessages.shift();
+        if (bufferedMessage) {
+          lastActivityTime = Date.now();
+          yield bufferedMessage;
+          continue;
+        }
+
+        if (!claimAdditionalMessagesFromStore) {
+          return;
+        }
+
         // Atomically claim next pending message (marks as 'processing')
         // Self-heals any stale processing messages before claiming
         const persistentMessage = this.store.claimNextMessage(sessionDbId);
@@ -45,6 +70,10 @@ export class SessionQueueProcessor {
           // Yield the message for processing (it's marked as 'processing' in DB)
           yield this.toPendingMessageWithId(persistentMessage);
         } else {
+          if (drainMode) {
+            return;
+          }
+
           // Queue empty - wait for wake-up event or timeout
           const receivedMessage = await this.waitForMessage(signal, IDLE_TIMEOUT_MS);
 

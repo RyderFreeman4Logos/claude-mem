@@ -443,5 +443,25 @@ describe('SettingsDefaultsManager', () => {
       expect(defaults.CLAUDE_MEM_WORKER_PORT).toBe('37777'); // Confirm default
       expect(result.CLAUDE_MEM_WORKER_PORT).toBe('33333'); // Env wins
     });
+
+    it('should keep valid concurrent message settings', () => {
+      writeFileSync(settingsPath, JSON.stringify({
+        CLAUDE_MEM_CONCURRENT_MESSAGES: '7',
+      }));
+
+      const result = SettingsDefaultsManager.loadFromFile(settingsPath);
+
+      expect(result.CLAUDE_MEM_CONCURRENT_MESSAGES).toBe('7');
+    });
+
+    it('should fall back to default concurrent messages when configured value is out of range', () => {
+      writeFileSync(settingsPath, JSON.stringify({
+        CLAUDE_MEM_CONCURRENT_MESSAGES: '99',
+      }));
+
+      const result = SettingsDefaultsManager.loadFromFile(settingsPath);
+
+      expect(result.CLAUDE_MEM_CONCURRENT_MESSAGES).toBe('3');
+    });
   });
 });

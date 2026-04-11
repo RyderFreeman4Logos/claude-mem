@@ -143,4 +143,86 @@ describe('PendingMessageStore - Self-Healing claimNextMessage', () => {
     const session1Msg = db.query('SELECT status FROM pending_messages WHERE id = ?').get(stuckInSession1) as { status: string };
     expect(session1Msg.status).toBe('processing');
   });
+
+  test('global claims are unique across concurrent claimers', async () => {
+    const otherSessionIds = Array.from({ length: 9 }, (_, index) =>
+      createSDKSession(db, `global-claim-${index}`, 'test-project', 'Test')
+    );
+
+    const messageIds = [
+      enqueueMessage(),
+      ...otherSessionIds.map((otherSessionId, index) => store.enqueue(otherSessionId, `global-claim-${index}`, {
+        type: 'observation',
+        tool_name: 'TestTool',
+        tool_input: { index },
+        tool_response: { index },
+        prompt_number: 1,
+      }))
+    ];
+
+    const claimed = await Promise.all(
+      Array.from({ length: 10 }, () => Promise.resolve(store.claimNextMessage()))
+    );
+
+    const claimedIds = claimed
+      .map((message) => message?.id ?? null)
+      .filter((messageId): messageId is number => messageId !== null);
+
+    expect(claimedIds).toHaveLength(10);
+    expect(new Set(claimedIds).size).toBe(10);
+    expect(new Set(claimedIds)).toEqual(new Set(messageIds));
+  });
+
+  test('same-session observations remain claimable while earlier ones are processing', async () => {
+    const messageIds = Array.from({ length: 5 }, (_, index) => enqueueMessage({
+      prompt_number: index + 1,
+      tool_input: { index },
+      tool_response: { index }
+    }));
+
+    const claimed = await Promise.all(
+      Array.from({ length: 5 }, () => Promise.resolve(store.claimNextMessage()))
+    );
+
+    const claimedIds = claimed
+      .map((message) => message?.id ?? null)
+      .filter((messageId): messageId is number => messageId !== null);
+
+    expect(claimedIds).toHaveLength(5);
+    expect(new Set(claimedIds)).toEqual(new Set(messageIds));
+  });
+
+  test('summarize messages stay blocked until earlier observations in the same session complete', () => {
+    const observationIds = [
+      enqueueMessage({ prompt_number: 1 }),
+      enqueueMessage({ prompt_number: 2 }),
+      enqueueMessage({ prompt_number: 3 })
+    ];
+    const summarizeId = enqueueMessage({
+      type: 'summarize',
+      tool_name: undefined,
+      tool_input: undefined,
+      tool_response: undefined,
+      last_assistant_message: 'done'
+    });
+
+    const firstThreeClaims = [
+      store.claimNextMessage(),
+      store.claimNextMessage(),
+      store.claimNextMessage()
+    ];
+    expect(firstThreeClaims.map((message) => message?.id)).toEqual(observationIds);
+
+    const blockedWhileProcessing = store.claimNextMessage();
+    expect(blockedWhileProcessing).toBeNull();
+
+    store.confirmProcessed(observationIds[0]);
+    store.confirmProcessed(observationIds[1]);
+    expect(store.claimNextMessage()).toBeNull();
+
+    store.confirmProcessed(observationIds[2]);
+
+    const summarizeClaim = store.claimNextMessage();
+    expect(summarizeClaim?.id).toBe(summarizeId);
+  });
 });

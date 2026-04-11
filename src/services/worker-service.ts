@@ -16,6 +16,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { getWorkerPort, getWorkerHost } from '../shared/worker-utils.js';
 import { HOOK_TIMEOUTS } from '../shared/hook-constants.js';
 import { SettingsDefaultsManager } from '../shared/SettingsDefaultsManager.js';
+import { USER_SETTINGS_PATH } from '../shared/paths.js';
 import { getAuthMethodDescription } from '../shared/EnvManager.js';
 import { logger } from '../utils/logger.js';
 import { ChromaMcpManager } from './sync/ChromaMcpManager.js';
@@ -85,6 +86,8 @@ import { SearchManager } from './worker/SearchManager.js';
 import { FormattingService } from './worker/FormattingService.js';
 import { TimelineService } from './worker/TimelineService.js';
 import { SessionEventBroadcaster } from './worker/events/SessionEventBroadcaster.js';
+import { ConcurrencyManager } from './worker/ConcurrencyManager.js';
+import { GlobalMessagePool } from './worker/GlobalMessagePool.js';
 import { DEFAULT_CONFIG_PATH, DEFAULT_STATE_PATH, expandHomePath, loadTranscriptWatchConfig, writeSampleConfig } from './transcripts/config.js';
 import { TranscriptWatcher } from './transcripts/watcher.js';
 
@@ -98,7 +101,9 @@ import { LogsRoutes } from './worker/http/routes/LogsRoutes.js';
 import { MemoryRoutes } from './worker/http/routes/MemoryRoutes.js';
 
 // Process management for zombie cleanup (Issue #737)
-import { startOrphanReaper, reapOrphanedProcesses, getProcessBySession, ensureProcessExit } from './worker/ProcessRegistry.js';
+import { startOrphanReaper, reapOrphanedProcesses, getProcessBySession, ensureProcessExit, waitForSlot } from './worker/ProcessRegistry.js';
+import type { PersistentPendingMessage } from './sqlite/PendingMessageStore.js';
+import type { ActiveSession } from './worker-types.js';
 
 /**
  * Build JSON status output for hook framework communication.
@@ -144,6 +149,8 @@ export class WorkerService {
   private paginationHelper: PaginationHelper;
   private settingsManager: SettingsManager;
   private sessionEventBroadcaster: SessionEventBroadcaster;
+  private concurrencyManager: ConcurrencyManager;
+  private globalMessagePool: GlobalMessagePool | null = null;
 
   // Route handlers
   private searchRoutes: SearchRoutes | null = null;
@@ -203,6 +210,7 @@ export class WorkerService {
     this.paginationHelper = new PaginationHelper(this.dbManager);
     this.settingsManager = new SettingsManager(this.dbManager);
     this.sessionEventBroadcaster = new SessionEventBroadcaster(this.sseBroadcaster, this);
+    this.concurrencyManager = ConcurrencyManager.getInstance();
     this.chromaServerLifecycle = new ChromaServerLifecycle();
 
     // Set callback for when sessions are deleted
@@ -356,8 +364,6 @@ export class WorkerService {
 
       // Load mode configuration
       const { ModeManager } = await import('./domain/ModeManager.js');
-      const { SettingsDefaultsManager } = await import('../shared/SettingsDefaultsManager.js');
-      const { USER_SETTINGS_PATH } = await import('../shared/paths.js');
 
       const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
 
@@ -396,6 +402,14 @@ export class WorkerService {
       if (resetCount > 0) {
         logger.info('SYSTEM', `Reset ${resetCount} stale processing messages to pending`);
       }
+
+      this.globalMessagePool = new GlobalMessagePool(
+        pendingStore,
+        this.concurrencyManager,
+        async (message) => this.processClaimedSessionMessage(message),
+        async () => this.waitForClaimSlotIfNeeded()
+      );
+      this.globalMessagePool.start();
 
       // Initialize search services
       const formattingService = new FormattingService();
@@ -507,33 +521,8 @@ export class WorkerService {
         }
       }, 2 * 60 * 1000);
 
-      // Auto-recover orphaned queues (fire-and-forget with error logging)
-      this.processPendingQueues(50).then(result => {
-        if (result.sessionsStarted > 0) {
-          logger.info('SYSTEM', `Auto-recovered ${result.sessionsStarted} sessions with pending work`, {
-            totalPending: result.totalPendingSessions,
-            started: result.sessionsStarted,
-            sessionIds: result.startedSessionIds
-          });
-        }
-      }).catch(error => {
-        logger.error('SYSTEM', 'Auto-recovery of pending queues failed', {}, error as Error);
-      });
-
-      // Periodic orphan queue scanner (every 5 min) — catches messages stranded
-      // after a session processor stops mid-queue without a worker restart.
-      this.orphanQueueScanInterval = setInterval(async () => {
-        try {
-          const result = await this.processPendingQueues(10);
-          if (result.sessionsStarted > 0) {
-            logger.info('SYSTEM', `Orphan scan recovered ${result.sessionsStarted} sessions`, {
-              sessionIds: result.startedSessionIds
-            });
-          }
-        } catch (e) {
-          logger.error('SYSTEM', 'Orphan queue scan error', { error: e instanceof Error ? e.message : String(e) });
-        }
-      }, 5 * 60 * 1000);
+      // Kick the pool once after startup so any recovered pending work begins draining immediately.
+      this.notifyGlobalMessagePool('startup');
     } catch (error) {
       logger.error('SYSTEM', 'Background initialization failed', {}, error as Error);
       throw error;
@@ -594,6 +583,159 @@ export class WorkerService {
       return this.geminiAgent;
     }
     return this.sdkAgent;
+  }
+
+  notifyGlobalMessagePool(source: string): void {
+    if (!this.globalMessagePool) {
+      logger.debug('SYSTEM', 'Global message pool not ready yet', { source });
+      return;
+    }
+
+    logger.debug('SYSTEM', 'Notifying global message pool', { source });
+    this.globalMessagePool.notify();
+  }
+
+  private static readonly SIMPLE_TOOLS = new Set([
+    'Read', 'Glob', 'Grep', 'LS', 'ListMcpResourcesTool'
+  ]);
+
+  private applyTierRouting(session: NonNullable<ReturnType<typeof this.sessionManager.getSession>>): void {
+    const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
+    if (settings.CLAUDE_MEM_TIER_ROUTING_ENABLED === 'false') {
+      session.modelOverride = undefined;
+      return;
+    }
+
+    session.modelOverride = undefined;
+
+    const pending = this.sessionManager.getPendingMessageStore().peekPendingTypes(session.sessionDbId);
+    if (pending.length === 0) {
+      return;
+    }
+
+    const hasSummarize = pending.some((message) => message.message_type === 'summarize');
+    const allSimple = pending.every((message) =>
+      message.message_type === 'observation'
+      && !!message.tool_name
+      && WorkerService.SIMPLE_TOOLS.has(message.tool_name)
+    );
+
+    if (hasSummarize) {
+      const summaryModel = settings.CLAUDE_MEM_TIER_SUMMARY_MODEL;
+      if (summaryModel) {
+        session.modelOverride = summaryModel;
+      }
+      return;
+    }
+
+    if (allSimple) {
+      const simpleModel = settings.CLAUDE_MEM_TIER_SIMPLE_MODEL;
+      if (simpleModel) {
+        session.modelOverride = simpleModel;
+      }
+    }
+  }
+
+  private async processClaimedSessionMessage(message: PersistentPendingMessage): Promise<void> {
+    const pendingStore = this.sessionManager.getPendingMessageStore();
+    const session = this.createIsolatedClaimedSession(message);
+    const agent = this.getActiveAgent();
+
+    session.idleTimedOut = false;
+    session.quotaPaused = false;
+    session.skipSdkSlotWait = agent === this.sdkAgent;
+
+    this.applyTierRouting(session);
+
+    logger.info('SYSTEM', 'Processing claimed message via global pool', {
+      sessionId: session.sessionDbId,
+      messageId: message.id,
+      type: message.message_type,
+      provider: agent.constructor.name,
+      claimAdditionalMessagesFromStore: session.claimAdditionalMessagesFromStore ?? true
+    });
+
+    const run = agent.startSession(session, this);
+    session.generatorPromise = run;
+
+    try {
+      await run;
+
+      this.lastAiInteraction = {
+        timestamp: Date.now(),
+        success: true,
+        provider: agent.constructor.name,
+      };
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      const processingMessageIds = session.processingMessageIds.length > 0
+        ? [...session.processingMessageIds]
+        : [message.id];
+
+      for (const messageId of processingMessageIds) {
+        if (pendingStore.getMessageStatus(messageId) === 'processing') {
+          pendingStore.markFailed(messageId);
+        }
+      }
+
+      this.lastAiInteraction = {
+        timestamp: Date.now(),
+        success: false,
+        provider: agent.constructor.name,
+        error: errorMessage,
+      };
+      throw error;
+    } finally {
+      session.generatorPromise = null;
+      session.processingMessageIds = [];
+
+      const remaining = pendingStore.getPendingCount(session.sessionDbId);
+      if (remaining === 0 || session.quotaPaused) {
+        this.sessionManager.removeSessionImmediate(session.sessionDbId);
+      }
+
+      this.broadcastProcessingStatus();
+    }
+  }
+
+  private createIsolatedClaimedSession(message: PersistentPendingMessage): ActiveSession {
+    const baseSession = this.sessionManager.initializeSession(message.session_db_id);
+    const pendingStore = this.sessionManager.getPendingMessageStore();
+    const initialMessage = pendingStore.toPendingMessageWithId(message);
+
+    return {
+      sessionDbId: baseSession.sessionDbId,
+      contentSessionId: baseSession.contentSessionId,
+      memorySessionId: null,
+      project: baseSession.project,
+      platformSource: baseSession.platformSource,
+      userPrompt: baseSession.userPrompt,
+      pendingMessages: [],
+      abortController: new AbortController(),
+      generatorPromise: null,
+      lastPromptNumber: initialMessage.prompt_number ?? baseSession.lastPromptNumber,
+      startTime: Date.now(),
+      cumulativeInputTokens: 0,
+      cumulativeOutputTokens: 0,
+      earliestPendingTimestamp: null,
+      conversationHistory: [],
+      currentProvider: null,
+      consecutiveRestarts: 0,
+      processingMessageIds: [],
+      preclaimedMessages: [initialMessage],
+      claimAdditionalMessagesFromStore: false,
+      lastGeneratorActivity: Date.now()
+    };
+  }
+
+  private async waitForClaimSlotIfNeeded(): Promise<void> {
+    if (this.getActiveAgent() !== this.sdkAgent) {
+      return;
+    }
+
+    const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
+    const maxConcurrent = parseInt(settings.CLAUDE_MEM_MAX_CONCURRENT_AGENTS, 10) || 2;
+    await waitForSlot(maxConcurrent);
   }
 
   /**
@@ -937,46 +1079,24 @@ export class WorkerService {
     }
 
     const orphanedSessionIds = pendingStore.getSessionsWithPendingMessages();
+    const startedSessionIds = orphanedSessionIds.slice(0, sessionLimit);
 
-    const result = {
-      totalPendingSessions: orphanedSessionIds.length,
-      sessionsStarted: 0,
-      sessionsSkipped: 0,
-      startedSessionIds: [] as number[]
-    };
-
-    if (orphanedSessionIds.length === 0) return result;
-
-    logger.info('SYSTEM', `Processing up to ${sessionLimit} of ${orphanedSessionIds.length} pending session queues`);
-
-    for (const sessionDbId of orphanedSessionIds) {
-      if (result.sessionsStarted >= sessionLimit) break;
-
+    for (const sessionDbId of startedSessionIds) {
       try {
-        const existingSession = this.sessionManager.getSession(sessionDbId);
-        if (existingSession?.generatorPromise) {
-          result.sessionsSkipped++;
-          continue;
-        }
-
-        const session = this.sessionManager.initializeSession(sessionDbId);
-        logger.info('SYSTEM', `Starting processor for session ${sessionDbId}`, {
-          project: session.project,
-          pendingCount: pendingStore.getPendingCount(sessionDbId)
-        });
-
-        this.startSessionProcessor(session, 'startup-recovery');
-        result.sessionsStarted++;
-        result.startedSessionIds.push(sessionDbId);
-
-        await new Promise(resolve => setTimeout(resolve, 100));
+        this.sessionManager.initializeSession(sessionDbId);
       } catch (error) {
-        logger.error('SYSTEM', `Failed to process session ${sessionDbId}`, {}, error as Error);
-        result.sessionsSkipped++;
+        logger.error('SYSTEM', `Failed to initialize pending session ${sessionDbId}`, {}, error as Error);
       }
     }
 
-    return result;
+    this.notifyGlobalMessagePool('process-pending-queues');
+
+    return {
+      totalPendingSessions: orphanedSessionIds.length,
+      sessionsStarted: startedSessionIds.length,
+      sessionsSkipped: Math.max(0, orphanedSessionIds.length - startedSessionIds.length),
+      startedSessionIds
+    };
   }
 
   /**
@@ -1005,6 +1125,11 @@ export class WorkerService {
     if (this.orphanQueueScanInterval) {
       clearInterval(this.orphanQueueScanInterval);
       this.orphanQueueScanInterval = null;
+    }
+
+    if (this.globalMessagePool) {
+      await this.globalMessagePool.stop();
+      this.globalMessagePool = null;
     }
 
     // Reset all 'processing' messages back to 'pending' before shutdown.
