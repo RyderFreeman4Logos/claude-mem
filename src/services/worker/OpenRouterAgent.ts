@@ -135,18 +135,29 @@ export class OpenRouterAgent {
    * Uses multi-turn conversation to maintain context across messages
    */
   async startSession(session: ActiveSession, worker?: WorkerRef): Promise<void> {
-    // Check if OpenRouter is in cooldown - delegate to Gemini directly
+    // Check if OpenRouter is in cooldown
     if (OpenRouterAgent.isInCooldown()) {
       const remaining = OpenRouterAgent.getCooldownRemainingSeconds();
-      logger.info('SDK', `OpenRouter in cooldown (${remaining}s remaining), delegating to Gemini`, {
-        sessionDbId: session.sessionDbId,
-        cooldownUntil: new Date(OpenRouterAgent.globalCooldownUntil).toISOString()
-      });
 
-      if (isGeminiAvailable() && this.geminiAgent) {
-        return this.geminiAgent.startSession(session, worker);
+      // Short cooldown (≤ 120s): wait and retry instead of falling back to paid providers
+      if (remaining <= 120) {
+        logger.info('SDK', `OpenRouter short cooldown (${remaining}s), waiting to retry`, {
+          sessionDbId: session.sessionDbId,
+        });
+        await new Promise(r => setTimeout(r, remaining * 1000 + 1000));
+        // Fall through to try block — cooldown should be expired now
+      } else {
+        // Long cooldown: delegate to Gemini
+        logger.info('SDK', `OpenRouter in cooldown (${remaining}s remaining), delegating to Gemini`, {
+          sessionDbId: session.sessionDbId,
+          cooldownUntil: new Date(OpenRouterAgent.globalCooldownUntil).toISOString()
+        });
+
+        if (isGeminiAvailable() && this.geminiAgent) {
+          return this.geminiAgent.startSession(session, worker);
+        }
+        logger.warn('SDK', 'OpenRouter in cooldown but Gemini not available, attempting anyway');
       }
-      logger.warn('SDK', 'OpenRouter in cooldown but Gemini not available, attempting anyway');
     }
 
     try {
@@ -336,47 +347,80 @@ export class OpenRouterAgent {
 
       const shouldFallback = shouldFallbackToClaude(error) || errorMessage.includes('cooldown');
 
-      // Fallback: use wired fallback agent (avoids circular loops when
-      // this agent is itself a fallback target from the primary provider).
-      if (shouldFallback && this.fallbackAgent && !session.inFallback) {
-        logger.warn('SDK', 'OpenRouter failed, falling back to next agent', {
+      // Short cooldown mid-session: wait and retry once before falling back
+      const isCooldownError = errorMessage.includes('cooldown') || errorMessage.includes('rate limit');
+      const cooldownRemaining = OpenRouterAgent.getCooldownRemainingSeconds();
+      if (isCooldownError && cooldownRemaining > 0 && cooldownRemaining <= 120 && !session.inFallback) {
+        logger.info('SDK', `Mid-session short cooldown (${cooldownRemaining}s), waiting to retry OpenRouter`, {
           sessionDbId: session.sessionDbId,
-          error: errorMessage,
         });
-        // Reset history — fallback agent manages its own context
+        await new Promise(r => setTimeout(r, cooldownRemaining * 1000 + 1000));
+
+        // One retry attempt — if it fails again, fall through to fallback
+        try {
+          session.inFallback = true; // prevent double wait on retry failure
+          return await this.startSession(session, worker);
+        } catch {
+          // Retry failed — fall through to Gemini/Claude fallback below
+        } finally {
+          session.inFallback = false;
+        }
+      }
+
+      // Fallback order: Gemini (free) first, Claude SDK (paid) last.
+      // Avoids circular loops when this agent is itself a fallback target.
+      if (shouldFallback && !session.inFallback) {
         session.conversationHistory = [];
         session.inFallback = true;
         try {
-          return await this.fallbackAgent.startSession(session, worker);
-        } catch (fallbackError: unknown) {
-          const fbMsg = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
-
-          // Try Gemini as last resort before giving up
+          // Try Gemini first (free provider)
           if (this.geminiAgent) {
             try {
-              logger.warn('SDK', 'Claude SDK fallback failed, trying Gemini', { error: fbMsg.substring(0, 100) });
+              logger.warn('SDK', 'OpenRouter failed, falling back to Gemini', {
+                sessionDbId: session.sessionDbId,
+                error: errorMessage,
+              });
               return await this.geminiAgent.startSession(session, worker);
             } catch (geminiError: unknown) {
               const geminiMsg = geminiError instanceof Error ? geminiError.message : String(geminiError);
-              logger.failure('SDK', 'Gemini fallback also failed', { error: geminiMsg.substring(0, 100) });
-              // Fall through to existing quota/throw logic
+              logger.warn('SDK', 'Gemini fallback failed, trying Claude SDK', { error: geminiMsg.substring(0, 100) });
             }
           }
 
-          logger.failure('SDK', 'OpenRouter and all fallback agents failed', {
+          // Try Claude SDK as last resort (paid provider)
+          if (this.fallbackAgent) {
+            try {
+              logger.warn('SDK', 'OpenRouter failed, falling back to Claude SDK', {
+                sessionDbId: session.sessionDbId,
+                error: errorMessage,
+              });
+              return await this.fallbackAgent.startSession(session, worker);
+            } catch (fallbackError: unknown) {
+              const fbMsg = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
+
+              logger.failure('SDK', 'OpenRouter and all fallback agents failed', {
+                sessionDbId: session.sessionDbId,
+                openRouterError: errorMessage,
+                fallbackError: fbMsg,
+              }, fallbackError as Error);
+
+              const isQuota = fbMsg.includes('429') || fbMsg.includes('quota') || fbMsg.includes('RESOURCE_EXHAUSTED');
+              if (isQuota || errorMessage.includes('429') || errorMessage.includes('cooldown')) {
+                session.quotaPaused = true;
+                return;
+              }
+              throw fallbackError;
+            }
+          }
+
+          // No fallback agents available
+          logger.failure('SDK', 'OpenRouter failed, no fallback agents available', {
             sessionDbId: session.sessionDbId,
-            openRouterError: errorMessage,
-            fallbackError: fbMsg,
-          }, fallbackError as Error);
-          // Only set quotaPaused if the root cause was actually quota-related.
-          // Non-quota fallback failures (e.g., auth errors) should propagate
-          // normally so the restart handler can apply its own retry logic.
-          const isQuota = fbMsg.includes('429') || fbMsg.includes('quota') || fbMsg.includes('RESOURCE_EXHAUSTED');
-          if (isQuota || errorMessage.includes('429') || errorMessage.includes('cooldown')) {
+          });
+          if (errorMessage.includes('429') || errorMessage.includes('cooldown')) {
             session.quotaPaused = true;
             return;
           }
-          throw fallbackError;
         } finally {
           session.inFallback = false;
         }
