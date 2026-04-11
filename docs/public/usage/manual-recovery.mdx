@@ -218,7 +218,7 @@ Or use the CLI tool which shows this automatically.
 
 ### 5. Handle Failed Messages
 
-Messages that fail 3 times are marked `failed` and won't auto-retry:
+Messages only move to `failed` when they are explicitly marked failed during handling. Normal `markFailed()` retries use exponential backoff with no hard retry limit, while stale self-heal recovery only gravestones messages after 10 recovery cycles:
 
 ```bash
 # View failed messages
