@@ -287,9 +287,9 @@ The skill includes comprehensive diagnostics, automated repair sequences, and de
 
 ### Manual Recovery for Stuck Observations
 
-**Symptoms**: Observations stuck in processing queue after worker crash or restart, no new summaries appearing despite worker running.
+**Symptoms**: Observations remain stuck in the processing queue, or the queue is not draining after a worker crash/restart even though the worker is running again.
 
-**Background**: As of v5.x, automatic queue recovery on worker startup is disabled. Users must manually trigger recovery to maintain explicit control over reprocessing and prevent unexpected duplicate observations.
+**Background**: Worker restarts are safe as of PR #24 (commit `ce34b858`). Claude-mem resets stale `processing` messages back to `pending` on startup and graceful shutdown, auto-recovers pending queues on startup, and runs a 5-minute orphan scanner to catch stranded work. Use the tools below when you want to inspect queue health or trigger recovery immediately because the backlog still is not clearing.
 
 **Solutions**:
 
@@ -370,7 +370,7 @@ Messages progress through these states:
 3. **processed** - Completed successfully
 4. **failed** - Failed after 3 retry attempts
 
-**Stuck Detection**: Messages in `processing` state for >5 minutes are considered stuck and automatically reset to `pending` on worker startup (but not automatically reprocessed).
+**Stuck Detection**: Messages in `processing` state for >5 minutes are considered stuck. Claude-mem resets them to `pending` on startup and graceful shutdown, auto-recovers pending queues on startup, and the 5-minute orphan scanner retries any sessions stranded without a restart.
 
 #### Recovery Strategy
 
