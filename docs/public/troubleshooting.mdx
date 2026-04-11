@@ -444,12 +444,14 @@ CREATE TABLE pending_messages (
   claude_session_id TEXT,          -- Claude session ID
   message_type TEXT,               -- 'observation' | 'summarize'
   status TEXT,                     -- 'pending' | 'processing' | 'processed' | 'failed'
-  retry_count INTEGER,             -- Current retry attempt (max: 3)
+  retry_count INTEGER,             -- Retry counter for backoff and stale self-heal tracking
   created_at_epoch INTEGER,        -- When message was queued
   started_processing_at_epoch INTEGER,  -- When marked 'processing'
   completed_at_epoch INTEGER       -- When completed/failed
 )
 ```
+
+Messages that fail during processing are automatically retried with exponential backoff (30s, 60s, then 2 minutes max). There is no hard cap on retries for normal failure paths, so the worker keeps retrying until the message succeeds. If a message instead gets stuck in `status='processing'` for more than 60 seconds and self-heal keeps resetting it, it is gravestoned to `status='failed'` after 10 stale recovery cycles to prevent infinite loops. See `MAX_RETRY_BEFORE_GRAVESTONE` in `src/services/sqlite/PendingMessageStore.ts`.
 
 **Query examples**:
 
