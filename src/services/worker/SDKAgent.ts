@@ -92,7 +92,11 @@ export class SDKAgent {
     // Wait for agent pool slot (configurable via CLAUDE_MEM_MAX_CONCURRENT_AGENTS)
     const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
     const maxConcurrent = parseInt(settings.CLAUDE_MEM_MAX_CONCURRENT_AGENTS, 10) || 2;
-    await waitForSlot(maxConcurrent);
+    if (session.skipSdkSlotWait) {
+      session.skipSdkSlotWait = false;
+    } else {
+      await waitForSlot(maxConcurrent);
+    }
 
     // Build isolated environment from ~/.claude-mem/.env
     // This prevents Issue #733: random ANTHROPIC_API_KEY from project .env files
@@ -369,10 +373,12 @@ export class SDKAgent {
     };
 
     // Consume pending messages from SessionManager (event-driven, no polling)
+    const initialMessages = session.preclaimedMessages?.splice(0) ?? [];
+
     for await (const message of this.sessionManager.getMessageIterator(session.sessionDbId, {
       drainMode: true,
       signal: session.abortController.signal,
-      initialMessages: session.preclaimedMessages.splice(0),
+      initialMessages,
       claimAdditionalMessagesFromStore: session.claimAdditionalMessagesFromStore
     })) {
       if (session.earliestPendingTimestamp === null) {

@@ -5,6 +5,7 @@ import { ConcurrencyManager } from './ConcurrencyManager.js';
 const IDLE_POLL_MS = 1000;
 
 type MessageProcessor = (message: PersistentPendingMessage) => Promise<void>;
+type ClaimGate = () => Promise<void>;
 
 interface WorkerHandle {
   id: number;
@@ -22,7 +23,8 @@ export class GlobalMessagePool {
   constructor(
     private pendingStore: PendingMessageStore,
     private concurrencyManager: ConcurrencyManager,
-    private processMessage: MessageProcessor
+    private processMessage: MessageProcessor,
+    private beforeClaim?: ClaimGate
   ) {}
 
   start(): void {
@@ -114,6 +116,25 @@ export class GlobalMessagePool {
   private async workerLoop(workerId: number): Promise<void> {
     while (this.running) {
       if (this.retiringWorkers.has(workerId)) {
+        return;
+      }
+
+      if (this.pendingStore.getTotalPendingCount() === 0) {
+        await this.waitForWork();
+        continue;
+      }
+
+      try {
+        await this.beforeClaim?.();
+      } catch (error) {
+        logger.error('QUEUE', 'Global message worker failed before claim', {
+          workerId
+        }, error as Error);
+        await this.waitForWork();
+        continue;
+      }
+
+      if (!this.running || this.retiringWorkers.has(workerId)) {
         return;
       }
 

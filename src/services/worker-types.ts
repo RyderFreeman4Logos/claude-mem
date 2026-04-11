@@ -47,6 +47,8 @@ export interface ActiveSession {
   preclaimedMessages: PendingMessageWithId[];
   // Global-pool isolated runs disable store claims so each worker handles only its claimed message.
   claimAdditionalMessagesFromStore?: boolean;
+  // SDK global-pool runs can pre-wait on the agent slot before the claim enters processing.
+  skipSdkSlotWait?: boolean;
   // Tier routing: model override per session based on queue complexity
   modelOverride?: string;
 }

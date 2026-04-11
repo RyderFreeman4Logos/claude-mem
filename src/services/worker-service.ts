@@ -101,7 +101,7 @@ import { LogsRoutes } from './worker/http/routes/LogsRoutes.js';
 import { MemoryRoutes } from './worker/http/routes/MemoryRoutes.js';
 
 // Process management for zombie cleanup (Issue #737)
-import { startOrphanReaper, reapOrphanedProcesses, getProcessBySession, ensureProcessExit } from './worker/ProcessRegistry.js';
+import { startOrphanReaper, reapOrphanedProcesses, getProcessBySession, ensureProcessExit, waitForSlot } from './worker/ProcessRegistry.js';
 import type { PersistentPendingMessage } from './sqlite/PendingMessageStore.js';
 import type { ActiveSession } from './worker-types.js';
 
@@ -406,7 +406,8 @@ export class WorkerService {
       this.globalMessagePool = new GlobalMessagePool(
         pendingStore,
         this.concurrencyManager,
-        async (message) => this.processClaimedSessionMessage(message)
+        async (message) => this.processClaimedSessionMessage(message),
+        async () => this.waitForClaimSlotIfNeeded()
       );
       this.globalMessagePool.start();
 
@@ -642,6 +643,7 @@ export class WorkerService {
 
     session.idleTimedOut = false;
     session.quotaPaused = false;
+    session.skipSdkSlotWait = agent === this.sdkAgent;
 
     this.applyTierRouting(session);
 
@@ -666,7 +668,16 @@ export class WorkerService {
       };
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
-      pendingStore.markSessionMessagesFailed(session.sessionDbId);
+      const processingMessageIds = session.processingMessageIds.length > 0
+        ? [...session.processingMessageIds]
+        : [message.id];
+
+      for (const messageId of processingMessageIds) {
+        if (pendingStore.getMessageStatus(messageId) === 'processing') {
+          pendingStore.markFailed(messageId);
+        }
+      }
+
       this.lastAiInteraction = {
         timestamp: Date.now(),
         success: false,
@@ -715,6 +726,16 @@ export class WorkerService {
       claimAdditionalMessagesFromStore: false,
       lastGeneratorActivity: Date.now()
     };
+  }
+
+  private async waitForClaimSlotIfNeeded(): Promise<void> {
+    if (this.getActiveAgent() !== this.sdkAgent) {
+      return;
+    }
+
+    const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
+    const maxConcurrent = parseInt(settings.CLAUDE_MEM_MAX_CONCURRENT_AGENTS, 10) || 2;
+    await waitForSlot(maxConcurrent);
   }
 
   /**

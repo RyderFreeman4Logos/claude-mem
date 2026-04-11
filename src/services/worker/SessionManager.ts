@@ -475,7 +475,7 @@ export class SessionManager {
     }
 
     const processor = new SessionQueueProcessor(this.getPendingStore(), emitter);
-    const initialMessages = options.initialMessages ?? session.preclaimedMessages.splice(0);
+    const initialMessages = options.initialMessages ?? session.preclaimedMessages?.splice(0) ?? [];
     const signal = options.signal ?? session.abortController.signal;
 
     // Use the robust iterator over initial claimed work plus optional store draining.

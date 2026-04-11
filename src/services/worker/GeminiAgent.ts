@@ -190,10 +190,12 @@ export class GeminiAgent {
       // Track cwd from messages for CLAUDE.md generation
       let lastCwd: string | undefined;
 
+      const initialMessages = session.preclaimedMessages?.splice(0) ?? [];
+
       for await (const message of this.sessionManager.getMessageIterator(session.sessionDbId, {
         drainMode: true,
         signal: session.abortController.signal,
-        initialMessages: session.preclaimedMessages.splice(0),
+        initialMessages,
         claimAdditionalMessagesFromStore: session.claimAdditionalMessagesFromStore
       })) {
         if (session.earliestPendingTimestamp === null) {

@@ -221,10 +221,12 @@ export class OpenRouterAgent {
       let lastCwd: string | undefined;
 
       // Process pending messages
+      const initialMessages = session.preclaimedMessages?.splice(0) ?? [];
+
       for await (const message of this.sessionManager.getMessageIterator(session.sessionDbId, {
         drainMode: true,
         signal: session.abortController.signal,
-        initialMessages: session.preclaimedMessages.splice(0),
+        initialMessages,
         claimAdditionalMessagesFromStore: session.claimAdditionalMessagesFromStore
       })) {
         if (session.earliestPendingTimestamp === null) {
