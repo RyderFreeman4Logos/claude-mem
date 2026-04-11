@@ -21,6 +21,8 @@ import { computeObservationContentHash, findDuplicateObservation } from './obser
 import { parseFileList } from './observations/files.js';
 import { DEFAULT_PLATFORM_SOURCE, normalizePlatformSource, sortPlatformSources } from '../../shared/platform-source.js';
 
+const SQLITE_BUSY_TIMEOUT_MS = 5_000;
+
 function resolveCreateSessionArgs(
   customTitle?: string,
   platformSource?: string
@@ -48,6 +50,7 @@ export class SessionStore {
     this.db.run('PRAGMA journal_mode = WAL');
     this.db.run('PRAGMA synchronous = NORMAL');
     this.db.run('PRAGMA foreign_keys = ON');
+    this.db.run(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS}`);
 
     // Initialize schema if needed (fresh database)
     this.initializeSchema();
@@ -65,6 +68,7 @@ export class SessionStore {
     this.renameSessionIdColumns();
     this.repairSessionIdColumnRename();
     this.addFailedAtEpochColumn();
+    this.ensurePendingMessagesLastAttemptedAtColumn();
     this.addOnUpdateCascadeToForeignKeys();
     this.addObservationContentHashColumn();
     this.addSessionCustomTitleColumn();
@@ -687,6 +691,24 @@ export class SessionStore {
     }
 
     this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(20, new Date().toISOString());
+  }
+
+  /**
+   * Ensure pending_messages has last_attempted_at_epoch for retry backoff tracking.
+   *
+   * MigrationRunner also adds this column, but SessionStore has its own schema
+   * bootstrap path and historically re-used migration version numbers for other
+   * columns. Check the live schema directly so file-backed temp DBs get the
+   * backoff column even when schema_versions has drifted.
+   */
+  private ensurePendingMessagesLastAttemptedAtColumn(): void {
+    const tableInfo = this.db.query('PRAGMA table_info(pending_messages)').all() as TableColumnInfo[];
+    const hasColumn = tableInfo.some(col => col.name === 'last_attempted_at_epoch');
+
+    if (!hasColumn) {
+      this.db.run('ALTER TABLE pending_messages ADD COLUMN last_attempted_at_epoch INTEGER');
+      logger.debug('DB', 'Added last_attempted_at_epoch column to pending_messages table');
+    }
   }
 
   /**

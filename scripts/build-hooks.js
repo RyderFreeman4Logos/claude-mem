@@ -17,6 +17,11 @@ const WORKER_SERVICE = {
   source: 'src/services/worker-service.ts'
 };
 
+const SQLITE_WRITER_WORKER = {
+  name: 'sqlite-writer-worker',
+  source: 'src/services/worker/storage/sqlite-writer-entry.ts'
+};
+
 const MCP_SERVER = {
   name: 'mcp-server',
   source: 'src/servers/mcp-server.ts'
@@ -188,6 +193,30 @@ async function buildHooks() {
     fs.chmodSync(`${hooksDir}/${WORKER_SERVICE.name}.cjs`, 0o755);
     const workerStats = fs.statSync(`${hooksDir}/${WORKER_SERVICE.name}.cjs`);
     console.log(`✓ worker-service built (${(workerStats.size / 1024).toFixed(2)} KB)`);
+
+    console.log(`\n🔧 Building sqlite writer worker...`);
+    await build({
+      entryPoints: [SQLITE_WRITER_WORKER.source],
+      bundle: true,
+      platform: 'node',
+      target: 'node18',
+      format: 'cjs',
+      outfile: `${hooksDir}/${SQLITE_WRITER_WORKER.name}.cjs`,
+      minify: true,
+      logLevel: 'error',
+      external: ['bun:sqlite'],
+      banner: {
+        js: [
+          '#!/usr/bin/env bun',
+          'var __filename = require("node:url").fileURLToPath(import.meta.url);',
+          'var __dirname = require("node:path").dirname(__filename);'
+        ].join('\n')
+      }
+    });
+    stripHardcodedDirname(`${hooksDir}/${SQLITE_WRITER_WORKER.name}.cjs`);
+    fs.chmodSync(`${hooksDir}/${SQLITE_WRITER_WORKER.name}.cjs`, 0o755);
+    const sqliteWriterStats = fs.statSync(`${hooksDir}/${SQLITE_WRITER_WORKER.name}.cjs`);
+    console.log(`✓ sqlite-writer-worker built (${(sqliteWriterStats.size / 1024).toFixed(2)} KB)`);
 
     // Build MCP server
     console.log(`\n🔧 Building MCP server...`);

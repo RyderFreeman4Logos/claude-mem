@@ -21,8 +21,9 @@ import type { ActiveSession, ConversationMessage } from '../worker-types.js';
 import { DatabaseManager } from './DatabaseManager.js';
 import { SessionManager } from './SessionManager.js';
 import {
+  enqueueAgentResponsePersist,
+  parseAgentResponse,
   isAbortError,
-  processAgentResponse,
   shouldFallbackToClaude,
   type FallbackAgent,
   type WorkerRef
@@ -173,6 +174,7 @@ export class OpenRouterAgent {
         const syntheticMemorySessionId = `openrouter-${session.contentSessionId}-${Date.now()}`;
         session.memorySessionId = syntheticMemorySessionId;
         this.dbManager.getSessionStore().updateMemorySessionId(session.sessionDbId, syntheticMemorySessionId);
+        this.sessionManager.syncMemorySessionId(session.sessionDbId, syntheticMemorySessionId);
         logger.info('SESSION', `MEMORY_ID_GENERATED | sessionDbId=${session.sessionDbId} | provider=OpenRouter`);
       }
 
@@ -198,8 +200,9 @@ export class OpenRouterAgent {
         session.cumulativeOutputTokens += Math.floor(tokensUsed * 0.3);
 
         // Process response using shared ResponseProcessor (no original timestamp for init - not from queue)
-        await processAgentResponse(
-          initResponse.content,
+        const parsedInit = parseAgentResponse(initResponse.content, session, 'OpenRouter');
+        await enqueueAgentResponsePersist(
+          parsedInit,
           session,
           this.dbManager,
           this.sessionManager,
@@ -283,9 +286,9 @@ export class OpenRouterAgent {
             session.cumulativeOutputTokens += Math.floor(tokensUsed * 0.3);
           }
 
-          // Process response using shared ResponseProcessor
-          await processAgentResponse(
-            obsResponse.content || '',
+          const parsedObservation = parseAgentResponse(obsResponse.content || '', session, 'OpenRouter');
+          await enqueueAgentResponsePersist(
+            parsedObservation,
             session,
             this.dbManager,
             this.sessionManager,
@@ -326,9 +329,9 @@ export class OpenRouterAgent {
             session.cumulativeOutputTokens += Math.floor(tokensUsed * 0.3);
           }
 
-          // Process response using shared ResponseProcessor
-          await processAgentResponse(
-            summaryResponse.content || '',
+          const parsedSummary = parseAgentResponse(summaryResponse.content || '', session, 'OpenRouter');
+          await enqueueAgentResponsePersist(
+            parsedSummary,
             session,
             this.dbManager,
             this.sessionManager,

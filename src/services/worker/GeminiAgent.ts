@@ -142,6 +142,7 @@ export class GeminiAgent {
         const syntheticMemorySessionId = `gemini-${session.contentSessionId}-${Date.now()}`;
         session.memorySessionId = syntheticMemorySessionId;
         this.dbManager.getSessionStore().updateMemorySessionId(session.sessionDbId, syntheticMemorySessionId);
+        this.sessionManager.syncMemorySessionId(session.sessionDbId, syntheticMemorySessionId);
         logger.info('SESSION', `MEMORY_ID_GENERATED | sessionDbId=${session.sessionDbId} | provider=Gemini`);
       }
 

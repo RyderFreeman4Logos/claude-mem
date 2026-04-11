@@ -22,6 +22,7 @@ import type { ActiveSession } from '../../worker-types.js';
 import type { DatabaseManager } from '../DatabaseManager.js';
 import type { SessionManager } from '../SessionManager.js';
 import type { WorkerRef, StorageResult } from './types.js';
+import type { PersistedSummaryPayload, StorageCommitResult } from '../storage/StorageTypes.js';
 import { broadcastObservation, broadcastSummary } from './ObservationBroadcaster.js';
 import { cleanupProcessedMessages } from './SessionCleanupHelper.js';
 
@@ -57,15 +58,44 @@ export async function processAgentResponse(
   projectRoot?: string,
   modelId?: string
 ): Promise<void> {
-  // Track generator activity for stale detection (Issue #1099)
+  const parsed = parseAgentResponse(text, session, agentName);
+  const result = storeParsedAgentResponseInline(
+    parsed,
+    session,
+    dbManager,
+    sessionManager,
+    discoveryTokens,
+    originalTimestamp,
+    modelId
+  );
+
+  await finalizeSuccessfulPersist(
+    parsed,
+    result,
+    session,
+    dbManager,
+    sessionManager,
+    worker,
+    discoveryTokens,
+    agentName,
+    projectRoot
+  );
+}
+
+export function parseAgentResponse(
+  text: string,
+  session: ActiveSession,
+  agentName: string
+): {
+  observations: ParsedObservation[];
+  summary: ParsedSummary | null;
+} {
   session.lastGeneratorActivity = Date.now();
 
-  // Add assistant response to shared conversation history for provider interop
   if (text) {
     session.conversationHistory.push({ role: 'assistant', content: text });
   }
 
-  // Parse observations and summary
   const observations = parseObservations(text, session.contentSessionId);
   const summary = parseSummary(text, session.sessionDbId);
 
@@ -82,109 +112,104 @@ export async function processAgentResponse(
     });
   }
 
-  // Convert nullable fields to empty strings for storeSummary (if summary exists)
-  const summaryForStore = normalizeSummaryForStorage(summary);
+  return { observations, summary };
+}
 
-  // Get session store for atomic transaction
-  const sessionStore = dbManager.getSessionStore();
-  const pendingStore = sessionManager.getPendingMessageStore();
+export async function enqueueAgentResponsePersist(
+  parsed: { observations: ParsedObservation[]; summary: ParsedSummary | null; },
+  session: ActiveSession,
+  dbManager: DatabaseManager,
+  sessionManager: SessionManager,
+  worker: WorkerRef | undefined,
+  discoveryTokens: number,
+  originalTimestamp: number | null,
+  agentName: string,
+  projectRoot?: string,
+  modelId?: string
+): Promise<void> {
+  if (!worker?.storageCoordinator) {
+    const inlineResult = storeParsedAgentResponseInline(
+      parsed,
+      session,
+      dbManager,
+      sessionManager,
+      discoveryTokens,
+      originalTimestamp,
+      modelId
+    );
 
-  // CRITICAL: Must use memorySessionId (not contentSessionId) for FK constraint
+    await finalizeSuccessfulPersist(
+      parsed,
+      inlineResult,
+      session,
+      dbManager,
+      sessionManager,
+      worker,
+      discoveryTokens,
+      agentName,
+      projectRoot
+    );
+    return;
+  }
+
   if (!session.memorySessionId) {
     throw new Error('Cannot store observations: memorySessionId not yet captured');
   }
 
-  const storeResponse = () => {
-    // SAFETY NET (Issue #846 / Multi-terminal FK fix):
-    // The PRIMARY fix is in SDKAgent.ts where ensureMemorySessionIdRegistered() is called
-    // immediately when the SDK returns a memory_session_id. This call is a defensive safety net
-    // in case the DB was somehow not updated (race condition, crash, etc.).
-    // In multi-terminal scenarios, createSDKSession() now resets memory_session_id to NULL
-    // for each new generator, ensuring clean isolation.
-    sessionStore.ensureMemorySessionIdRegistered(session.sessionDbId, session.memorySessionId!);
+  const processingMessageIds = [...session.processingMessageIds];
+  const summaryForStore = normalizeSummaryForStorage(parsed.summary);
+  const persistPromise = worker.storageCoordinator.enqueuePersist({
+    sessionDbId: session.sessionDbId,
+    contentSessionId: session.contentSessionId,
+    memorySessionId: session.memorySessionId,
+    project: session.project,
+    platformSource: session.platformSource,
+    lastPromptNumber: session.lastPromptNumber,
+    discoveryTokens,
+    originalTimestamp,
+    modelId,
+    processingMessageIds,
+    observations: parsed.observations,
+    summary: summaryForStore
+  });
 
-    // Log pre-storage with session ID chain for verification
-    logger.info('DB', `STORING | sessionDbId=${session.sessionDbId} | memorySessionId=${session.memorySessionId} | obsCount=${observations.length} | hasSummary=${!!summaryForStore}`, {
-      sessionId: session.sessionDbId,
-      memorySessionId: session.memorySessionId
-    });
+  session.processingMessageIds = [];
+  session.deferredPersistCount = (session.deferredPersistCount ?? 0) + 1;
 
-    // ATOMIC TRANSACTION: Store observations + summary ONCE
-    // Messages are marked 'processing' on claim and completed after successful processing
-    const result = sessionStore.storeObservations(
-      session.memorySessionId!,
-      session.project,
-      observations,
-      summaryForStore,
-      session.lastPromptNumber,
+  void persistPromise
+    .then((result) => finalizeSuccessfulPersist(
+      parsed,
+      result,
+      session,
+      dbManager,
+      sessionManager,
+      worker,
       discoveryTokens,
-      originalTimestamp ?? undefined,
-      modelId
-    );
+      agentName,
+      projectRoot
+    ))
+    .catch((error) => {
+      logger.error('DB', `${agentName} deferred persist failed`, {
+        sessionId: session.sessionDbId,
+        messageIds: processingMessageIds
+      }, error as Error);
 
-    // Log storage result with IDs for end-to-end traceability
-    logger.info('DB', `STORED | sessionDbId=${session.sessionDbId} | memorySessionId=${session.memorySessionId} | obsCount=${result.observationIds.length} | obsIds=[${result.observationIds.join(',')}] | summaryId=${result.summaryId || 'none'}`, {
-      sessionId: session.sessionDbId,
-      memorySessionId: session.memorySessionId
+      cleanupProcessedMessages(session, worker);
+
+      const remaining = sessionManager.getPendingMessageStore().getPendingCount(session.sessionDbId);
+      if (remaining === 0 || session.quotaPaused) {
+        sessionManager.removeSessionImmediate(session.sessionDbId);
+      }
+    })
+    .finally(() => {
+      session.deferredPersistCount = Math.max(0, (session.deferredPersistCount ?? 1) - 1);
     });
-
-    // CLAIM-CONFIRM: Now that storage succeeded, confirm all processing messages (delete from queue)
-    // This is the critical step that prevents message loss on generator crash
-    for (const messageId of session.processingMessageIds) {
-      pendingStore.confirmProcessed(messageId);
-    }
-    if (session.processingMessageIds.length > 0) {
-      logger.debug('QUEUE', `CONFIRMED_BATCH | sessionDbId=${session.sessionDbId} | count=${session.processingMessageIds.length} | ids=[${session.processingMessageIds.join(',')}]`);
-    }
-    session.processingMessageIds = [];
-
-    return result;
-  };
-
-  const result = worker?.sqliteGate
-    ? await worker.sqliteGate.run('store', storeResponse)
-    : storeResponse();
-
-  // AFTER transaction commits - async operations (can fail safely without data loss)
-  await syncAndBroadcastObservations(
-    observations,
-    result,
-    session,
-    dbManager,
-    worker,
-    discoveryTokens,
-    agentName,
-    projectRoot
-  );
-
-  // Sync and broadcast summary if present
-  await syncAndBroadcastSummary(
-    summary,
-    summaryForStore,
-    result,
-    session,
-    dbManager,
-    worker,
-    discoveryTokens,
-    agentName
-  );
-
-  // Clean up session state
-  cleanupProcessedMessages(session, worker);
 }
 
-/**
- * Normalize summary for storage (convert null fields to empty strings)
- */
-function normalizeSummaryForStorage(summary: ParsedSummary | null): {
-  request: string;
-  investigated: string;
-  learned: string;
-  completed: string;
-  next_steps: string;
-  notes: string | null;
-} | null {
-  if (!summary) return null;
+function normalizeSummaryForStorage(summary: ParsedSummary | null): PersistedSummaryPayload | null {
+  if (!summary) {
+    return null;
+  }
 
   return {
     request: summary.request || '',
@@ -194,6 +219,100 @@ function normalizeSummaryForStorage(summary: ParsedSummary | null): {
     next_steps: summary.next_steps || '',
     notes: summary.notes
   };
+}
+
+function storeParsedAgentResponseInline(
+  parsed: { observations: ParsedObservation[]; summary: ParsedSummary | null; },
+  session: ActiveSession,
+  dbManager: DatabaseManager,
+  sessionManager: SessionManager,
+  discoveryTokens: number,
+  originalTimestamp: number | null,
+  modelId?: string
+): StorageResult {
+  const sessionStore = dbManager.getSessionStore();
+  const pendingStore = sessionManager.getPendingMessageStore();
+  const summaryForStore = normalizeSummaryForStorage(parsed.summary);
+
+  if (!session.memorySessionId) {
+    throw new Error('Cannot store observations: memorySessionId not yet captured');
+  }
+
+  sessionStore.ensureMemorySessionIdRegistered(session.sessionDbId, session.memorySessionId);
+
+  logger.info('DB', `STORING | sessionDbId=${session.sessionDbId} | memorySessionId=${session.memorySessionId} | obsCount=${parsed.observations.length} | hasSummary=${!!summaryForStore}`, {
+    sessionId: session.sessionDbId,
+    memorySessionId: session.memorySessionId
+  });
+
+  const result = sessionStore.storeObservations(
+    session.memorySessionId,
+    session.project,
+    parsed.observations,
+    summaryForStore,
+    session.lastPromptNumber,
+    discoveryTokens,
+    originalTimestamp ?? undefined,
+    modelId
+  );
+
+  logger.info('DB', `STORED | sessionDbId=${session.sessionDbId} | memorySessionId=${session.memorySessionId} | obsCount=${result.observationIds.length} | obsIds=[${result.observationIds.join(',')}] | summaryId=${result.summaryId || 'none'}`, {
+    sessionId: session.sessionDbId,
+    memorySessionId: session.memorySessionId
+  });
+
+  for (const messageId of session.processingMessageIds) {
+    pendingStore.confirmProcessed(messageId);
+  }
+  if (session.processingMessageIds.length > 0) {
+    logger.debug('QUEUE', `CONFIRMED_BATCH | sessionDbId=${session.sessionDbId} | count=${session.processingMessageIds.length} | ids=[${session.processingMessageIds.join(',')}]`);
+  }
+  session.processingMessageIds = [];
+
+  return result;
+}
+
+async function finalizeSuccessfulPersist(
+  parsed: { observations: ParsedObservation[]; summary: ParsedSummary | null; },
+  result: StorageResult | StorageCommitResult,
+  session: ActiveSession,
+  dbManager: DatabaseManager,
+  sessionManager: SessionManager,
+  worker: WorkerRef | undefined,
+  discoveryTokens: number,
+  agentName: string,
+  projectRoot?: string
+): Promise<void> {
+  const summaryForStore = normalizeSummaryForStorage(parsed.summary);
+
+  await syncAndBroadcastObservations(
+    parsed.observations,
+    result,
+    session,
+    dbManager,
+    worker,
+    discoveryTokens,
+    agentName,
+    projectRoot
+  );
+
+  await syncAndBroadcastSummary(
+    parsed.summary,
+    summaryForStore,
+    result,
+    session,
+    dbManager,
+    worker,
+    discoveryTokens,
+    agentName
+  );
+
+  cleanupProcessedMessages(session, worker);
+
+  const remaining = sessionManager.getPendingMessageStore().getPendingCount(session.sessionDbId);
+  if (remaining === 0 || session.quotaPaused) {
+    sessionManager.removeSessionImmediate(session.sessionDbId);
+  }
 }
 
 /**

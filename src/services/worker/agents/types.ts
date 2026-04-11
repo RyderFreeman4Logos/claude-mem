@@ -8,14 +8,11 @@
 
 import type { ActiveSession } from '../../worker-types.js';
 import type { ParsedObservation, ParsedSummary } from '../../../sdk/parser.js';
+import type { StorageCoordinator } from '../storage/StorageTypes.js';
 
 // ============================================================================
 // Worker Reference Type
 // ============================================================================
-
-export interface SqliteGate {
-  run<T>(label: string, task: () => T | Promise<T>): Promise<T>;
-}
 
 /**
  * Worker reference for SSE broadcasting and status updates
@@ -23,7 +20,7 @@ export interface SqliteGate {
  * to allow agents to run without a full worker context (e.g., testing)
  */
 export interface WorkerRef {
-  sqliteGate?: SqliteGate;
+  storageCoordinator?: StorageCoordinator;
   sseBroadcaster?: {
     broadcast(event: SSEEventPayload): void;
   };

@@ -198,6 +198,20 @@ export class SessionManager {
   }
 
   /**
+   * Update the cached in-memory memorySessionId for active sessions.
+   * This lets isolated claimed-session workers reuse the same provider session
+   * without forcing an extra DB write before every fetch.
+   */
+  syncMemorySessionId(sessionDbId: number, memorySessionId: string | null): void {
+    const session = this.sessions.get(sessionDbId);
+    if (!session) {
+      return;
+    }
+
+    session.memorySessionId = memorySessionId;
+  }
+
+  /**
    * Queue an observation for processing (zero-latency notification)
    * Auto-initializes session if not in memory but exists in database
    *

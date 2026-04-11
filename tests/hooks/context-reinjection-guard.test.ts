@@ -21,6 +21,8 @@ mock.module('../../src/shared/SettingsDefaultsManager.js', () => ({
     },
     getInt: () => 0,
     loadFromFile: () => ({ CLAUDE_MEM_EXCLUDED_PROJECTS: [] }),
+    invalidateCache: () => {},
+    clearCache: () => {},
   },
 }));
 

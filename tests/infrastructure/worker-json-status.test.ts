@@ -18,15 +18,32 @@ import { buildStatusOutput, StatusOutput } from '../../src/services/worker-servi
 const WORKER_SCRIPT = path.join(__dirname, '../../plugin/scripts/worker-service.cjs');
 
 /**
- * Run worker CLI command and return stdout + exit code
- * Uses spawnSync for synchronous output capture
+ * Run worker CLI command and return captured output.
+ *
+ * Invoke through the platform shell instead of spawning `bun` directly.
+ * Under Bun's own test runner, `spawnSync('bun', [...])` can intermittently
+ * return empty stdout for this command even though the CLI printed JSON.
+ * Shell invocation matches real user execution and keeps the capture stable.
  */
-function runWorkerStart(): { stdout: string; exitCode: number } {
-  const result = spawnSync('bun', [WORKER_SCRIPT, 'start'], {
-    encoding: 'utf-8',
-    timeout: 60000
-  });
-  return { stdout: result.stdout?.trim() || '', exitCode: result.status || 0 };
+function runWorkerStart(): { stdout: string; stderr: string; exitCode: number } {
+  const command = `bun "${WORKER_SCRIPT}" start`;
+  const result = process.platform === 'win32'
+    ? spawnSync('cmd.exe', ['/d', '/s', '/c', command], {
+        encoding: 'utf-8',
+        timeout: 60000,
+        env: process.env
+      })
+    : spawnSync('/bin/sh', ['-lc', command], {
+        encoding: 'utf-8',
+        timeout: 60000,
+        env: process.env
+      });
+
+  return {
+    stdout: result.stdout?.trim() || '',
+    stderr: result.stderr?.trim() || '',
+    exitCode: result.status ?? 0
+  };
 }
 
 describe('worker-json-status', () => {
@@ -310,13 +327,7 @@ describe('worker-json-status', () => {
         return;
       }
 
-      const result = spawnSync('bun', [WORKER_SCRIPT, 'start'], {
-        encoding: 'utf-8',
-        timeout: 60000
-      });
-
-      const stdout = result.stdout?.trim() || '';
-      const stderr = result.stderr?.trim() || '';
+      const { stdout, stderr } = runWorkerStart();
 
       // stdout should contain valid JSON
       expect(() => JSON.parse(stdout)).not.toThrow();

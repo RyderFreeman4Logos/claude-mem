@@ -350,6 +350,24 @@ export class SettingsDefaultsManager {
     console.error('[SETTINGS] All caches cleared and watchers closed');
   }
 
+  /**
+   * Clear the cached settings entry for one path and drop its watcher so the
+   * next read re-establishes watching against the current inode.
+   */
+  static invalidateCache(settingsPath: string): void {
+    this.settingsCache.delete(settingsPath);
+
+    const watcher = this.fileWatchers.get(settingsPath);
+    if (watcher) {
+      try {
+        watcher.close();
+      } catch (error) {
+        console.warn('[SETTINGS] Failed to close watcher for:', settingsPath, error);
+      }
+      this.fileWatchers.delete(settingsPath);
+    }
+  }
+
   private static normalizeSettingValue(key: keyof SettingsDefaults, value: unknown): string {
     if (key === 'CLAUDE_MEM_CONCURRENT_MESSAGES') {
       const parsed = parseInt(String(value ?? ''), 10);

@@ -90,9 +90,11 @@ describe('ResponseProcessor', () => {
       getPendingMessageStore: () => ({
         markProcessed: mock(() => {}),
         confirmProcessed: mockConfirmProcessed,  // CLAIM-CONFIRM pattern: confirm after successful storage
+        getPendingCount: mock(() => 0),
         cleanupProcessed: mock(() => 0),
         resetStuckMessages: mock(() => 0),
       }),
+      removeSessionImmediate: mock(() => {}),
     } as unknown as SessionManager;
 
     mockBroadcast = mock(() => {});
@@ -211,50 +213,6 @@ describe('ResponseProcessor', () => {
       expect(observations).toHaveLength(2);
       expect(observations[0].type).toBe('discovery');
       expect(observations[1].type).toBe('bugfix');
-    });
-  });
-
-  describe('sqlite gate', () => {
-    it('uses the shared sqlite gate for synchronous storage when available', async () => {
-      const sqliteGateRun = mock(async (_label: string, task: () => unknown) => task());
-      const session = createMockSession({ processingMessageIds: [101, 102] });
-      const responseText = `
-        <observation>
-          <type>discovery</type>
-          <title>Stored behind sqlite gate</title>
-          <narrative>Gate should wrap FK registration, storage, and confirmations.</narrative>
-          <facts></facts>
-          <concepts></concepts>
-          <files_read></files_read>
-          <files_modified></files_modified>
-        </observation>
-      `;
-
-      mockWorker = {
-        sqliteGate: {
-          run: sqliteGateRun,
-        },
-        sseBroadcaster: {
-          broadcast: mockBroadcast,
-        },
-        broadcastProcessingStatus: mockBroadcastProcessingStatus,
-      };
-
-      await processAgentResponse(
-        responseText,
-        session,
-        mockDbManager,
-        mockSessionManager,
-        mockWorker,
-        100,
-        null,
-        'TestAgent'
-      );
-
-      expect(sqliteGateRun).toHaveBeenCalledTimes(1);
-      expect(sqliteGateRun.mock.calls[0][0]).toBe('store');
-      expect(mockStoreObservations).toHaveBeenCalledTimes(1);
-      expect(mockConfirmProcessed).toHaveBeenCalledTimes(2);
     });
   });
 
