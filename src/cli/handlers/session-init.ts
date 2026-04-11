@@ -123,6 +123,55 @@ export const sessionInitHandler: EventHandler = {
       logger.debug('HOOK', 'session-init: Skipping SDK agent init for Cursor platform', { sessionDbId, promptNumber });
     }
 
+    if (promptNumber === 1 && input.platform !== 'cursor') {
+      // Seed the priority queue with a real SessionStart message so initial-session
+      // work cuts ahead of normal backlog during recovery.
+      void workerHttpRequest('/api/sessions/observations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contentSessionId: sessionId,
+          platformSource,
+          tool_name: 'session_start',
+          tool_input: {
+            event: 'session_init',
+            project,
+            prompt_number: promptNumber,
+            prompt_recorded: true
+          },
+          tool_response: {
+            status: 'initialized',
+            context_injected: Boolean(initResult.contextInjected)
+          },
+          cwd: cwd ?? process.cwd(),
+          priority: 10
+        })
+      })
+        .then((response) => {
+          if (!response.ok) {
+            logger.warn('HOOK', 'session-init: SessionStart observation enqueue failed, continuing', {
+              status: response.status,
+              sessionDbId,
+              promptNumber
+            });
+            return;
+          }
+
+          logger.debug('HOOK', 'session-init: SessionStart observation queued', {
+            sessionDbId,
+            promptNumber,
+            priority: 10
+          });
+        })
+        .catch((error) => {
+          logger.warn('HOOK', 'session-init: SessionStart observation enqueue errored, continuing', {
+            error: error instanceof Error ? error.message : String(error),
+            sessionDbId,
+            promptNumber
+          });
+        });
+    }
+
     // Semantic context injection: query Chroma for relevant past observations
     // and inject as additionalContext so Claude receives relevant memory each prompt.
     // Controlled by CLAUDE_MEM_SEMANTIC_INJECT setting (default: true).
