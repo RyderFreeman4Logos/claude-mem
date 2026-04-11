@@ -14,6 +14,8 @@ import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js
 import { USER_SETTINGS_PATH } from '../../shared/paths.js';
 import { normalizePlatformSource } from '../../shared/platform-source.js';
 
+const SESSION_INIT_ENQUEUE_TIMEOUT_MS = 200;
+
 export const sessionInitHandler: EventHandler = {
   async execute(input: NormalizedHookInput): Promise<HookResult> {
     // Ensure worker is running before any other logic
@@ -126,50 +128,66 @@ export const sessionInitHandler: EventHandler = {
     if (promptNumber === 1 && input.platform !== 'cursor') {
       // Seed the priority queue with a real SessionStart message so initial-session
       // work cuts ahead of normal backlog during recovery.
-      void workerHttpRequest('/api/sessions/observations', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contentSessionId: sessionId,
-          platformSource,
-          tool_name: 'session_start',
-          tool_input: {
-            event: 'session_init',
-            project,
-            prompt_number: promptNumber,
-            prompt_recorded: true
-          },
-          tool_response: {
-            status: 'initialized',
-            context_injected: Boolean(initResult.contextInjected)
-          },
-          cwd: cwd ?? process.cwd(),
-          priority: 10
-        })
-      })
-        .then((response) => {
-          if (!response.ok) {
-            logger.warn('HOOK', 'session-init: SessionStart observation enqueue failed, continuing', {
-              status: response.status,
-              sessionDbId,
-              promptNumber
-            });
-            return;
-          }
-
-          logger.debug('HOOK', 'session-init: SessionStart observation queued', {
-            sessionDbId,
-            promptNumber,
+      const timeoutPromise = new Promise<null>((resolve) =>
+        setTimeout(() => resolve(null), SESSION_INIT_ENQUEUE_TIMEOUT_MS)
+      );
+      const enqueuePromise = (async () => {
+        const response = await workerHttpRequest('/api/sessions/observations', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contentSessionId: sessionId,
+            platformSource,
+            tool_name: 'session_start',
+            tool_input: {
+              event: 'session_init',
+              project,
+              prompt_number: promptNumber,
+              prompt_recorded: true
+            },
+            tool_response: {
+              status: 'initialized',
+              context_injected: Boolean(initResult.contextInjected)
+            },
+            cwd: cwd ?? process.cwd(),
             priority: 10
-          });
-        })
-        .catch((error) => {
-          logger.warn('HOOK', 'session-init: SessionStart observation enqueue errored, continuing', {
-            error: error instanceof Error ? error.message : String(error),
+          })
+        });
+
+        if (!response.ok) {
+          logger.warn('HOOK', 'session-init: SessionStart observation enqueue failed, continuing', {
+            status: response.status,
             sessionDbId,
             promptNumber
           });
+          return 'failed' as const;
+        }
+
+        logger.debug('HOOK', 'session-init: SessionStart observation queued', {
+          sessionDbId,
+          promptNumber,
+          priority: 10
         });
+        return 'ok' as const;
+      })();
+
+      try {
+        const outcome = await Promise.race([enqueuePromise, timeoutPromise]);
+        if (outcome === null) {
+          logger.debug('HOOK', 'SessionStart priority=10 observation enqueue timed out at 200ms, dropped', {
+            sessionDbId,
+            promptNumber,
+            priority: 10,
+            timeoutMs: SESSION_INIT_ENQUEUE_TIMEOUT_MS
+          });
+        }
+      } catch (error) {
+        logger.warn('HOOK', 'session-init: SessionStart observation enqueue errored, continuing', {
+          error: error instanceof Error ? error.message : String(error),
+          sessionDbId,
+          promptNumber
+        });
+      }
     }
 
     // Semantic context injection: query Chroma for relevant past observations
