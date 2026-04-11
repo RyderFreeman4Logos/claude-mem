@@ -435,6 +435,91 @@ describe('GlobalMessagePool', () => {
     }
   });
 
+  test('processes all in-flight work before pool shrink retires excess workers', async () => {
+    const concurrency = createMutableConcurrencyManagerStub(5);
+    const messageIds = Array.from({ length: 5 }, (_, index) => enqueueMessage({ prompt_number: index + 1 }));
+    const completedIds: number[] = [];
+
+    const pool = new GlobalMessagePool(
+      store,
+      concurrency.manager,
+      async (message) => {
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        store.confirmProcessed(message.id);
+        completedIds.push(message.id);
+      }
+    );
+
+    pool.start();
+
+    try {
+      await waitFor(() => pool.getStatus().processingCount === 5);
+
+      concurrency.setDesiredConcurrency(1);
+
+      await waitFor(() => completedIds.length === 5, 5_000);
+      await waitFor(() => pool.getStatus().poolSize === 1);
+
+      expect(new Set(completedIds)).toEqual(new Set(messageIds));
+      expect(store.getMessageStatus(messageIds[0])).toBeNull();
+      expect(pool.getStatus().retiringWorkers).toBe(0);
+    } finally {
+      await pool.stop();
+    }
+  });
+
+  test('finishes a claimed message before honoring worker retirement', async () => {
+    const concurrency = createMutableConcurrencyManagerStub(2);
+    const messageId = enqueueMessage({ prompt_number: 1 });
+    const originalClaimNextMessage = store.claimNextMessage.bind(store);
+    const completedIds: number[] = [];
+    let beforeClaimCalls = 0;
+    let releaseFirstWorker!: () => void;
+    const firstWorkerGate = new Promise<void>((resolve) => {
+      releaseFirstWorker = resolve;
+    });
+
+    const claimSpy = spyOn(store, 'claimNextMessage').mockImplementation(() => {
+      const claimedMessage = originalClaimNextMessage();
+      if (claimedMessage) {
+        concurrency.setDesiredConcurrency(1);
+      }
+      return claimedMessage;
+    });
+
+    const pool = new GlobalMessagePool(
+      store,
+      concurrency.manager,
+      async (message) => {
+        store.confirmProcessed(message.id);
+        completedIds.push(message.id);
+      },
+      async () => {
+        beforeClaimCalls += 1;
+        if (beforeClaimCalls === 1) {
+          await firstWorkerGate;
+        }
+      }
+    );
+
+    pool.start();
+
+    try {
+      await waitFor(() => completedIds.length === 1);
+
+      expect(completedIds).toEqual([messageId]);
+      expect(store.getMessageStatus(messageId)).toBeNull();
+
+      releaseFirstWorker();
+
+      await waitFor(() => pool.getStatus().poolSize === 1);
+    } finally {
+      claimSpy.mockRestore();
+      releaseFirstWorker();
+      await pool.stop();
+    }
+  });
+
   test('runs summarize after later same-session observations when summarize is queued in the middle', async () => {
     const observationIds = [
       enqueueMessage({ prompt_number: 1 }),
