@@ -203,7 +203,7 @@ export class SessionManager {
    * CRITICAL: Persists to database FIRST before adding to in-memory queue.
    * This ensures observations survive worker crashes.
    */
-  queueObservation(sessionDbId: number, data: ObservationData): void {
+  queueObservation(sessionDbId: number, data: ObservationData, priority: number = 0): void {
     // Auto-initialize from database if needed (handles worker restarts)
     let session = this.sessions.get(sessionDbId);
     if (!session) {
@@ -221,7 +221,7 @@ export class SessionManager {
     };
 
     try {
-      const messageId = this.getPendingStore().enqueue(sessionDbId, session.contentSessionId, message);
+      const messageId = this.getPendingStore().enqueue(sessionDbId, session.contentSessionId, message, priority);
       const queueDepth = this.getPendingStore().getPendingCount(sessionDbId);
       const toolSummary = logger.formatTool(data.tool_name, data.tool_input);
       logger.info('QUEUE', `ENQUEUED | sessionDbId=${sessionDbId} | messageId=${messageId} | type=observation | tool=${toolSummary} | depth=${queueDepth}`, {

@@ -38,7 +38,7 @@ The skill includes comprehensive diagnostics, automated repair sequences, and de
 
 2. Verify worker is healthy:
    ```bash
-   curl http://localhost:37777/health
+   curl http://localhost:37777/api/health
    ```
 
 3. Check worker logs for errors:
@@ -287,9 +287,9 @@ The skill includes comprehensive diagnostics, automated repair sequences, and de
 
 ### Manual Recovery for Stuck Observations
 
-**Symptoms**: Observations stuck in processing queue after worker crash or restart, no new summaries appearing despite worker running.
+**Symptoms**: Observations remain stuck in the processing queue, or the queue is not draining after a worker crash/restart even though the worker is running again.
 
-**Background**: As of v5.x, automatic queue recovery on worker startup is disabled. Users must manually trigger recovery to maintain explicit control over reprocessing and prevent unexpected duplicate observations.
+**Background**: Worker restarts are safe as of PR #24 (commit `ce34b858`). Claude-mem resets stale `processing` messages back to `pending` on startup and graceful shutdown, auto-recovers pending queues on startup, and runs a 5-minute orphan scanner to catch stranded work. Use the tools below when you want to inspect queue health or trigger recovery immediately because the backlog still is not clearing.
 
 **Solutions**:
 
@@ -368,9 +368,9 @@ Messages progress through these states:
 1. **pending** - Queued, waiting to process
 2. **processing** - Currently being processed by SDK agent
 3. **processed** - Completed successfully
-4. **failed** - Failed after 3 retry attempts
+4. **failed** - Permanently marked failed after 10 stale recovery cycles
 
-**Stuck Detection**: Messages in `processing` state for >5 minutes are considered stuck and automatically reset to `pending` on worker startup (but not automatically reprocessed).
+**Stuck Detection**: Messages that remain in `processing` for >60 seconds are treated as stale by self-heal. Each stale recovery bumps `retry_count` and moves the message back to `pending`. After 10 stale recovery cycles, the message is permanently marked `failed` to prevent infinite loops. Startup/shutdown recovery and the 5-minute orphan scanner still reclaim stranded work after crashes or restarts.
 
 #### Recovery Strategy
 
@@ -394,7 +394,7 @@ If recovery fails or messages remain stuck:
 
 1. **Verify worker is healthy**:
    ```bash
-   curl http://localhost:37777/health
+   curl http://localhost:37777/api/health
    # Should return: {"status":"ok","uptime":12345,"port":37777}
    ```
 
@@ -444,12 +444,14 @@ CREATE TABLE pending_messages (
   claude_session_id TEXT,          -- Claude session ID
   message_type TEXT,               -- 'observation' | 'summarize'
   status TEXT,                     -- 'pending' | 'processing' | 'processed' | 'failed'
-  retry_count INTEGER,             -- Current retry attempt (max: 3)
+  retry_count INTEGER,             -- Retry counter for backoff and stale self-heal tracking
   created_at_epoch INTEGER,        -- When message was queued
   started_processing_at_epoch INTEGER,  -- When marked 'processing'
   completed_at_epoch INTEGER       -- When completed/failed
 )
 ```
+
+Messages that fail during processing are automatically retried with exponential backoff (30s, 60s, then 2 minutes max). There is no hard cap on retries for normal failure paths, so the worker keeps retrying until the message succeeds. If a message instead gets stuck in `status='processing'` for more than 60 seconds and self-heal keeps resetting it, it is gravestoned to `status='failed'` after 10 stale recovery cycles to prevent infinite loops. See `MAX_RETRY_BEFORE_GRAVESTONE` in `src/services/sqlite/PendingMessageStore.ts`.
 
 **Query examples**:
 
@@ -958,7 +960,7 @@ npm run worker:logs
 cat ~/.claude-mem/worker.port
 
 # Test worker health
-curl http://localhost:37777/health
+curl http://localhost:37777/api/health
 ```
 
 ### Database Inspection

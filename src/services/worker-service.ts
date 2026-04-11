@@ -193,10 +193,9 @@ export class WorkerService {
     this.geminiAgent = new GeminiAgent(this.dbManager, this.sessionManager);
     this.openRouterAgent = new OpenRouterAgent(this.dbManager, this.sessionManager);
 
-    // Wire fallback: Gemini→OpenRouter, OpenRouter→Claude SDK.
-    // Claude SDK spawns the CLI (needs auth in daemon env), so it's last resort.
-    // Gemini is wired as secondary fallback on OpenRouter so that when Claude SDK
-    // also fails, Gemini gets a chance before the session gives up entirely.
+    // Wire fallback: Gemini→OpenRouter, OpenRouter→Gemini→Claude SDK.
+    // Short cooldowns (≤120s) are waited out before falling back.
+    // Gemini (free) is tried before Claude SDK (paid) to minimize cost.
     this.geminiAgent.setFallbackAgent(this.openRouterAgent);
     this.openRouterAgent.setFallbackAgent(this.sdkAgent);
     this.openRouterAgent.setGeminiAgent(this.geminiAgent);

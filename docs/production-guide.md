@@ -24,6 +24,8 @@ Practical guide based on 23 days of production usage with 3,400+ observations ac
 | Chroma size | Growing slowly | Sudden jump | Check for sync loops |
 | Errors/day in logs | 0-2 | >10 | Investigate log patterns |
 
+Worker restarts are safe as of PR #24 (`ce34b858`): `pending_messages` are preserved, stale `processing` rows are reset to `pending`, and startup recovery resumes queued work automatically. If the queue stalls, restarting the worker is a valid remediation step rather than a data-loss risk.
+
 ### Quick health check
 
 ```bash

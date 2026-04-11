@@ -428,6 +428,9 @@ export class SessionRoutes extends BaseRouteHandler {
     if (sessionDbId === null) return;
 
     const { tool_name, tool_input, tool_response, prompt_number, cwd } = req.body;
+    const priority = typeof req.body.priority === 'number' && Number.isFinite(req.body.priority)
+      ? Math.trunc(req.body.priority)
+      : 0;
 
     this.sessionManager.queueObservation(sessionDbId, {
       tool_name,
@@ -435,7 +438,7 @@ export class SessionRoutes extends BaseRouteHandler {
       tool_response,
       prompt_number,
       cwd
-    });
+    }, priority);
 
     // CRITICAL: Ensure SDK agent is running to consume the queue
     this.ensureGeneratorRunning(sessionDbId, 'observation');
@@ -522,10 +525,13 @@ export class SessionRoutes extends BaseRouteHandler {
   /**
    * Queue observations by contentSessionId (post-tool-use-hook uses this)
    * POST /api/sessions/observations
-   * Body: { contentSessionId, tool_name, tool_input, tool_response, cwd }
+   * Body: { contentSessionId, tool_name, tool_input, tool_response, cwd, priority? }
    */
   private handleObservationsByClaudeId = this.wrapHandler((req: Request, res: Response): void => {
     const { contentSessionId, tool_name, tool_input, tool_response, cwd } = req.body;
+    const priority = typeof req.body.priority === 'number' && Number.isFinite(req.body.priority)
+      ? Math.trunc(req.body.priority)
+      : 0;
     const platformSource = normalizePlatformSource(req.body.platformSource);
     const project = typeof cwd === 'string' && cwd.trim() ? getProjectName(cwd) : '';
 
@@ -601,7 +607,7 @@ export class SessionRoutes extends BaseRouteHandler {
           });
           return '';
         })()
-      });
+      }, priority);
 
       // Ensure SDK agent is running
       this.ensureGeneratorRunning(sessionDbId, 'observation');

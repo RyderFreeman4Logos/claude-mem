@@ -7,6 +7,10 @@ import {
   SchemaVersion
 } from '../../../types/database.js';
 import { DEFAULT_PLATFORM_SOURCE } from '../../../shared/platform-source.js';
+import {
+  PENDING_MESSAGES_ADD_PRIORITY_COLUMN_SQL,
+  PENDING_MESSAGES_PRIORITY_COLUMN_DEF
+} from '../pending-messages-schema.js';
 
 /**
  * MigrationRunner handles all database schema migrations
@@ -39,6 +43,7 @@ export class MigrationRunner {
     this.createFailedMessagesTable();
     this.addMessageDeduplicationColumns();
     this.createObservationFeedbackTable();
+    this.addPendingMessagePriorityColumn();
     this.addSessionPlatformSourceColumn();
   }
 
@@ -526,6 +531,7 @@ export class MigrationRunner {
         prompt_number INTEGER,
         status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'processing', 'processed', 'failed')),
         retry_count INTEGER NOT NULL DEFAULT 0,
+        ${PENDING_MESSAGES_PRIORITY_COLUMN_DEF},
         created_at_epoch INTEGER NOT NULL,
         started_processing_at_epoch INTEGER,
         completed_at_epoch INTEGER,
@@ -1000,6 +1006,24 @@ export class MigrationRunner {
 
     this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(27, new Date().toISOString());
     logger.debug('DB', 'Created observation_feedback table for usage tracking');
+  }
+
+  /**
+   * Add priority column to pending_messages for priority-ordered queue claims (migration 28)
+   */
+  private addPendingMessagePriorityColumn(): void {
+    const applied = this.db.prepare('SELECT version FROM schema_versions WHERE version = ?').get(28) as SchemaVersion | undefined;
+    const tableInfo = this.db.query('PRAGMA table_info(pending_messages)').all() as TableColumnInfo[];
+    const hasColumn = tableInfo.some(col => col.name === 'priority');
+
+    if (applied && hasColumn) return;
+
+    if (!hasColumn) {
+      this.db.run(PENDING_MESSAGES_ADD_PRIORITY_COLUMN_SQL);
+      logger.debug('DB', 'Added priority column to pending_messages table');
+    }
+
+    this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(28, new Date().toISOString());
   }
 
   /**

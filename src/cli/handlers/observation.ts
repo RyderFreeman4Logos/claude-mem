@@ -13,15 +13,10 @@ import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js
 import { USER_SETTINGS_PATH } from '../../shared/paths.js';
 import { normalizePlatformSource } from '../../shared/platform-source.js';
 
+const POSTTOOLUSE_ENQUEUE_TIMEOUT_MS = 200;
+
 export const observationHandler: EventHandler = {
   async execute(input: NormalizedHookInput): Promise<HookResult> {
-    // Ensure worker is running before any other logic
-    const workerReady = await ensureWorkerRunning();
-    if (!workerReady) {
-      // Worker not available - skip observation gracefully
-      return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
-    }
-
     const { sessionId, cwd, toolName, toolInput, toolResponse } = input;
     const platformSource = normalizePlatformSource(input.platform);
 
@@ -46,32 +41,55 @@ export const observationHandler: EventHandler = {
       return { continue: true, suppressOutput: true };
     }
 
-    // Send to worker - worker handles privacy check and database operations
-    try {
+    const requestBody = JSON.stringify({
+      contentSessionId: sessionId,
+      platformSource,
+      tool_name: toolName,
+      tool_input: toolInput,
+      tool_response: toolResponse,
+      cwd
+    });
+
+    // Bound the full enqueue path so hook-command.ts can exit promptly without
+    // dropping observations that were still waiting on the background promise chain.
+    const timeoutPromise = new Promise<null>((resolve) =>
+      setTimeout(() => resolve(null), POSTTOOLUSE_ENQUEUE_TIMEOUT_MS)
+    );
+    const enqueuePromise = (async () => {
+      const workerReady = await ensureWorkerRunning();
+      if (!workerReady) {
+        logger.debug('HOOK', 'Observation enqueue skipped, worker not healthy', { toolName });
+        return 'skipped' as const;
+      }
+
       const response = await workerHttpRequest('/api/sessions/observations', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contentSessionId: sessionId,
-          platformSource,
-          tool_name: toolName,
-          tool_input: toolInput,
-          tool_response: toolResponse,
-          cwd
-        })
+        body: requestBody
       });
 
       if (!response.ok) {
-        // Log but don't throw — observation storage failure should not block tool use
         logger.warn('HOOK', 'Observation storage failed, skipping', { status: response.status, toolName });
-        return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
+        return 'failed' as const;
       }
 
       logger.debug('HOOK', 'Observation sent successfully', { toolName });
+      return 'ok' as const;
+    })();
+
+    try {
+      const outcome = await Promise.race([enqueuePromise, timeoutPromise]);
+      if (outcome === null) {
+        logger.debug('HOOK', 'PostToolUse observation enqueue timed out at 200ms, dropped', {
+          toolName,
+          timeoutMs: POSTTOOLUSE_ENQUEUE_TIMEOUT_MS,
+        });
+      }
     } catch (error) {
-      // Worker unreachable — skip observation gracefully
-      logger.warn('HOOK', 'Observation fetch error, skipping', { error: error instanceof Error ? error.message : String(error) });
-      return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
+      logger.warn('HOOK', 'Observation enqueue failed', {
+        error: error instanceof Error ? error.message : String(error),
+        toolName,
+      });
     }
 
     return { continue: true, suppressOutput: true };
