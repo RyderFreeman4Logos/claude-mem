@@ -80,53 +80,70 @@ CLAUDE_MEM_DB_PATH="${DB_PATH}" bun -e '
 
   const db = new Database(dbPath);
   db.run("PRAGMA journal_mode = WAL");
+  db.run("PRAGMA busy_timeout = 10000");
 
-  const now = Date.now();
-  const iso = new Date(now).toISOString();
-  const contentSessionId = `rollback-content-${now}`;
-  const memorySessionId = `rollback-memory-${now}`;
+  let lastError;
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    try {
+      const now = Date.now();
+      const iso = new Date(now).toISOString();
+      const contentSessionId = `rollback-content-${now}`;
+      const memorySessionId = `rollback-memory-${now}`;
 
-  db.prepare(`
-    INSERT INTO sdk_sessions (
-      content_session_id,
-      memory_session_id,
-      project,
-      platform_source,
-      user_prompt,
-      started_at,
-      started_at_epoch,
-      status
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    contentSessionId,
-    memorySessionId,
-    "claude-mem",
-    "claude",
-    "rollback smoke",
-    iso,
-    now,
-    "completed",
-  );
+      db.prepare(`
+        INSERT INTO sdk_sessions (
+          content_session_id,
+          memory_session_id,
+          project,
+          platform_source,
+          user_prompt,
+          started_at,
+          started_at_epoch,
+          status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        contentSessionId,
+        memorySessionId,
+        "claude-mem",
+        "claude",
+        "rollback smoke",
+        iso,
+        now,
+        "completed",
+      );
 
-  db.prepare(`
-    INSERT INTO observations (
-      memory_session_id,
-      project,
-      text,
-      type,
-      created_at,
-      created_at_epoch
-    ) VALUES (?, ?, ?, ?, ?, ?)
-  `).run(
-    memorySessionId,
-    "claude-mem",
-    "rollback smoke observation",
-    "decision",
-    iso,
-    now,
-  );
+      db.prepare(`
+        INSERT INTO observations (
+          memory_session_id,
+          project,
+          text,
+          type,
+          created_at,
+          created_at_epoch
+        ) VALUES (?, ?, ?, ?, ?, ?)
+      `).run(
+        memorySessionId,
+        "claude-mem",
+        "rollback smoke observation",
+        "decision",
+        iso,
+        now,
+      );
+
+      db.close();
+      process.exit(0);
+    } catch (error) {
+      lastError = error;
+      if (error?.code !== "SQLITE_BUSY" || attempt === 9) {
+        db.close();
+        throw error;
+      }
+      await new Promise(resolve => setTimeout(resolve, 500 * (attempt + 1)));
+    }
+  }
 
   db.close();
+  throw lastError;
 '
 
 CLAUDE_MEM_WORKER_PORT="${WORKER_PORT}" bun plugin/scripts/worker-service.cjs stop >/dev/null
