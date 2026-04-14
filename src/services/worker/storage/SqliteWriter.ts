@@ -21,7 +21,7 @@ import type {
 
 interface PendingRequest<T extends StorageWorkerRequestType = StorageWorkerRequestType> {
   type: T;
-  resolve: (value: StorageWorkerResponseMap[T]) => void;
+  resolve: (value: StorageWorkerResponseMap[StorageWorkerRequestType]) => void;
   reject: (reason?: unknown) => void;
 }
 
@@ -101,7 +101,11 @@ class StorageWorkerChannel {
     const request: QueuedRequest<T> = { requestId, type, payload };
 
     return new Promise<StorageWorkerResponseMap[T]>((resolve, reject) => {
-      this.pendingRequests.set(requestId, { type, resolve, reject });
+      this.pendingRequests.set(requestId, {
+        type,
+        resolve: resolve as (value: StorageWorkerResponseMap[StorageWorkerRequestType]) => void,
+        reject
+      });
       this.queue.push(request);
       this.pumpQueue();
     });
@@ -243,7 +247,7 @@ export class SqliteWriter implements StorageCoordinator {
       return Promise.resolve();
     }
 
-    return this.claimChannel.request('markFailed', { messageIds });
+    return this.claimChannel.request('markFailed', { messageIds }).then(() => undefined);
   }
 
   getStatus(): StorageCoordinatorStatus {

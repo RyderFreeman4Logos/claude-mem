@@ -56,7 +56,7 @@ export function getWorkerPort(): number {
   }
 
   const settingsPath = path.join(SettingsDefaultsManager.get('CLAUDE_MEM_DATA_DIR'), 'settings.json');
-  const settings = SettingsDefaultsManager.loadFromFile(settingsPath, { watchFile: false });
+  const settings = SettingsDefaultsManager.loadFromFile(settingsPath);
   cachedPort = parseInt(settings.CLAUDE_MEM_WORKER_PORT, 10);
   return cachedPort;
 }
@@ -72,7 +72,7 @@ export function getWorkerHost(): string {
   }
 
   const settingsPath = path.join(SettingsDefaultsManager.get('CLAUDE_MEM_DATA_DIR'), 'settings.json');
-  const settings = SettingsDefaultsManager.loadFromFile(settingsPath, { watchFile: false });
+  const settings = SettingsDefaultsManager.loadFromFile(settingsPath);
   cachedHost = settings.CLAUDE_MEM_WORKER_HOST;
   return cachedHost;
 }

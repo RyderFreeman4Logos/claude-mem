@@ -5,7 +5,7 @@
  * - Manage single database connection for worker lifetime
  * - Provide centralized access to SessionStore and SessionSearch
  * - High-level database operations
- * - ChromaSync integration
+ * - Vector backend integration
  */
 
 import { SessionStore } from '../sqlite/SessionStore.js';
@@ -92,14 +92,14 @@ export class DatabaseManager {
   }
 
   /**
-   * Get ChromaSync instance (returns null if Chroma is disabled)
+   * Get the active vector sync backend instance (returns null if vector search is disabled)
    */
   getVectorSync(): VectorSyncBackend | null {
     return this.vectorSync;
   }
 
   /**
-   * Backward-compatible alias while search/storage call sites still reference Chroma naming.
+   * Backward-compatible alias while some search/storage call sites still reference Chroma naming.
    */
   getChromaSync(): VectorSyncBackend | null {
     return this.vectorSync;
@@ -117,7 +117,9 @@ export class DatabaseManager {
     content_session_id: string;
     memory_session_id: string | null;
     project: string;
+    platform_source: string;
     user_prompt: string;
+    custom_title: string | null;
   } {
     const session = this.getSessionStore().getSessionById(sessionDbId);
     if (!session) {

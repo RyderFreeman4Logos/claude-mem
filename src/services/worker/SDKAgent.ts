@@ -79,6 +79,7 @@ export class SDKAgent {
     // NEVER use contentSessionId for resume - that would inject messages into the user's transcript!
     const hasRealMemorySessionId = !!session.memorySessionId;
     const shouldResume = hasRealMemorySessionId && session.lastPromptNumber > 1 && !session.forceInit;
+    const resumeSessionId = shouldResume ? session.memorySessionId ?? undefined : undefined;
 
     // Clear forceInit after using it
     if (session.forceInit) {
@@ -107,10 +108,10 @@ export class SDKAgent {
     logger.info('SDK', 'Starting SDK query', {
       sessionDbId: session.sessionDbId,
       contentSessionId: session.contentSessionId,
-      memorySessionId: session.memorySessionId,
+      memorySessionId: session.memorySessionId ?? undefined,
       hasRealMemorySessionId,
       shouldResume,
-      resume_parameter: shouldResume ? session.memorySessionId : '(none - fresh start)',
+      resume_parameter: resumeSessionId ?? '(none - fresh start)',
       lastPromptNumber: session.lastPromptNumber,
       authMethod
     });
@@ -141,7 +142,7 @@ export class SDKAgent {
         // instead of polluting user's actual project resume lists
         cwd: OBSERVER_SESSIONS_DIR,
         // Only resume if shouldResume is true (memorySessionId exists, not first prompt, not forceInit)
-        ...(shouldResume && { resume: session.memorySessionId }),
+        ...(resumeSessionId ? { resume: resumeSessionId } : {}),
         disallowedTools,
         abortController: session.abortController,
         pathToClaudeCodeExecutable: claudePath,

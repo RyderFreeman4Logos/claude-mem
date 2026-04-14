@@ -296,11 +296,7 @@ ${o.stack}`:` ${o.message}`:this.getLevel()===0&&typeof o=="object"?m=`
       UPDATE sdk_sessions
       SET memory_session_id = ?
       WHERE id = ?
-    `).run(t,e)}markSessionCompleted(e){let t=Date.now(),s=new Date(t).toISOString();this.db.prepare(`
-      UPDATE sdk_sessions
-      SET status = 'completed', completed_at = ?, completed_at_epoch = ?
-      WHERE id = ?
-    `).run(s,t,e)}ensureMemorySessionIdRegistered(e,t){let s=this.db.prepare(`
+    `).run(t,e)}ensureMemorySessionIdRegistered(e,t){let s=this.db.prepare(`
       SELECT id, memory_session_id FROM sdk_sessions WHERE id = ?
     `).get(e);if(!s)throw new Error(`Session ${e} not found in sdk_sessions`);s.memory_session_id!==t&&(this.db.prepare(`
         UPDATE sdk_sessions SET memory_session_id = ? WHERE id = ?

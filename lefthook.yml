@@ -1,0 +1,7 @@
+pre-commit:
+  parallel: true
+  commands:
+    test:
+      run: bun test --preload ./tests/test-setup.ts
+    typecheck:
+      run: npx tsc --noEmit

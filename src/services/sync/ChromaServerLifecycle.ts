@@ -159,15 +159,15 @@ export class ChromaServerLifecycle {
    * Build chroma-mcp CLI arguments from settings.
    */
   private buildChromaArgs(settings: ReturnType<typeof SettingsDefaultsManager.loadFromFile>): string[] {
-    const chromaMode = (settings as Record<string, string>).CLAUDE_MEM_CHROMA_MODE || 'local';
+    const chromaMode = settings.CLAUDE_MEM_CHROMA_MODE || 'local';
 
     if (chromaMode === 'remote') {
-      const host = (settings as Record<string, string>).CLAUDE_MEM_CHROMA_HOST || '127.0.0.1';
-      const port = (settings as Record<string, string>).CLAUDE_MEM_CHROMA_PORT || '8000';
-      const ssl = (settings as Record<string, string>).CLAUDE_MEM_CHROMA_SSL === 'true';
-      const tenant = (settings as Record<string, string>).CLAUDE_MEM_CHROMA_TENANT || 'default_tenant';
-      const database = (settings as Record<string, string>).CLAUDE_MEM_CHROMA_DATABASE || 'default_database';
-      const apiKey = (settings as Record<string, string>).CLAUDE_MEM_CHROMA_API_KEY || '';
+      const host = settings.CLAUDE_MEM_CHROMA_HOST || '127.0.0.1';
+      const port = settings.CLAUDE_MEM_CHROMA_PORT || '8000';
+      const ssl = settings.CLAUDE_MEM_CHROMA_SSL === 'true';
+      const tenant = settings.CLAUDE_MEM_CHROMA_TENANT || 'default_tenant';
+      const database = settings.CLAUDE_MEM_CHROMA_DATABASE || 'default_database';
+      const apiKey = settings.CLAUDE_MEM_CHROMA_API_KEY || '';
 
       const args = ['--client-type', 'http', '--host', host, '--port', port];
       args.push('--ssl', ssl ? 'true' : 'false');

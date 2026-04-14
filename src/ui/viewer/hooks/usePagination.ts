@@ -14,7 +14,12 @@ type DataItem = Observation | Summary | UserPrompt;
 /**
  * Generic pagination hook for observations, summaries, and prompts
  */
-function usePaginationFor(endpoint: string, dataType: DataType, currentFilter: string, currentSource: string) {
+function usePaginationFor<T extends DataItem>(
+  endpoint: string,
+  dataType: DataType,
+  currentFilter: string,
+  currentSource: string
+) {
   const [state, setState] = useState<PaginationState>({
     isLoading: false,
     hasMore: true
@@ -29,7 +34,7 @@ function usePaginationFor(endpoint: string, dataType: DataType, currentFilter: s
    * Load more items from the API
    * Automatically resets offset to 0 if filter has changed
    */
-  const loadMore = useCallback(async (): Promise<DataItem[]> => {
+  const loadMore = useCallback(async (): Promise<T[]> => {
     // Check if filter changed - if so, reset pagination synchronously
     const selectionKey = `${currentSource}::${currentFilter}`;
     const filterChanged = lastSelectionRef.current !== selectionKey;
@@ -74,7 +79,7 @@ function usePaginationFor(endpoint: string, dataType: DataType, currentFilter: s
       throw new Error(`Failed to load ${dataType}: ${response.statusText}`);
     }
 
-    const data = await response.json() as { items: DataItem[], hasMore: boolean };
+    const data = await response.json() as { items: T[]; hasMore: boolean };
 
     const nextState = {
       ...stateRef.current,
@@ -105,9 +110,9 @@ function usePaginationFor(endpoint: string, dataType: DataType, currentFilter: s
  * Hook for paginating observations
  */
 export function usePagination(currentFilter: string, currentSource: string) {
-  const observations = usePaginationFor(API_ENDPOINTS.OBSERVATIONS, 'observations', currentFilter, currentSource);
-  const summaries = usePaginationFor(API_ENDPOINTS.SUMMARIES, 'summaries', currentFilter, currentSource);
-  const prompts = usePaginationFor(API_ENDPOINTS.PROMPTS, 'prompts', currentFilter, currentSource);
+  const observations = usePaginationFor<Observation>(API_ENDPOINTS.OBSERVATIONS, 'observations', currentFilter, currentSource);
+  const summaries = usePaginationFor<Summary>(API_ENDPOINTS.SUMMARIES, 'summaries', currentFilter, currentSource);
+  const prompts = usePaginationFor<UserPrompt>(API_ENDPOINTS.PROMPTS, 'prompts', currentFilter, currentSource);
 
   return {
     observations,

@@ -36,13 +36,13 @@ export type VectorQueryResult =
 export function isVectorQueryDisabledResult(
   result: VectorQueryResult
 ): result is VectorQueryDisabledResult {
-  return result.disabled === true;
+  return 'disabled' in result && result.disabled === true;
 }
 
 export function isVectorQueryNotReadyResult(
   result: VectorQueryResult
 ): result is VectorQueryNotReadyResult {
-  return result.notReady === true;
+  return 'notReady' in result && result.notReady === true;
 }
 
 export interface VectorSyncBackend {
