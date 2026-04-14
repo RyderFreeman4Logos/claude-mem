@@ -133,4 +133,95 @@ describe('SearchManager', () => {
     expect(text).toContain('sqlite-vec backend not ready yet.');
     expect(text).not.toContain('No results found');
   });
+
+  it('scopes searchObservations semantic queries to the requested project', async () => {
+    const queryChroma = mock(() => Promise.resolve({
+      ids: [],
+      distances: [],
+      metadatas: []
+    }));
+
+    const manager = new SearchManager(
+      {
+        searchObservations: mock(() => []),
+        searchSessions: mock(() => []),
+        searchUserPrompts: mock(() => []),
+        findByType: mock(() => []),
+        findByConcept: mock(() => []),
+        findByFile: mock(() => ({ observations: [], sessions: [] }))
+      } as any,
+      {
+        getObservationsByIds: mock(() => []),
+        getSessionSummariesByIds: mock(() => []),
+        getUserPromptsByIds: mock(() => [])
+      } as any,
+      { queryChroma } as any,
+      {} as any,
+      {} as any
+    );
+
+    await manager.searchObservations({ query: 'matching', project: 'project-b' });
+
+    expect(queryChroma).toHaveBeenCalledWith(
+      'matching',
+      100,
+      { $and: [{ doc_type: 'observation' }, { project: 'project-b' }] }
+    );
+  });
+
+  it('scopes concept ranking queries to the requested project', async () => {
+    const queryChroma = mock(() => Promise.resolve({
+      notReady: true,
+      message: 'sqlite-vec backend not ready yet.',
+      ids: [],
+      distances: [],
+      metadatas: []
+    }));
+
+    const manager = new SearchManager(
+      {
+        findByConcept: mock(() => [
+          {
+            id: 2,
+            memory_session_id: 'session-456',
+            project: 'project-b',
+            text: 'Vector note',
+            type: 'decision',
+            title: 'Vector note',
+            subtitle: null,
+            facts: '[]',
+            narrative: 'Vector note',
+            concepts: '["vector"]',
+            files_read: '[]',
+            files_modified: '[]',
+            prompt_number: 1,
+            discovery_tokens: 0,
+            created_at: '2025-01-01T12:00:00.000Z',
+            created_at_epoch: Date.now()
+          }
+        ]),
+        searchObservations: mock(() => []),
+        searchSessions: mock(() => []),
+        searchUserPrompts: mock(() => []),
+        findByType: mock(() => []),
+        findByFile: mock(() => ({ observations: [], sessions: [] }))
+      } as any,
+      {
+        getObservationsByIds: mock(() => []),
+        getSessionSummariesByIds: mock(() => []),
+        getUserPromptsByIds: mock(() => [])
+      } as any,
+      { queryChroma } as any,
+      {} as any,
+      {} as any
+    );
+
+    await manager.findByConcept({ concepts: 'vector', project: 'project-b' });
+
+    expect(queryChroma).toHaveBeenCalledWith(
+      ['vector'],
+      1,
+      { $and: [{ doc_type: 'observation' }, { project: 'project-b' }] }
+    );
+  });
 });

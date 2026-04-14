@@ -79,7 +79,13 @@ def configure_logging(level: str) -> None:
 def backup_db(db_path: Path) -> Path:
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     backup_path = db_path.with_name(f"{db_path.name}.sqlite-vec-bak-{timestamp}")
-    shutil.copy2(db_path, backup_path)
+    source = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=30.0)
+    backup = sqlite3.connect(backup_path, timeout=30.0)
+    try:
+        source.backup(backup)
+    finally:
+        backup.close()
+        source.close()
     LOG.info("database backup created at %s", backup_path)
     return backup_path
 
