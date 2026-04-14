@@ -60,3 +60,4 @@ src/agents/
 
 # Local contribution analysis (not part of upstream)
 CONTRIB_NOTES.md
+__pycache__/
