@@ -110,11 +110,9 @@ export class HybridSearchStrategy extends BaseSearchStrategy implements SearchSt
 
       if (isVectorQueryNotReadyResult(chromaResults)) {
         return {
-          results: { observations: [], sessions: [], prompts: [] },
+          results: { observations: metadataResults, sessions: [], prompts: [] },
           usedChroma: false,
-          fellBack: false,
-          vectorBackendNotReady: true,
-          backendNotReadyMessage: chromaResults.message,
+          fellBack: true,
           strategy: 'hybrid'
         };
       }
@@ -198,11 +196,9 @@ export class HybridSearchStrategy extends BaseSearchStrategy implements SearchSt
 
       if (isVectorQueryNotReadyResult(chromaResults)) {
         return {
-          results: { observations: [], sessions: [], prompts: [] },
+          results: { observations: metadataResults, sessions: [], prompts: [] },
           usedChroma: false,
-          fellBack: false,
-          vectorBackendNotReady: true,
-          backendNotReadyMessage: chromaResults.message,
+          fellBack: true,
           strategy: 'hybrid'
         };
       }
@@ -284,7 +280,11 @@ export class HybridSearchStrategy extends BaseSearchStrategy implements SearchSt
       }
 
       if (isVectorQueryNotReadyResult(chromaResults)) {
-        return { observations: [], sessions: [], usedChroma: false };
+        return {
+          observations: metadataResults.observations,
+          sessions,
+          usedChroma: false
+        };
       }
 
       // Step 3: Intersect with ranking

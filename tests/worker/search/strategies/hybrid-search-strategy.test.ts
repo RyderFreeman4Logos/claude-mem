@@ -294,6 +294,22 @@ describe('HybridSearchStrategy', () => {
       expect(result.semanticSearchDisabled).toBe(true);
       expect(result.results.observations).toHaveLength(3);
     });
+
+    it('falls back to metadata-only when the vector backend is not ready', async () => {
+      mockChromaSync.queryChroma = mock(() => Promise.resolve({
+        notReady: true,
+        message: 'sqlite-vec backend not ready yet.',
+        ids: [],
+        distances: [],
+        metadatas: []
+      }));
+
+      const result = await strategy.findByConcept('test-concept', { limit: 10 });
+
+      expect(result.usedChroma).toBe(false);
+      expect(result.fellBack).toBe(true);
+      expect(result.results.observations).toHaveLength(3);
+    });
   });
 
   describe('findByType', () => {
@@ -378,6 +394,22 @@ describe('HybridSearchStrategy', () => {
       expect(result.usedChroma).toBe(false);
       expect(result.fellBack).toBe(true);
       expect(result.semanticSearchDisabled).toBe(true);
+      expect(result.results.observations.length).toBeGreaterThan(0);
+    });
+
+    it('falls back to metadata-only when the vector backend is not ready', async () => {
+      mockChromaSync.queryChroma = mock(() => Promise.resolve({
+        notReady: true,
+        message: 'sqlite-vec backend not ready yet.',
+        ids: [],
+        distances: [],
+        metadatas: []
+      }));
+
+      const result = await strategy.findByType('bugfix', { limit: 10 });
+
+      expect(result.usedChroma).toBe(false);
+      expect(result.fellBack).toBe(true);
       expect(result.results.observations.length).toBeGreaterThan(0);
     });
 
@@ -475,6 +507,22 @@ describe('HybridSearchStrategy', () => {
 
       expect(result.usedChroma).toBe(false);
       expect(result.observations.length).toBeGreaterThan(0);
+      expect(result.sessions).toHaveLength(1);
+    });
+
+    it('falls back to metadata file results when the vector backend is not ready', async () => {
+      mockChromaSync.queryChroma = mock(() => Promise.resolve({
+        notReady: true,
+        message: 'sqlite-vec backend not ready yet.',
+        ids: [],
+        distances: [],
+        metadatas: []
+      }));
+
+      const result = await strategy.findByFile('/path/to/file.ts', { limit: 10 });
+
+      expect(result.usedChroma).toBe(false);
+      expect(result.observations).toHaveLength(2);
       expect(result.sessions).toHaveLength(1);
     });
   });

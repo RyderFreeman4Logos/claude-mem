@@ -248,7 +248,7 @@ describe('SqliteVecSync', () => {
     await sync.close();
   });
 
-  it('does not treat a complete migration row as ready when source rows are still missing vectors', async () => {
+  it('keeps sqlite-vec not-ready when pre-migration rows are still missing vectors after a complete import', async () => {
     spyOn(EmbeddingClient, 'getInstance').mockReturnValue({
       embedDocuments: mock(async (docs: string[]) => docs.map((_doc, index) => makeEmbedding(index + 1))),
       embedQuery: mock(async () => makeEmbedding(1)),
@@ -258,6 +258,7 @@ describe('SqliteVecSync', () => {
     const dbPath = join(tempRoot, 'complete-state-readiness.db');
     const store = new SessionStore(dbPath);
     const now = Date.now();
+    const completionEpoch = now + 1_000;
 
     store.db.prepare(`
       INSERT INTO sdk_sessions (
@@ -335,13 +336,112 @@ describe('SqliteVecSync', () => {
       'complete',
       'chroma-qwen3',
       now,
-      now,
+      completionEpoch,
       null
     );
 
     const result = await sync.queryChroma('source observation', 5, { project: 'test-project' });
     expect(result.notReady).toBe(true);
     expect(result.message).toContain('sqlite-vec backend not ready');
+
+    await sync.close();
+  });
+
+  it('allows post-migration async sync lag without marking the whole backend not-ready', async () => {
+    spyOn(EmbeddingClient, 'getInstance').mockReturnValue({
+      embedDocuments: mock(async (docs: string[]) => docs.map((_doc, index) => makeEmbedding(index + 1))),
+      embedQuery: mock(async () => makeEmbedding(1)),
+      getConfig: () => ({ model: 'test-model', dim: 4096 })
+    } as any);
+
+    const dbPath = join(tempRoot, 'post-migration-lag.db');
+    const store = new SessionStore(dbPath);
+    const completionEpoch = Date.now();
+    const newObservationEpoch = completionEpoch + 5_000;
+
+    store.db.prepare(`
+      INSERT INTO sdk_sessions (
+        content_session_id,
+        memory_session_id,
+        project,
+        platform_source,
+        user_prompt,
+        started_at,
+        started_at_epoch,
+        status
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      'content-1',
+      'memory-1',
+      'test-project',
+      'claude',
+      'test prompt',
+      new Date(newObservationEpoch).toISOString(),
+      newObservationEpoch,
+      'completed'
+    );
+    store.db.prepare(`
+      INSERT INTO observations (
+        id,
+        memory_session_id,
+        project,
+        text,
+        type,
+        title,
+        subtitle,
+        facts,
+        narrative,
+        concepts,
+        files_read,
+        files_modified,
+        prompt_number,
+        discovery_tokens,
+        created_at,
+        created_at_epoch
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      1,
+      'memory-1',
+      'test-project',
+      'new observation',
+      'decision',
+      'Fresh write',
+      null,
+      '[]',
+      'new observation',
+      '[]',
+      '[]',
+      '[]',
+      1,
+      0,
+      new Date(newObservationEpoch).toISOString(),
+      newObservationEpoch
+    );
+    store.close();
+
+    const sync = new SqliteVecSync('test-project', dbPath);
+    await (sync as any).ensureDatabaseReady();
+    (sync as any).db.prepare(`
+      INSERT INTO claude_mem_vec_state (
+        state_key,
+        status,
+        source,
+        started_at_epoch,
+        completed_at_epoch,
+        last_error
+      ) VALUES (?, ?, ?, ?, ?, ?)
+    `).run(
+      'sqlite_vec_readiness',
+      'complete',
+      'chroma-qwen3',
+      completionEpoch - 1_000,
+      completionEpoch,
+      null
+    );
+
+    const result = await sync.queryChroma('new observation', 5, { project: 'test-project' });
+    expect(result.notReady).toBeUndefined();
+    expect(result.ids).toEqual([]);
 
     await sync.close();
   });

@@ -796,14 +796,18 @@ Set CLAUDE_MEM_EMBED_URL in ~/.claude-mem/settings.json (or your environment) an
             return this.buildSemanticSearchDisabledResponse(query);
           }
           if (this.isVectorBackendNotReady(chromaResults)) {
-            return this.buildVectorBackendNotReadyResponse(query, chromaResults.message);
-          }
-          const obsIds = chromaResults.ids;
+            logger.debug('SEARCH', 'Vector backend not ready for decision semantic search, falling back to metadata search', {
+              query,
+              project: filters.project
+            });
+          } else {
+            const obsIds = chromaResults.ids;
 
-          if (obsIds.length > 0) {
-            results = this.sessionStore.getObservationsByIds(obsIds, { ...filters, type: 'decision' });
-            // Preserve Chroma ranking order
-            results.sort((a, b) => obsIds.indexOf(a.id) - obsIds.indexOf(b.id));
+            if (obsIds.length > 0) {
+              results = this.sessionStore.getObservationsByIds(obsIds, { ...filters, type: 'decision' });
+              // Preserve Chroma ranking order
+              results.sort((a, b) => obsIds.indexOf(a.id) - obsIds.indexOf(b.id));
+            }
           }
         } else {
           // No query: get all decisions, rank by "decision" keyword
@@ -821,19 +825,21 @@ Set CLAUDE_MEM_EMBED_URL in ~/.claude-mem/settings.json (or your environment) an
               this.warnSemanticSearchUnavailableOnce('decisions', 'decision', filters.project);
             }
             if (this.isVectorBackendNotReady(chromaResults)) {
-              return this.buildVectorBackendNotReadyResponse('decision', chromaResults.message);
-            }
-
-            const rankedIds: number[] = [];
-            for (const chromaId of chromaResults.ids) {
-              if (ids.includes(chromaId) && !rankedIds.includes(chromaId)) {
-                rankedIds.push(chromaId);
+              logger.debug('SEARCH', 'Vector backend not ready for decision ranking, falling back to metadata search', {
+                project: filters.project
+              });
+            } else {
+              const rankedIds: number[] = [];
+              for (const chromaId of chromaResults.ids) {
+                if (ids.includes(chromaId) && !rankedIds.includes(chromaId)) {
+                  rankedIds.push(chromaId);
+                }
               }
-            }
 
-            if (rankedIds.length > 0) {
-              results = this.sessionStore.getObservationsByIds(rankedIds, { limit: filters.limit || 20 });
-              results.sort((a, b) => rankedIds.indexOf(a.id) - rankedIds.indexOf(b.id));
+              if (rankedIds.length > 0) {
+                results = this.sessionStore.getObservationsByIds(rankedIds, { limit: filters.limit || 20 });
+                results.sort((a, b) => rankedIds.indexOf(a.id) - rankedIds.indexOf(b.id));
+              }
             }
           }
         }
@@ -900,19 +906,21 @@ Set CLAUDE_MEM_EMBED_URL in ~/.claude-mem/settings.json (or your environment) an
             this.warnSemanticSearchUnavailableOnce('changes', 'what changed', filters.project);
           }
           if (this.isVectorBackendNotReady(chromaResults)) {
-            return this.buildVectorBackendNotReadyResponse('what changed', chromaResults.message);
-          }
-
-          const rankedIds: number[] = [];
-          for (const chromaId of chromaResults.ids) {
-            if (idsArray.includes(chromaId) && !rankedIds.includes(chromaId)) {
-              rankedIds.push(chromaId);
+            logger.debug('SEARCH', 'Vector backend not ready for changes ranking, falling back to metadata search', {
+              project: filters.project
+            });
+          } else {
+            const rankedIds: number[] = [];
+            for (const chromaId of chromaResults.ids) {
+              if (idsArray.includes(chromaId) && !rankedIds.includes(chromaId)) {
+                rankedIds.push(chromaId);
+              }
             }
-          }
 
-          if (rankedIds.length > 0) {
-            results = this.sessionStore.getObservationsByIds(rankedIds, { limit: filters.limit || 20 });
-            results.sort((a, b) => rankedIds.indexOf(a.id) - rankedIds.indexOf(b.id));
+            if (rankedIds.length > 0) {
+              results = this.sessionStore.getObservationsByIds(rankedIds, { limit: filters.limit || 20 });
+              results.sort((a, b) => rankedIds.indexOf(a.id) - rankedIds.indexOf(b.id));
+            }
           }
         }
       } catch (chromaError) {
@@ -984,18 +992,21 @@ Set CLAUDE_MEM_EMBED_URL in ~/.claude-mem/settings.json (or your environment) an
           this.warnSemanticSearchUnavailableOnce('how_it_works', 'how it works architecture', filters.project);
         } else {
           if (this.isVectorBackendNotReady(chromaResults)) {
-            return this.buildVectorBackendNotReadyResponse('how it works architecture', chromaResults.message);
-          }
-          const rankedIds: number[] = [];
-          for (const chromaId of chromaResults.ids) {
-            if (ids.includes(chromaId) && !rankedIds.includes(chromaId)) {
-              rankedIds.push(chromaId);
+            logger.debug('SEARCH', 'Vector backend not ready for how-it-works ranking, falling back to metadata search', {
+              project: filters.project
+            });
+          } else {
+            const rankedIds: number[] = [];
+            for (const chromaId of chromaResults.ids) {
+              if (ids.includes(chromaId) && !rankedIds.includes(chromaId)) {
+                rankedIds.push(chromaId);
+              }
             }
-          }
 
-          if (rankedIds.length > 0) {
-            results = this.sessionStore.getObservationsByIds(rankedIds, { limit: filters.limit || 20 });
-            results.sort((a, b) => rankedIds.indexOf(a.id) - rankedIds.indexOf(b.id));
+            if (rankedIds.length > 0) {
+              results = this.sessionStore.getObservationsByIds(rankedIds, { limit: filters.limit || 20 });
+              results.sort((a, b) => rankedIds.indexOf(a.id) - rankedIds.indexOf(b.id));
+            }
           }
         }
       }
@@ -1259,23 +1270,27 @@ Set CLAUDE_MEM_EMBED_URL in ~/.claude-mem/settings.json (or your environment) an
           this.warnSemanticSearchUnavailableOnce('find_by_concept', concept, filters.project);
         } else {
           if (this.isVectorBackendNotReady(chromaResults)) {
-            return this.buildVectorBackendNotReadyResponse(concept, chromaResults.message);
-          }
-          // Intersect: Keep only IDs that passed metadata filter, in semantic rank order
-          const rankedIds: number[] = [];
-          for (const chromaId of chromaResults.ids) {
-            if (ids.includes(chromaId) && !rankedIds.includes(chromaId)) {
-              rankedIds.push(chromaId);
+            logger.debug('SEARCH', 'Vector backend not ready for concept ranking, falling back to metadata search', {
+              concept,
+              project: filters.project
+            });
+          } else {
+            // Intersect: Keep only IDs that passed metadata filter, in semantic rank order
+            const rankedIds: number[] = [];
+            for (const chromaId of chromaResults.ids) {
+              if (ids.includes(chromaId) && !rankedIds.includes(chromaId)) {
+                rankedIds.push(chromaId);
+              }
             }
-          }
 
-          logger.debug('SEARCH', 'Chroma ranked results by semantic relevance', { count: rankedIds.length });
+            logger.debug('SEARCH', 'Chroma ranked results by semantic relevance', { count: rankedIds.length });
 
-          // Step 3: Hydrate in semantic rank order
-          if (rankedIds.length > 0) {
-            results = this.sessionStore.getObservationsByIds(rankedIds, { limit: filters.limit || 20 });
-            // Restore semantic ranking order
-            results.sort((a, b) => rankedIds.indexOf(a.id) - rankedIds.indexOf(b.id));
+            // Step 3: Hydrate in semantic rank order
+            if (rankedIds.length > 0) {
+              results = this.sessionStore.getObservationsByIds(rankedIds, { limit: filters.limit || 20 });
+              // Restore semantic ranking order
+              results.sort((a, b) => rankedIds.indexOf(a.id) - rankedIds.indexOf(b.id));
+            }
           }
         }
       }
@@ -1345,23 +1360,28 @@ Set CLAUDE_MEM_EMBED_URL in ~/.claude-mem/settings.json (or your environment) an
           observations = metadataResults.observations;
         } else {
           if (this.isVectorBackendNotReady(chromaResults)) {
-            return this.buildVectorBackendNotReadyResponse(filePath, chromaResults.message);
-          }
-          // Intersect: Keep only IDs that passed metadata filter, in semantic rank order
-          const rankedIds: number[] = [];
-          for (const chromaId of chromaResults.ids) {
-            if (ids.includes(chromaId) && !rankedIds.includes(chromaId)) {
-              rankedIds.push(chromaId);
+            logger.debug('SEARCH', 'Vector backend not ready for file ranking, falling back to metadata search', {
+              filePath,
+              project: filters.project
+            });
+            observations = metadataResults.observations;
+          } else {
+            // Intersect: Keep only IDs that passed metadata filter, in semantic rank order
+            const rankedIds: number[] = [];
+            for (const chromaId of chromaResults.ids) {
+              if (ids.includes(chromaId) && !rankedIds.includes(chromaId)) {
+                rankedIds.push(chromaId);
+              }
             }
-          }
 
-          logger.debug('SEARCH', 'Chroma ranked observations by semantic relevance', { count: rankedIds.length });
+            logger.debug('SEARCH', 'Chroma ranked observations by semantic relevance', { count: rankedIds.length });
 
-          // Step 3: Hydrate in semantic rank order
-          if (rankedIds.length > 0) {
-            observations = this.sessionStore.getObservationsByIds(rankedIds, { limit: filters.limit || 20 });
-            // Restore semantic ranking order
-            observations.sort((a, b) => rankedIds.indexOf(a.id) - rankedIds.indexOf(b.id));
+            // Step 3: Hydrate in semantic rank order
+            if (rankedIds.length > 0) {
+              observations = this.sessionStore.getObservationsByIds(rankedIds, { limit: filters.limit || 20 });
+              // Restore semantic ranking order
+              observations.sort((a, b) => rankedIds.indexOf(a.id) - rankedIds.indexOf(b.id));
+            }
           }
         }
       }
@@ -1471,23 +1491,27 @@ Set CLAUDE_MEM_EMBED_URL in ~/.claude-mem/settings.json (or your environment) an
           this.warnSemanticSearchUnavailableOnce('find_by_type', typeStr, filters.project);
         } else {
           if (this.isVectorBackendNotReady(chromaResults)) {
-            return this.buildVectorBackendNotReadyResponse(typeStr, chromaResults.message);
-          }
-          // Intersect: Keep only IDs that passed metadata filter, in semantic rank order
-          const rankedIds: number[] = [];
-          for (const chromaId of chromaResults.ids) {
-            if (ids.includes(chromaId) && !rankedIds.includes(chromaId)) {
-              rankedIds.push(chromaId);
+            logger.debug('SEARCH', 'Vector backend not ready for type ranking, falling back to metadata search', {
+              type: typeStr,
+              project: filters.project
+            });
+          } else {
+            // Intersect: Keep only IDs that passed metadata filter, in semantic rank order
+            const rankedIds: number[] = [];
+            for (const chromaId of chromaResults.ids) {
+              if (ids.includes(chromaId) && !rankedIds.includes(chromaId)) {
+                rankedIds.push(chromaId);
+              }
             }
-          }
 
-          logger.debug('SEARCH', 'Chroma ranked results by semantic relevance', { count: rankedIds.length });
+            logger.debug('SEARCH', 'Chroma ranked results by semantic relevance', { count: rankedIds.length });
 
-          // Step 3: Hydrate in semantic rank order
-          if (rankedIds.length > 0) {
-            results = this.sessionStore.getObservationsByIds(rankedIds, { limit: filters.limit || 20 });
-            // Restore semantic ranking order
-            results.sort((a, b) => rankedIds.indexOf(a.id) - rankedIds.indexOf(b.id));
+            // Step 3: Hydrate in semantic rank order
+            if (rankedIds.length > 0) {
+              results = this.sessionStore.getObservationsByIds(rankedIds, { limit: filters.limit || 20 });
+              // Restore semantic ranking order
+              results.sort((a, b) => rankedIds.indexOf(a.id) - rankedIds.indexOf(b.id));
+            }
           }
         }
       }

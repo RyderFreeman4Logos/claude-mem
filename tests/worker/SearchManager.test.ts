@@ -214,7 +214,8 @@ describe('SearchManager', () => {
       metadatas: []
     }));
 
-    const manager = new SearchManager(
+    const manager = buildManager(
+      queryChroma,
       {
         findByConcept: mock(() => [
           {
@@ -235,21 +236,8 @@ describe('SearchManager', () => {
             created_at: '2025-01-01T12:00:00.000Z',
             created_at_epoch: Date.now()
           }
-        ]),
-        searchObservations: mock(() => []),
-        searchSessions: mock(() => []),
-        searchUserPrompts: mock(() => []),
-        findByType: mock(() => []),
-        findByFile: mock(() => ({ observations: [], sessions: [] }))
-      } as any,
-      {
-        getObservationsByIds: mock(() => []),
-        getSessionSummariesByIds: mock(() => []),
-        getUserPromptsByIds: mock(() => [])
-      } as any,
-      { queryChroma } as any,
-      {} as any,
-      {} as any
+        ])
+      }
     );
 
     await manager.findByConcept({ concepts: 'vector', project: 'project-b' });
@@ -259,6 +247,49 @@ describe('SearchManager', () => {
       1,
       { $and: [{ doc_type: 'observation' }, { project: 'project-b' }] }
     );
+  });
+
+  it('falls back to metadata concept results when the vector backend is temporarily not ready', async () => {
+    const queryChroma = mock(() => Promise.resolve({
+      notReady: true,
+      message: 'sqlite-vec backend not ready yet.',
+      ids: [],
+      distances: [],
+      metadatas: []
+    }));
+
+    const manager = buildManager(
+      queryChroma,
+      {
+        findByConcept: mock(() => [
+          {
+            id: 2,
+            memory_session_id: 'session-456',
+            project: 'project-b',
+            text: 'Vector note',
+            type: 'decision',
+            title: 'Vector note',
+            subtitle: null,
+            facts: '[]',
+            narrative: 'Vector note',
+            concepts: '["vector"]',
+            files_read: '[]',
+            files_modified: '[]',
+            prompt_number: 1,
+            discovery_tokens: 0,
+            created_at: '2025-01-01T12:00:00.000Z',
+            created_at_epoch: Date.now()
+          }
+        ])
+      }
+    );
+
+    const result = await manager.findByConcept({ concepts: 'vector', project: 'project-b' });
+    const text = result.content[0].text;
+
+    expect(text).toContain('Found 1 observation(s) with concept "vector"');
+    expect(text).toContain('OBS-0');
+    expect(text).not.toContain('backend not ready');
   });
 
   it('scopes timeline semantic queries to the requested project', async () => {

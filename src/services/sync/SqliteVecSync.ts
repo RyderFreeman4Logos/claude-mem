@@ -793,10 +793,19 @@ export class SqliteVecSync implements VectorSyncBackend {
       return false;
     }
 
-    return !this.hasUnvectorizedSourceRecords(scope);
+    const migrationCutoffEpoch = this.getMigrationCutoffEpoch(state);
+    return !this.hasUnvectorizedSourceRecords(scope, migrationCutoffEpoch);
   }
 
-  private hasUnvectorizedSourceRecords(scope: QueryScope): boolean {
+  private getMigrationCutoffEpoch(state: SqliteVecStateRow | null): number | undefined {
+    if (!state || state.status !== 'complete' || state.completed_at_epoch === null) {
+      return undefined;
+    }
+
+    return state.completed_at_epoch;
+  }
+
+  private hasUnvectorizedSourceRecords(scope: QueryScope, cutoffEpoch?: number): boolean {
     if (!this.hasSourceTables()) {
       return false;
     }
@@ -804,25 +813,29 @@ export class SqliteVecSync implements VectorSyncBackend {
     const { project, docType, observationType } = scope;
 
     if (docType === 'observation') {
-      return this.hasUnvectorizedObservations(project, observationType);
+      return this.hasUnvectorizedObservations(project, observationType, cutoffEpoch);
     }
 
     if (docType === 'session_summary') {
-      return this.hasUnvectorizedSummaries(project);
+      return this.hasUnvectorizedSummaries(project, cutoffEpoch);
     }
 
     if (docType === 'user_prompt') {
-      return this.hasUnvectorizedPrompts(project);
+      return this.hasUnvectorizedPrompts(project, cutoffEpoch);
     }
 
-    return this.hasUnvectorizedObservations(project, observationType)
-      || this.hasUnvectorizedSummaries(project)
-      || this.hasUnvectorizedPrompts(project);
+    return this.hasUnvectorizedObservations(project, observationType, cutoffEpoch)
+      || this.hasUnvectorizedSummaries(project, cutoffEpoch)
+      || this.hasUnvectorizedPrompts(project, cutoffEpoch);
   }
 
-  private hasUnvectorizedObservations(project?: string, observationType?: string): boolean {
+  private hasUnvectorizedObservations(
+    project?: string,
+    observationType?: string,
+    cutoffEpoch?: number
+  ): boolean {
     const conditions: string[] = [];
-    const params: Array<string> = [];
+    const params: Array<string | number> = [];
 
     if (project) {
       conditions.push('o.project = ?');
@@ -832,6 +845,11 @@ export class SqliteVecSync implements VectorSyncBackend {
     if (observationType) {
       conditions.push('o.type = ?');
       params.push(observationType);
+    }
+
+    if (cutoffEpoch !== undefined) {
+      conditions.push('o.created_at_epoch <= ?');
+      params.push(cutoffEpoch);
     }
 
     const whereClause = conditions.length > 0
@@ -857,8 +875,21 @@ export class SqliteVecSync implements VectorSyncBackend {
     return row !== null;
   }
 
-  private hasUnvectorizedSummaries(project?: string): boolean {
-    const whereClause = project ? 'WHERE ss.project = ?' : '';
+  private hasUnvectorizedSummaries(project?: string, cutoffEpoch?: number): boolean {
+    const conditions: string[] = [];
+    const params: Array<string | number> = [];
+
+    if (project) {
+      conditions.push('ss.project = ?');
+      params.push(project);
+    }
+
+    if (cutoffEpoch !== undefined) {
+      conditions.push('ss.created_at_epoch <= ?');
+      params.push(cutoffEpoch);
+    }
+
+    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
     const row = this.db.prepare(
       `
         SELECT 1 AS missing
@@ -874,13 +905,26 @@ export class SqliteVecSync implements VectorSyncBackend {
           )
         LIMIT 1
       `
-    ).get(...(project ? [project] : [])) as { missing: number } | null;
+    ).get(...params) as { missing: number } | null;
 
     return row !== null;
   }
 
-  private hasUnvectorizedPrompts(project?: string): boolean {
-    const whereClause = project ? 'WHERE s.project = ?' : '';
+  private hasUnvectorizedPrompts(project?: string, cutoffEpoch?: number): boolean {
+    const conditions: string[] = [];
+    const params: Array<string | number> = [];
+
+    if (project) {
+      conditions.push('s.project = ?');
+      params.push(project);
+    }
+
+    if (cutoffEpoch !== undefined) {
+      conditions.push('up.created_at_epoch <= ?');
+      params.push(cutoffEpoch);
+    }
+
+    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
     const row = this.db.prepare(
       `
         SELECT 1 AS missing
@@ -897,7 +941,7 @@ export class SqliteVecSync implements VectorSyncBackend {
           )
         LIMIT 1
       `
-    ).get(...(project ? [project] : [])) as { missing: number } | null;
+    ).get(...params) as { missing: number } | null;
 
     return row !== null;
   }
