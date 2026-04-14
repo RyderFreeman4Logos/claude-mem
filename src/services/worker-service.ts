@@ -464,8 +464,12 @@ export class WorkerService {
       // Mark MCP as externally ready once the bundled stdio server binary exists.
       // Codex/Claude Desktop connect to this binary directly; the loopback client
       // below is only a best-effort self-check and should not mark health false.
-      const mcpServerPath = path.join(__dirname, 'mcp-server.cjs');
-      this.mcpReady = existsSync(mcpServerPath);
+      const mcpServerCandidates = [
+        path.join(__dirname, 'mcp-server.cjs'),
+        path.resolve(__dirname, '../../plugin/scripts/mcp-server.cjs'),
+      ];
+      const mcpServerPath = mcpServerCandidates.find(candidate => existsSync(candidate)) ?? mcpServerCandidates[0];
+      this.mcpReady = mcpServerCandidates.some(candidate => existsSync(candidate));
 
       // Best-effort loopback MCP self-check
       getSupervisor().assertCanSpawn('mcp server');
