@@ -29,6 +29,7 @@ import {
   type WorkerRef
 } from './agents/index.js';
 import { isGeminiAvailable } from './GeminiAgent.js';
+import { backfillUnsyncedPrompts } from './utils/promptBackfill.js';
 
 // Context window management constants (defaults, overridable via settings)
 const DEFAULT_MAX_CONTEXT_MESSAGES = 20;  // Maximum messages to keep in conversation history
@@ -176,6 +177,7 @@ export class OpenRouterAgent {
         this.dbManager.getSessionStore().updateMemorySessionId(session.sessionDbId, syntheticMemorySessionId);
         this.sessionManager.syncMemorySessionId(session.sessionDbId, syntheticMemorySessionId);
         logger.info('SESSION', `MEMORY_ID_GENERATED | sessionDbId=${session.sessionDbId} | provider=OpenRouter`);
+        await this.backfillPromptsAfterMemoryCapture(session, syntheticMemorySessionId);
       }
 
       // Load active mode
@@ -446,6 +448,20 @@ export class OpenRouterAgent {
       logger.failure('SDK', 'OpenRouter agent error (no fallback available)', { sessionDbId: session.sessionDbId }, error as Error);
       throw error;
     }
+  }
+
+  private async backfillPromptsAfterMemoryCapture(
+    session: ActiveSession,
+    memorySessionId: string
+  ): Promise<void> {
+    await backfillUnsyncedPrompts(
+      this.dbManager.getSessionStore(),
+      session.contentSessionId,
+      memorySessionId,
+      session.project,
+      this.dbManager.getVectorSync(),
+      logger
+    );
   }
 
   /**

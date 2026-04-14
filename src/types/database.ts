@@ -113,6 +113,7 @@ export interface UserPromptRecord {
   content_session_id: string;
   prompt_number: number;
   prompt_text: string;
+  vector_synced_at?: number | null;
   project?: string;  // From JOIN with sdk_sessions
   memory_session_id?: string | null;
   platform_source?: string;
@@ -126,11 +127,12 @@ export interface UserPromptRecord {
 export interface LatestPromptResult {
   id: number;
   content_session_id: string;
-  memory_session_id: string;
+  memory_session_id: string | null;
   project: string;
   platform_source: string;
   prompt_number: number;
   prompt_text: string;
+  vector_synced_at: number | null;
   created_at_epoch: number;
 }
 

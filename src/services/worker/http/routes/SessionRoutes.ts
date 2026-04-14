@@ -320,7 +320,8 @@ export class SessionRoutes extends BaseRouteHandler {
 
     const session = this.sessionManager.initializeSession(sessionDbId, userPrompt, promptNumber);
 
-    // Get the latest user prompt for this session to sync to the active vector backend
+    // Get the latest user prompt for this session to broadcast to SSE clients.
+    // Vector sync is deferred until the provider has captured a real memory_session_id.
     const latestPrompt = this.dbManager.getSessionStore().getLatestUserPrompt(session.contentSessionId);
 
     // Broadcast new prompt to SSE clients (for web UI)
@@ -335,32 +336,6 @@ export class SessionRoutes extends BaseRouteHandler {
         created_at_epoch: latestPrompt.created_at_epoch
       });
 
-      // Sync user prompt to the selected vector backend
-      const vectorSyncStart = Date.now();
-      const promptText = latestPrompt.prompt_text;
-      this.dbManager.getVectorSync()?.syncUserPrompt(
-        latestPrompt.id,
-        latestPrompt.memory_session_id,
-        latestPrompt.project,
-        promptText,
-        latestPrompt.prompt_number,
-        latestPrompt.created_at_epoch
-      ).then(() => {
-        const vectorSyncDuration = Date.now() - vectorSyncStart;
-        const truncatedPrompt = promptText.length > 60
-          ? promptText.substring(0, 60) + '...'
-          : promptText;
-        logger.debug('CHROMA', 'User prompt synced', {
-          promptId: latestPrompt.id,
-          duration: `${vectorSyncDuration}ms`,
-          prompt: truncatedPrompt
-        });
-      }).catch((error) => {
-        logger.error('CHROMA', 'User prompt vector sync failed, continuing without vector search', {
-          promptId: latestPrompt.id,
-          prompt: promptText.length > 60 ? promptText.substring(0, 60) + '...' : promptText
-        }, error);
-      });
     }
 
     // Idempotent: ensure generator is running (matches handleObservations / handleSummarize)

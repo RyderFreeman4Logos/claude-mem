@@ -116,6 +116,18 @@ describe('MigrationRunner', () => {
       expect(columnNames).toContain('content_hash');
     });
 
+    it('should create user_prompts with vector_synced_at column', () => {
+      const runner = new MigrationRunner(db);
+      runner.runAllMigrations();
+
+      const columns = getColumns(db, 'user_prompts');
+      const vectorSyncedColumn = columns.find(column => column.name === 'vector_synced_at');
+
+      expect(vectorSyncedColumn).toBeDefined();
+      expect(vectorSyncedColumn?.type).toBe('INTEGER');
+      expect(vectorSyncedColumn?.notnull).toBe(0);
+    });
+
     it('should record all migration versions', () => {
       const runner = new MigrationRunner(db);
       runner.runAllMigrations();
@@ -136,6 +148,7 @@ describe('MigrationRunner', () => {
       expect(versions).toContain(20);  // failed_at_epoch
       expect(versions).toContain(21);  // ON UPDATE CASCADE
       expect(versions).toContain(22);  // content_hash
+      expect(versions).toContain(29);  // user_prompts.vector_synced_at
     });
   });
 

@@ -20,10 +20,25 @@ export function saveUserPrompt(
 
   const stmt = db.prepare(`
     INSERT INTO user_prompts
-    (content_session_id, prompt_number, prompt_text, created_at, created_at_epoch)
-    VALUES (?, ?, ?, ?, ?)
+    (content_session_id, prompt_number, prompt_text, vector_synced_at, created_at, created_at_epoch)
+    VALUES (?, ?, ?, NULL, ?, ?)
   `);
 
   const result = stmt.run(contentSessionId, promptNumber, promptText, now.toISOString(), nowEpoch);
   return result.lastInsertRowid as number;
+}
+
+/**
+ * Mark a user prompt as vector-synced.
+ */
+export function markPromptVectorSynced(
+  db: Database,
+  promptId: number,
+  syncedAt: number
+): void {
+  db.prepare(`
+    UPDATE user_prompts
+    SET vector_synced_at = ?
+    WHERE id = ?
+  `).run(syncedAt, promptId);
 }

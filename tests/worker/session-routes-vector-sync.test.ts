@@ -54,7 +54,7 @@ describe('SessionRoutes vector sync routing', () => {
     rmSync(tempRoot, { recursive: true, force: true });
   });
 
-  it('syncs the latest user prompt through the active vector backend', async () => {
+  it('does not sync user prompts during session init before memory session capture', async () => {
     const dbPath = join(tempRoot, 'claude-mem.db');
     const dbManager = new DatabaseManager(dbPath);
     await dbManager.initialize();
@@ -74,13 +74,7 @@ describe('SessionRoutes vector sync routing', () => {
     const vectorSync = dbManager.getVectorSync();
     expect(vectorSync?.backend).toBe('sqlite-vec');
 
-    const pendingSyncs: Promise<void>[] = [];
-    const originalSyncUserPrompt = vectorSync!.syncUserPrompt.bind(vectorSync);
-    spyOn(vectorSync!, 'syncUserPrompt').mockImplementation((...args) => {
-      const promise = originalSyncUserPrompt(...args);
-      pendingSyncs.push(promise);
-      return promise;
-    });
+    const syncSpy = spyOn(vectorSync!, 'syncUserPrompt').mockResolvedValue(undefined);
 
     const routes = new SessionRoutes(
       sessionManager,
@@ -109,15 +103,15 @@ describe('SessionRoutes vector sync routing', () => {
     } as any;
 
     (routes as any).handleSessionInit(req, res);
-    await Promise.all(pendingSyncs);
 
-    const promptChunks = store.db.prepare(`
-      SELECT COUNT(*) AS count
-      FROM claude_mem_vec_chunks
-      WHERE sqlite_id = ? AND doc_type = 'user_prompt' AND project = ?
-    `).get(promptId, 'test-project') as { count: number };
+    const promptSyncState = store.db.prepare(`
+      SELECT vector_synced_at
+      FROM user_prompts
+      WHERE id = ?
+    `).get(promptId) as { vector_synced_at: number | null };
 
-    expect(promptChunks.count).toBeGreaterThan(0);
+    expect(syncSpy).not.toHaveBeenCalled();
+    expect(promptSyncState.vector_synced_at).toBeNull();
     expect(res.json).toHaveBeenCalledWith(expect.objectContaining({
       status: 'initialized',
       sessionDbId,

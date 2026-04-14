@@ -23,6 +23,7 @@ import { ModeManager } from '../domain/ModeManager.js';
 import { processAgentResponse, type WorkerRef } from './agents/index.js';
 import { createPidCapturingSpawn, getProcessBySession, ensureProcessExit, waitForSlot } from './ProcessRegistry.js';
 import { sanitizeEnv } from '../../supervisor/env-sanitizer.js';
+import { backfillUnsyncedPrompts } from './utils/promptBackfill.js';
 
 // Import Agent SDK (assumes it's installed)
 // @ts-ignore - Agent SDK types may not be available
@@ -168,30 +169,7 @@ export class SDKAgent {
         // This ensures FK constraint compliance BEFORE any observations are stored.
         if (message.session_id && message.session_id !== session.memorySessionId) {
           const previousId = session.memorySessionId;
-          session.memorySessionId = message.session_id;
-          this.sessionManager.syncMemorySessionId(session.sessionDbId, message.session_id);
-          // Persist to database IMMEDIATELY for FK constraint compliance
-          // This must happen BEFORE any observations referencing this ID are stored
-          this.dbManager.getSessionStore().ensureMemorySessionIdRegistered(
-            session.sessionDbId,
-            message.session_id
-          );
-          // Verify the update by reading back from DB
-          const verification = this.dbManager.getSessionStore().getSessionById(session.sessionDbId);
-          const dbVerified = verification?.memory_session_id === message.session_id;
-          const logMessage = previousId
-            ? `MEMORY_ID_CHANGED | sessionDbId=${session.sessionDbId} | from=${previousId} | to=${message.session_id} | dbVerified=${dbVerified}`
-            : `MEMORY_ID_CAPTURED | sessionDbId=${session.sessionDbId} | memorySessionId=${message.session_id} | dbVerified=${dbVerified}`;
-          logger.info('SESSION', logMessage, {
-            sessionId: session.sessionDbId,
-            memorySessionId: message.session_id,
-            previousId
-          });
-          if (!dbVerified) {
-            logger.error('SESSION', `MEMORY_ID_MISMATCH | sessionDbId=${session.sessionDbId} | expected=${message.session_id} | got=${verification?.memory_session_id}`, {
-              sessionId: session.sessionDbId
-            });
-          }
+          await this.registerCapturedMemorySessionId(session, message.session_id);
           // Debug-level alignment log for detailed tracing
           logger.debug('SDK', `[ALIGNMENT] ${previousId ? 'Updated' : 'Captured'} | contentSessionId=${session.contentSessionId} → memorySessionId=${message.session_id} | Future prompts will resume with this ID`);
         }
@@ -300,6 +278,45 @@ export class SDKAgent {
       sessionId: session.sessionDbId,
       duration: `${(sessionDuration / 1000).toFixed(1)}s`
     });
+  }
+
+  private async registerCapturedMemorySessionId(
+    session: ActiveSession,
+    memorySessionId: string
+  ): Promise<void> {
+    const previousId = session.memorySessionId;
+    session.memorySessionId = memorySessionId;
+    this.sessionManager.syncMemorySessionId(session.sessionDbId, memorySessionId);
+
+    const sessionStore = this.dbManager.getSessionStore();
+    sessionStore.ensureMemorySessionIdRegistered(session.sessionDbId, memorySessionId);
+
+    const verification = sessionStore.getSessionById(session.sessionDbId);
+    const dbVerified = verification?.memory_session_id === memorySessionId;
+    const logMessage = previousId
+      ? `MEMORY_ID_CHANGED | sessionDbId=${session.sessionDbId} | from=${previousId} | to=${memorySessionId} | dbVerified=${dbVerified}`
+      : `MEMORY_ID_CAPTURED | sessionDbId=${session.sessionDbId} | memorySessionId=${memorySessionId} | dbVerified=${dbVerified}`;
+
+    logger.info('SESSION', logMessage, {
+      sessionId: session.sessionDbId,
+      memorySessionId,
+      previousId
+    });
+
+    if (!dbVerified) {
+      logger.error('SESSION', `MEMORY_ID_MISMATCH | sessionDbId=${session.sessionDbId} | expected=${memorySessionId} | got=${verification?.memory_session_id}`, {
+        sessionId: session.sessionDbId
+      });
+    }
+
+    await backfillUnsyncedPrompts(
+      sessionStore,
+      session.contentSessionId,
+      memorySessionId,
+      session.project,
+      this.dbManager.getVectorSync(),
+      logger
+    );
   }
 
   /**
