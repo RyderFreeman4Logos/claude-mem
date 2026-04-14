@@ -69,17 +69,19 @@ export class MemoryRoutes extends BaseRouteHandler {
     });
 
     // 4. Sync to the active vector backend (async, fire-and-forget)
-    vectorSync?.syncObservation(
-      result.id,
-      memorySessionId,
-      targetProject,
-      observation,
-      0,
-      result.createdAtEpoch,
-      0
-    ).catch(err => {
-      logger.error('VECTOR_BACKEND', 'Vector sync failed for manual observation', { id: result.id }, err as Error);
-    });
+    if (vectorSync) {
+      vectorSync.syncObservation(
+        result.id,
+        memorySessionId,
+        targetProject,
+        observation,
+        0,
+        result.createdAtEpoch,
+        0
+      ).catch(err => {
+        logger.error('VECTOR_BACKEND', 'Vector sync failed for manual observation', { id: result.id }, err as Error);
+      });
+    }
 
     // 5. Return success
     res.json({
