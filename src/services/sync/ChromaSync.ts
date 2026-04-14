@@ -9,11 +9,16 @@
  * The chroma-mcp server handles its own embedding and persistent storage,
  * eliminating the need for chromadb npm package and ONNX/WASM dependencies.
  *
- * Design: Fail-fast with no fallbacks - if Chroma is unavailable, syncing fails.
+ * Design: fail fast for runtime Chroma errors, but treat missing embedding
+ * configuration as an operator-controlled disabled state.
  */
 
 import { ChromaMcpManager } from './ChromaMcpManager.js';
-import { EmbeddingClient } from './EmbeddingClient.js';
+import {
+  EmbeddingClient,
+  isMissingEmbeddingConfigError,
+  MISSING_EMBEDDING_URL_MESSAGE
+} from './EmbeddingClient.js';
 import { ParsedObservation, ParsedSummary } from '../../sdk/parser.js';
 import { SessionStore } from '../sqlite/SessionStore.js';
 import { logger } from '../../utils/logger.js';
@@ -72,6 +77,7 @@ interface StoredUserPrompt {
 }
 
 export class ChromaSync {
+  private static missingEmbeddingConfigWarningLogged = false;
   private project: string;
   private collectionName: string;
   private collectionCreated = false;
@@ -92,14 +98,13 @@ export class ChromaSync {
    * chroma_create_collection is idempotent - safe to call multiple times.
    * Uses collectionCreated flag to avoid redundant calls within a session.
    */
-  private async ensureCollectionExists(): Promise<void> {
+  private async ensureCollectionExists(embedClient?: EmbeddingClient): Promise<void> {
     if (this.collectionCreated) {
       return;
     }
 
     const chromaMcp = ChromaMcpManager.getInstance();
-    const embedClient = EmbeddingClient.getInstance();
-    const embedCfg = embedClient.getConfig();
+    const embedCfg = (embedClient ?? EmbeddingClient.getInstance()).getConfig();
     try {
       await chromaMcp.callTool('cm_ensure_collection', {
         collection_name: this.collectionName,
@@ -120,6 +125,26 @@ export class ChromaSync {
     logger.debug('CHROMA_SYNC', 'Collection ready', {
       collection: this.collectionName
     });
+  }
+
+  private getEmbeddingClientOrSkip(operation: 'sync' | 'query' | 'backfill'): EmbeddingClient | null {
+    try {
+      return EmbeddingClient.getInstance();
+    } catch (error) {
+      if (!isMissingEmbeddingConfigError(error)) {
+        throw error;
+      }
+
+      if (!ChromaSync.missingEmbeddingConfigWarningLogged) {
+        ChromaSync.missingEmbeddingConfigWarningLogged = true;
+        logger.warn('CHROMA_SYNC', 'Skipping Chroma embedding operation because the endpoint is not configured', {
+          project: this.project,
+          operation
+        }, MISSING_EMBEDDING_URL_MESSAGE);
+      }
+
+      return null;
+    }
   }
 
   /**
@@ -266,10 +291,14 @@ export class ChromaSync {
       return;
     }
 
-    await this.ensureCollectionExists();
+    const embedClient = this.getEmbeddingClientOrSkip('sync');
+    if (!embedClient) {
+      return;
+    }
+
+    await this.ensureCollectionExists(embedClient);
 
     const chromaMcp = ChromaMcpManager.getInstance();
-    const embedClient = EmbeddingClient.getInstance();
 
     for (let i = 0; i < documents.length; i += this.BATCH_SIZE) {
       const batch = documents.slice(i, i + this.BATCH_SIZE);
@@ -525,7 +554,12 @@ export class ChromaSync {
     const backfillProject = projectOverride ?? this.project;
     logger.info('CHROMA_SYNC', 'Starting smart backfill', { project: backfillProject });
 
-    await this.ensureCollectionExists();
+    const embedClient = this.getEmbeddingClientOrSkip('backfill');
+    if (!embedClient) {
+      return;
+    }
+
+    await this.ensureCollectionExists(embedClient);
 
     // Fetch existing IDs from Chroma (fast, metadata only)
     const existing = await this.getExistingChromaIds(backfillProject);
@@ -696,11 +730,15 @@ export class ChromaSync {
     limit: number,
     whereFilter?: Record<string, any>
   ): Promise<{ ids: number[]; distances: number[]; metadatas: any[] }> {
-    await this.ensureCollectionExists();
+    const embedClient = this.getEmbeddingClientOrSkip('query');
+    if (!embedClient) {
+      return { ids: [], distances: [], metadatas: [] };
+    }
 
     try {
+      await this.ensureCollectionExists(embedClient);
+
       const chromaMcp = ChromaMcpManager.getInstance();
-      const embedClient = EmbeddingClient.getInstance();
       const queryEmbedding = await embedClient.embedQuery(query);
       const results = await chromaMcp.callTool('cm_query_with_embeddings', {
         collection_name: this.collectionName,

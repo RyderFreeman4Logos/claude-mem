@@ -7,6 +7,8 @@
 #      to pick up observations added during the migration window
 #   3. You have confirmed no other active claude-code sessions depend on the
 #      running worker (user explicitly approves worker restart)
+#   4. migration-qwen3.state.db has zero failed chunks; failed state is now
+#      hard-fatal and must be cleaned up explicitly before retrying cutover
 #
 # What this does:
 #   - Sanity-checks the new chroma-qwen3 dir has full coverage
@@ -14,6 +16,7 @@
 #   - Moves chroma-qwen3 -> chroma (atomic via mv on same filesystem)
 #   - Rebuilds claude-mem plugin (so new ChromaSync.ts code is live)
 #   - Restarts the worker
+#   - Lets the live worker backfill user_prompts asynchronously after cutover
 #
 # Rollback (if anything breaks):
 #   cd ~/.claude-mem
@@ -22,6 +25,8 @@
 #   cd <claude-mem repo> && git checkout main
 #   npm run build-and-sync                            # rebuilds MiniLM-path code
 #   <worker restart procedure>
+# If cutover aborts because chunks are failed, fix or clear migration-qwen3.state.db
+# explicitly before retrying. There is no interactive bypass anymore.
 
 set -euo pipefail
 
@@ -53,10 +58,7 @@ if [[ "${PENDING}" -gt 0 ]]; then
   fatal "migration has ${PENDING} pending chunks -- finish migration first"
 fi
 if [[ "${FAILED}" -gt 0 ]]; then
-  warn "${FAILED} chunks are in failed state. Inspect state DB before continuing:"
-  warn "  sqlite3 ${STATE_DB} 'SELECT chunk_id, last_error FROM chunks WHERE status=\"failed\" LIMIT 20'"
-  read -rp "[cutover] continue anyway? [y/N] " ans
-  [[ "${ans}" == "y" || "${ans}" == "Y" ]] || fatal "aborted"
+  fatal "${FAILED} chunks are in failed state. Inspect and explicitly clean ${STATE_DB} before retrying: sqlite3 ${STATE_DB} 'SELECT chunk_id, last_error FROM chunks WHERE status=\"failed\" LIMIT 20'"
 fi
 
 # ---- Confirm with user ----

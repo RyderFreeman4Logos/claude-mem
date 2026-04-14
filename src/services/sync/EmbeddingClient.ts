@@ -7,8 +7,8 @@
  * us pass different text to the embedder for doc vs query while writing
  * symmetric vectors into Chroma.
  *
- * Defaults target gb10:18002 (Qwen/Qwen3-Embedding-8B, 4096-dim, cosine).
- * Override via CLAUDE_MEM_EMBED_* env/settings.
+ * Operators must configure CLAUDE_MEM_EMBED_URL explicitly.
+ * CLAUDE_MEM_EMBED_MODEL/DIM/QUERY_INSTRUCT remain portable defaults.
  */
 
 import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
@@ -19,6 +19,22 @@ const DEFAULT_QUERY_INSTRUCT =
   'Instruct: Given a short title or user query about software engineering, code, ' +
   'tool usage, or debugging (in Chinese or English), retrieve the detailed ' +
   'description that most closely matches.\nQuery: ';
+
+export const MISSING_EMBEDDING_URL_MESSAGE =
+  'CLAUDE_MEM_EMBED_URL is not configured. Set it in ~/.claude-mem/settings.json ' +
+  '(e.g., http://your-embedding-host:port/v1/embeddings)';
+
+export class MissingEmbeddingConfigError extends Error {
+  constructor() {
+    super(MISSING_EMBEDDING_URL_MESSAGE);
+    this.name = 'MissingEmbeddingConfigError';
+  }
+}
+
+export function isMissingEmbeddingConfigError(error: unknown): error is MissingEmbeddingConfigError {
+  return error instanceof MissingEmbeddingConfigError ||
+    (error instanceof Error && error.message === MISSING_EMBEDDING_URL_MESSAGE);
+}
 
 export interface EmbeddingClientConfig {
   endpoint: string;
@@ -44,8 +60,13 @@ export class EmbeddingClient {
   static getInstance(): EmbeddingClient {
     if (!this.instance) {
       const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
+      const endpoint = settings.CLAUDE_MEM_EMBED_URL?.trim() ?? '';
+      if (endpoint.length === 0) {
+        throw new MissingEmbeddingConfigError();
+      }
+
       const cfg: EmbeddingClientConfig = {
-        endpoint: settings.CLAUDE_MEM_EMBED_URL || 'http://gb10:18002/v1/embeddings',
+        endpoint,
         model: settings.CLAUDE_MEM_EMBED_MODEL || 'Qwen/Qwen3-Embedding-8B',
         dim: parseInt(settings.CLAUDE_MEM_EMBED_DIM || '4096', 10),
         queryInstruct: settings.CLAUDE_MEM_EMBED_QUERY_INSTRUCT || DEFAULT_QUERY_INSTRUCT,

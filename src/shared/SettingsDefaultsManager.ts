@@ -166,8 +166,8 @@ export class SettingsDefaultsManager {
     CLAUDE_MEM_CHROMA_DATABASE: 'default_database',
     // Chroma MCP Server
     CLAUDE_MEM_CHROMA_SERVER_PORT: '37778',
-    // Embedding Service (client-side pre-compute; default: Qwen3-Embedding-8B on gb10)
-    CLAUDE_MEM_EMBED_URL: 'http://gb10:18002/v1/embeddings',
+    // Embedding Service (client-side pre-compute; operator must configure endpoint)
+    CLAUDE_MEM_EMBED_URL: '',
     CLAUDE_MEM_EMBED_MODEL: 'Qwen/Qwen3-Embedding-8B',
     CLAUDE_MEM_EMBED_DIM: '4096',
     CLAUDE_MEM_EMBED_QUERY_INSTRUCT:
