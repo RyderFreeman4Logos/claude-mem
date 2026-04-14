@@ -616,11 +616,14 @@ export class SqliteVecSync implements VectorSyncBackend {
 
     await this.ensureDatabaseReady();
 
+    const allEmbeddings: number[][] = [];
     for (let i = 0; i < documents.length; i += this.batchSize) {
       const batch = documents.slice(i, i + this.batchSize);
       const embeddings = await embedClient.embedDocuments(batch.map((doc) => doc.document));
-      this.upsertBatch(batch, embeddings);
+      allEmbeddings.push(...embeddings);
     }
+
+    this.upsertBatch(documents, allEmbeddings);
   }
 
   private upsertBatch(documents: VectorDocument[], embeddings: number[][]): void {

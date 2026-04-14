@@ -446,6 +446,119 @@ describe('SqliteVecSync', () => {
     await sync.close();
   });
 
+  it('does not commit partial observation chunks when a later embedding batch fails', async () => {
+    const embedDocuments = mock(async (docs: string[]) => {
+      if (docs.length === 20) {
+        return docs.map((_doc, index) => makeEmbedding(index + 1));
+      }
+
+      throw new Error('embedding batch failed');
+    });
+
+    spyOn(EmbeddingClient, 'getInstance').mockReturnValue({
+      embedDocuments,
+      embedQuery: mock(async () => makeEmbedding(1)),
+      getConfig: () => ({ model: 'test-model', dim: 4096 })
+    } as any);
+
+    const dbPath = join(tempRoot, 'partial-observation-sync.db');
+    const store = new SessionStore(dbPath);
+    const now = Date.now();
+
+    store.db.prepare(`
+      INSERT INTO sdk_sessions (
+        content_session_id,
+        memory_session_id,
+        project,
+        platform_source,
+        user_prompt,
+        started_at,
+        started_at_epoch,
+        status
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      'content-1',
+      'memory-1',
+      'test-project',
+      'claude',
+      'test prompt',
+      new Date(now).toISOString(),
+      now,
+      'completed'
+    );
+    store.db.prepare(`
+      INSERT INTO observations (
+        id,
+        memory_session_id,
+        project,
+        text,
+        type,
+        title,
+        subtitle,
+        facts,
+        narrative,
+        concepts,
+        files_read,
+        files_modified,
+        prompt_number,
+        discovery_tokens,
+        created_at,
+        created_at_epoch
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      1,
+      'memory-1',
+      'test-project',
+      null,
+      'decision',
+      'Large observation',
+      null,
+      JSON.stringify(Array.from({ length: 25 }, (_value, index) => `fact-${index}`)),
+      'large narrative',
+      '[]',
+      '[]',
+      '[]',
+      1,
+      0,
+      new Date(now).toISOString(),
+      now
+    );
+    store.close();
+
+    const sync = new SqliteVecSync('test-project', dbPath);
+
+    await expect(sync.syncObservation(
+      1,
+      'memory-1',
+      'test-project',
+      {
+        type: 'decision',
+        title: 'Large observation',
+        subtitle: null,
+        facts: Array.from({ length: 25 }, (_value, index) => `fact-${index}`),
+        narrative: 'large narrative',
+        concepts: [],
+        files_read: [],
+        files_modified: []
+      },
+      1,
+      now
+    )).rejects.toThrow('embedding batch failed');
+
+    await (sync as any).ensureDatabaseReady();
+    const chunkCount = (sync as any).db.prepare(`
+      SELECT COUNT(*) AS count
+      FROM claude_mem_vec_chunks
+      WHERE sqlite_id = ? AND doc_type = 'observation' AND project = ?
+    `).get(1, 'test-project') as { count: number };
+    expect(chunkCount.count).toBe(0);
+
+    const result = await sync.queryChroma('large narrative', 5, { project: 'test-project' });
+    expect(result.notReady).toBe(true);
+
+    await sync.close();
+  });
+
   it('uses the configured embedding dimension for sqlite-vec tables', async () => {
     (SettingsDefaultsManager.loadFromFile as any).mockReturnValue({
       CLAUDE_MEM_EMBED_DIM: '8'

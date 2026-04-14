@@ -51,32 +51,14 @@ CLAUDE_MEM_WORKER_PORT="${WORKER_PORT}" \
 CLAUDE_MEM_DATA_DIR="$(dirname "${DB_PATH}")" \
 CLAUDE_MEM_DB_PATH="${DB_PATH}" bun plugin/scripts/worker-service.cjs start >/dev/null || true
 
-CLAUDE_MEM_WORKER_PORT="${WORKER_PORT}" bun -e '
-  const workerPort = process.env.CLAUDE_MEM_WORKER_PORT;
-  if (!workerPort) throw new Error("CLAUDE_MEM_WORKER_PORT is required");
-
-  const url = `http://127.0.0.1:${workerPort}/api/search?query=${encodeURIComponent("rollback smoke")}&format=json`;
-  let response;
-  for (let attempt = 0; attempt < 60; attempt += 1) {
-    try {
-      response = await fetch(url);
-      if (response.ok) break;
-    } catch {}
-    await new Promise(resolve => setTimeout(resolve, 500));
-  }
-
-  if (!response?.ok) {
-    throw new Error(`rollback search api failed: ${response?.status ?? "unreachable"}`);
-  }
-
-  await response.json();
-'
-
-CLAUDE_MEM_DB_PATH="${DB_PATH}" bun -e '
+CLAUDE_MEM_DB_PATH="${DB_PATH}" \
+CLAUDE_MEM_PROJECT_NAME="${PROJECT_NAME}" bun -e '
   import { Database } from "bun:sqlite";
 
   const dbPath = process.env.CLAUDE_MEM_DB_PATH;
+  const project = process.env.CLAUDE_MEM_PROJECT_NAME;
   if (!dbPath) throw new Error("CLAUDE_MEM_DB_PATH is required");
+  if (!project) throw new Error("CLAUDE_MEM_PROJECT_NAME is required");
 
   const db = new Database(dbPath);
   db.run("PRAGMA journal_mode = WAL");
@@ -104,7 +86,7 @@ CLAUDE_MEM_DB_PATH="${DB_PATH}" bun -e '
       `).run(
         contentSessionId,
         memorySessionId,
-        "claude-mem",
+        project,
         "claude",
         "rollback smoke",
         iso,
@@ -123,7 +105,7 @@ CLAUDE_MEM_DB_PATH="${DB_PATH}" bun -e '
         ) VALUES (?, ?, ?, ?, ?, ?)
       `).run(
         memorySessionId,
-        "claude-mem",
+        project,
         "rollback smoke observation",
         "decision",
         iso,
@@ -144,6 +126,46 @@ CLAUDE_MEM_DB_PATH="${DB_PATH}" bun -e '
 
   db.close();
   throw lastError;
+'
+
+CLAUDE_MEM_WORKER_PORT="${WORKER_PORT}" \
+CLAUDE_MEM_PROJECT_NAME="${PROJECT_NAME}" bun -e '
+  const workerPort = process.env.CLAUDE_MEM_WORKER_PORT;
+  const project = process.env.CLAUDE_MEM_PROJECT_NAME;
+  if (!workerPort) throw new Error("CLAUDE_MEM_WORKER_PORT is required");
+  if (!project) throw new Error("CLAUDE_MEM_PROJECT_NAME is required");
+
+  const params = new URLSearchParams({
+    type: "decision",
+    project,
+    format: "json"
+  });
+  const url = `http://127.0.0.1:${workerPort}/api/search?${params.toString()}`;
+  let response;
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    try {
+      response = await fetch(url);
+      if (response.ok) break;
+    } catch {}
+    await new Promise(resolve => setTimeout(resolve, 500));
+  }
+
+  if (!response?.ok) {
+    throw new Error(`rollback search api failed: ${response?.status ?? "unreachable"}`);
+  }
+
+  const payload = await response.json();
+  if (payload.semanticSearchDisabled || payload.vectorBackendNotReady) {
+    throw new Error(`rollback search returned unavailable backend state: ${JSON.stringify(payload)}`);
+  }
+
+  const matched = Array.isArray(payload.observations)
+    && payload.observations.some((obs) =>
+      typeof obs?.text === "string" && obs.text.includes("rollback smoke observation"));
+
+  if (!matched) {
+    throw new Error(`rollback search did not return the smoke observation: ${JSON.stringify(payload)}`);
+  }
 '
 
 CLAUDE_MEM_WORKER_PORT="${WORKER_PORT}" bun plugin/scripts/worker-service.cjs stop >/dev/null
