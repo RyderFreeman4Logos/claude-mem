@@ -126,4 +126,62 @@ describe('SessionRoutes vector sync routing', () => {
 
     await dbManager.close();
   });
+
+  it('skips prompt sync during init until memory session id exists', async () => {
+    const dbPath = join(tempRoot, 'claude-mem-no-memory-id.db');
+    const dbManager = new DatabaseManager(dbPath);
+    await dbManager.initialize();
+
+    const store = dbManager.getSessionStore();
+    const sessionDbId = store.createSDKSession(
+      'content-session-2',
+      'test-project',
+      'Investigate prompt routing',
+      undefined,
+      'claude'
+    );
+    store.saveUserPrompt('content-session-2', 1, 'Investigate prompt routing');
+
+    const sessionManager = new SessionManager(dbManager);
+    const vectorSync = dbManager.getVectorSync();
+    const syncUserPrompt = mock(() => Promise.resolve());
+    spyOn(vectorSync!, 'syncUserPrompt').mockImplementation(syncUserPrompt);
+
+    const routes = new SessionRoutes(
+      sessionManager,
+      dbManager,
+      {} as any,
+      {} as any,
+      {} as any,
+      {
+        broadcastNewPrompt: mock(() => {}),
+        broadcastSessionStarted: mock(() => {}),
+      } as any,
+      {
+        notifyGlobalMessagePool: mock(() => {}),
+      } as any
+    );
+
+    const req = {
+      params: { sessionDbId: String(sessionDbId) },
+      body: { userPrompt: 'Investigate prompt routing', promptNumber: 1 },
+      path: `/sessions/${sessionDbId}/init`
+    } as any;
+    const res = {
+      headersSent: false,
+      status: mock(function status() { return res; }),
+      json: mock(() => res)
+    } as any;
+
+    await (routes as any).handleSessionInit(req, res);
+
+    expect(syncUserPrompt).not.toHaveBeenCalled();
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({
+      status: 'initialized',
+      sessionDbId,
+      port: 37777
+    }));
+
+    await dbManager.close();
+  });
 });

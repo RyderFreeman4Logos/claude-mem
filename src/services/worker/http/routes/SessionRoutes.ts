@@ -335,32 +335,41 @@ export class SessionRoutes extends BaseRouteHandler {
         created_at_epoch: latestPrompt.created_at_epoch
       });
 
-      // Sync user prompt to the selected vector backend
-      const vectorSyncStart = Date.now();
       const promptText = latestPrompt.prompt_text;
-      this.dbManager.getVectorSync()?.syncUserPrompt(
-        latestPrompt.id,
-        latestPrompt.memory_session_id,
-        latestPrompt.project,
-        promptText,
-        latestPrompt.prompt_number,
-        latestPrompt.created_at_epoch
-      ).then(() => {
-        const vectorSyncDuration = Date.now() - vectorSyncStart;
-        const truncatedPrompt = promptText.length > 60
-          ? promptText.substring(0, 60) + '...'
-          : promptText;
-        logger.debug('CHROMA', 'User prompt synced', {
+
+      if (!latestPrompt.memory_session_id) {
+        logger.debug('CHROMA', 'Skipping prompt sync until memory session id is available', {
           promptId: latestPrompt.id,
-          duration: `${vectorSyncDuration}ms`,
-          prompt: truncatedPrompt
+          contentSessionId: latestPrompt.content_session_id,
+          promptNumber: latestPrompt.prompt_number
         });
-      }).catch((error) => {
-        logger.error('CHROMA', 'User prompt vector sync failed, continuing without vector search', {
-          promptId: latestPrompt.id,
-          prompt: promptText.length > 60 ? promptText.substring(0, 60) + '...' : promptText
-        }, error);
-      });
+      } else {
+        // Sync user prompt to the selected vector backend
+        const vectorSyncStart = Date.now();
+        this.dbManager.getVectorSync()?.syncUserPrompt(
+          latestPrompt.id,
+          latestPrompt.memory_session_id,
+          latestPrompt.project,
+          promptText,
+          latestPrompt.prompt_number,
+          latestPrompt.created_at_epoch
+        ).then(() => {
+          const vectorSyncDuration = Date.now() - vectorSyncStart;
+          const truncatedPrompt = promptText.length > 60
+            ? promptText.substring(0, 60) + '...'
+            : promptText;
+          logger.debug('CHROMA', 'User prompt synced', {
+            promptId: latestPrompt.id,
+            duration: `${vectorSyncDuration}ms`,
+            prompt: truncatedPrompt
+          });
+        }).catch((error) => {
+          logger.error('CHROMA', 'User prompt vector sync failed, continuing without vector search', {
+            promptId: latestPrompt.id,
+            prompt: promptText.length > 60 ? promptText.substring(0, 60) + '...' : promptText
+          }, error);
+        });
+      }
     }
 
     // Idempotent: ensure generator is running (matches handleObservations / handleSummarize)

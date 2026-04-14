@@ -187,6 +187,9 @@ export class SDKAgent {
             memorySessionId: message.session_id,
             previousId
           });
+          if (!previousId) {
+            await this.syncLatestPromptAfterMemoryCapture(session.contentSessionId, message.session_id);
+          }
           if (!dbVerified) {
             logger.error('SESSION', `MEMORY_ID_MISMATCH | sessionDbId=${session.sessionDbId} | expected=${message.session_id} | got=${verification?.memory_session_id}`, {
               sessionId: session.sessionDbId
@@ -450,6 +453,40 @@ export class SDKAgent {
           isSynthetic: true
         };
       }
+    }
+  }
+
+  private async syncLatestPromptAfterMemoryCapture(
+    contentSessionId: string,
+    memorySessionId: string
+  ): Promise<void> {
+    const latestPrompt = this.dbManager.getSessionStore().getLatestUserPrompt(contentSessionId);
+    const vectorSync = this.dbManager.getVectorSync();
+
+    if (!latestPrompt || !vectorSync) {
+      return;
+    }
+
+    try {
+      await vectorSync.syncUserPrompt(
+        latestPrompt.id,
+        memorySessionId,
+        latestPrompt.project,
+        latestPrompt.prompt_text,
+        latestPrompt.prompt_number,
+        latestPrompt.created_at_epoch
+      );
+      logger.debug('CHROMA', 'Backfilled initial user prompt after memory id capture', {
+        promptId: latestPrompt.id,
+        contentSessionId,
+        promptNumber: latestPrompt.prompt_number
+      });
+    } catch (error) {
+      logger.error('CHROMA', 'Failed to backfill initial user prompt after memory id capture', {
+        promptId: latestPrompt.id,
+        contentSessionId,
+        promptNumber: latestPrompt.prompt_number
+      }, error as Error);
     }
   }
 
