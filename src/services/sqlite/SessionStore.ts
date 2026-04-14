@@ -62,6 +62,7 @@ export class SessionStore {
     this.addObservationHierarchicalFields();
     this.makeObservationsTextNullable();
     this.createUserPromptsTable();
+    this.addUserPromptVectorSyncedAtColumn();
     this.ensureDiscoveryTokensColumn();
     this.createPendingMessagesTable();
     this.addPendingMessagePriorityColumn();
@@ -440,6 +441,7 @@ export class SessionStore {
         content_session_id TEXT NOT NULL,
         prompt_number INTEGER NOT NULL,
         prompt_text TEXT NOT NULL,
+        vector_synced_at INTEGER,
         created_at TEXT NOT NULL,
         created_at_epoch INTEGER NOT NULL,
         FOREIGN KEY(content_session_id) REFERENCES sdk_sessions(content_session_id) ON DELETE CASCADE
@@ -492,6 +494,24 @@ export class SessionStore {
     this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(10, new Date().toISOString());
 
     logger.debug('DB', 'Successfully created user_prompts table');
+  }
+
+  /**
+   * Add vector_synced_at column to user_prompts for prompt-level backfill tracking (migration 29)
+   */
+  private addUserPromptVectorSyncedAtColumn(): void {
+    const tableInfo = this.db.query('PRAGMA table_info(user_prompts)').all() as TableColumnInfo[];
+    const hasColumn = tableInfo.some(col => col.name === 'vector_synced_at');
+    const applied = this.db.prepare('SELECT version FROM schema_versions WHERE version = ?').get(29) as SchemaVersion | undefined;
+
+    if (applied && hasColumn) return;
+
+    if (!hasColumn) {
+      this.db.run('ALTER TABLE user_prompts ADD COLUMN vector_synced_at INTEGER');
+      logger.debug('DB', 'Added vector_synced_at column to user_prompts table');
+    }
+
+    this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(29, new Date().toISOString());
   }
 
   /**
@@ -1297,11 +1317,12 @@ export class SessionStore {
   getLatestUserPrompt(contentSessionId: string): {
     id: number;
     content_session_id: string;
-    memory_session_id: string;
+    memory_session_id: string | null;
     project: string;
     platform_source: string;
     prompt_number: number;
     prompt_text: string;
+    vector_synced_at: number | null;
     created_at_epoch: number;
   } | undefined {
     const stmt = this.db.prepare(`
@@ -1318,6 +1339,28 @@ export class SessionStore {
     `);
 
     return stmt.get(contentSessionId) as LatestPromptResult | undefined;
+  }
+
+  /**
+   * Get all un-synced prompts for a content session in insertion order.
+   */
+  getUnsyncedUserPromptsByContentSessionId(contentSessionId: string): UserPromptRecord[] {
+    const stmt = this.db.prepare(`
+      SELECT
+        id,
+        content_session_id,
+        prompt_number,
+        prompt_text,
+        vector_synced_at,
+        created_at,
+        created_at_epoch
+      FROM user_prompts
+      WHERE content_session_id = ?
+        AND vector_synced_at IS NULL
+      ORDER BY id ASC
+    `);
+
+    return stmt.all(contentSessionId) as UserPromptRecord[];
   }
 
   /**
@@ -1745,12 +1788,23 @@ export class SessionStore {
 
     const stmt = this.db.prepare(`
       INSERT INTO user_prompts
-      (content_session_id, prompt_number, prompt_text, created_at, created_at_epoch)
-      VALUES (?, ?, ?, ?, ?)
+      (content_session_id, prompt_number, prompt_text, vector_synced_at, created_at, created_at_epoch)
+      VALUES (?, ?, ?, NULL, ?, ?)
     `);
 
     const result = stmt.run(contentSessionId, promptNumber, promptText, now.toISOString(), nowEpoch);
     return result.lastInsertRowid as number;
+  }
+
+  /**
+   * Mark a prompt as successfully synced to the vector backend.
+   */
+  markPromptVectorSynced(promptId: number, syncedAt: number): void {
+    this.db.prepare(`
+      UPDATE user_prompts
+      SET vector_synced_at = ?
+      WHERE id = ?
+    `).run(syncedAt, promptId);
   }
 
   /**

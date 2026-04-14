@@ -26,7 +26,18 @@ export interface PromptWithProject {
   content_session_id: string;
   prompt_number: number;
   prompt_text: string;
+  vector_synced_at: number | null;
   project: string;
+  created_at: string;
+  created_at_epoch: number;
+}
+
+export interface UnsyncedPromptResult {
+  id: number;
+  content_session_id: string;
+  prompt_number: number;
+  prompt_text: string;
+  vector_synced_at: number | null;
   created_at: string;
   created_at_epoch: number;
 }

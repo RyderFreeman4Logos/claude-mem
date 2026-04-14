@@ -28,6 +28,7 @@ import {
   type WorkerRef,
   type FallbackAgent
 } from './agents/index.js';
+import { backfillUnsyncedPrompts } from './utils/promptBackfill.js';
 
 // Gemini API endpoint — use v1beta for preview models.
 // gemini-3-flash-preview is only available on v1beta, not v1.
@@ -144,6 +145,7 @@ export class GeminiAgent {
         this.dbManager.getSessionStore().updateMemorySessionId(session.sessionDbId, syntheticMemorySessionId);
         this.sessionManager.syncMemorySessionId(session.sessionDbId, syntheticMemorySessionId);
         logger.info('SESSION', `MEMORY_ID_GENERATED | sessionDbId=${session.sessionDbId} | provider=Gemini`);
+        await this.backfillPromptsAfterMemoryCapture(session, syntheticMemorySessionId);
       }
 
       // Load active mode
@@ -378,6 +380,20 @@ export class GeminiAgent {
       logger.failure('SDK', 'Gemini agent error', { sessionDbId: session.sessionDbId }, error as Error);
       throw error;
     }
+  }
+
+  private async backfillPromptsAfterMemoryCapture(
+    session: ActiveSession,
+    memorySessionId: string
+  ): Promise<void> {
+    await backfillUnsyncedPrompts(
+      this.dbManager.getSessionStore(),
+      session.contentSessionId,
+      memorySessionId,
+      session.project,
+      this.dbManager.getVectorSync(),
+      logger
+    );
   }
 
   /**

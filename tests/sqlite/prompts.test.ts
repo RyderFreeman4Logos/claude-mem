@@ -13,6 +13,8 @@ import { ClaudeMemDatabase } from '../../src/services/sqlite/Database.js';
 import {
   saveUserPrompt,
   getPromptNumberFromUserPrompts,
+  getUnsyncedUserPromptsByContentSessionId,
+  markPromptVectorSynced,
 } from '../../src/services/sqlite/Prompts.js';
 import { createSDKSession } from '../../src/services/sqlite/Sessions.js';
 import type { Database } from 'bun:sqlite';
@@ -124,6 +126,48 @@ describe('Prompts Module', () => {
       }
 
       expect(getPromptNumberFromUserPrompts(db, contentSessionId)).toBe(100);
+    });
+  });
+
+  describe('getUnsyncedUserPromptsByContentSessionId', () => {
+    it('should return un-synced prompts in id order, not latest-only', () => {
+      const contentSessionId = createSession('unsynced-prompts-session');
+      const prompt1Id = saveUserPrompt(db, contentSessionId, 1, 'First prompt');
+      const prompt2Id = saveUserPrompt(db, contentSessionId, 2, 'Second prompt');
+      const prompt3Id = saveUserPrompt(db, contentSessionId, 3, 'Third prompt');
+
+      markPromptVectorSynced(db, prompt2Id, Date.now());
+
+      const prompts = getUnsyncedUserPromptsByContentSessionId(db, contentSessionId);
+
+      expect(prompts.map(prompt => prompt.id)).toEqual([prompt1Id, prompt3Id]);
+      expect(prompts.map(prompt => prompt.prompt_number)).toEqual([1, 3]);
+      expect(prompts.every(prompt => prompt.vector_synced_at === null)).toBe(true);
+    });
+  });
+
+  describe('markPromptVectorSynced', () => {
+    it('should update vector_synced_at for the targeted prompt only', () => {
+      const contentSessionId = createSession('mark-prompt-synced-session');
+      const promptId = saveUserPrompt(db, contentSessionId, 1, 'Sync me');
+      const otherPromptId = saveUserPrompt(db, contentSessionId, 2, 'Leave me pending');
+      const syncedAt = Date.now();
+
+      markPromptVectorSynced(db, promptId, syncedAt);
+
+      const syncedPrompt = db.prepare(`
+        SELECT vector_synced_at
+        FROM user_prompts
+        WHERE id = ?
+      `).get(promptId) as { vector_synced_at: number | null };
+      const pendingPrompt = db.prepare(`
+        SELECT vector_synced_at
+        FROM user_prompts
+        WHERE id = ?
+      `).get(otherPromptId) as { vector_synced_at: number | null };
+
+      expect(syncedPrompt.vector_synced_at).toBe(syncedAt);
+      expect(pendingPrompt.vector_synced_at).toBeNull();
     });
   });
 });

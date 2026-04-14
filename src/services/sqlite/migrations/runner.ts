@@ -31,6 +31,7 @@ export class MigrationRunner {
     this.addObservationHierarchicalFields();
     this.makeObservationsTextNullable();
     this.createUserPromptsTable();
+    this.addUserPromptVectorSyncedAtColumn();
     this.ensureDiscoveryTokensColumn();
     this.createPendingMessagesTable();
     this.renameSessionIdColumns();
@@ -411,6 +412,7 @@ export class MigrationRunner {
         content_session_id TEXT NOT NULL,
         prompt_number INTEGER NOT NULL,
         prompt_text TEXT NOT NULL,
+        vector_synced_at INTEGER,
         created_at TEXT NOT NULL,
         created_at_epoch INTEGER NOT NULL,
         FOREIGN KEY(content_session_id) REFERENCES sdk_sessions(content_session_id) ON DELETE CASCADE
@@ -463,6 +465,24 @@ export class MigrationRunner {
     this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(10, new Date().toISOString());
 
     logger.debug('DB', 'Successfully created user_prompts table');
+  }
+
+  /**
+   * Add vector_synced_at column to user_prompts for prompt-level backfill tracking (migration 29)
+   */
+  private addUserPromptVectorSyncedAtColumn(): void {
+    const tableInfo = this.db.query('PRAGMA table_info(user_prompts)').all() as TableColumnInfo[];
+    const hasColumn = tableInfo.some(col => col.name === 'vector_synced_at');
+    const applied = this.db.prepare('SELECT version FROM schema_versions WHERE version = ?').get(29) as SchemaVersion | undefined;
+
+    if (applied && hasColumn) return;
+
+    if (!hasColumn) {
+      this.db.run('ALTER TABLE user_prompts ADD COLUMN vector_synced_at INTEGER');
+      logger.debug('DB', 'Added vector_synced_at column to user_prompts table');
+    }
+
+    this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(29, new Date().toISOString());
   }
 
   /**

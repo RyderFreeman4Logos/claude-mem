@@ -5,7 +5,12 @@
 import type { Database } from 'bun:sqlite';
 import { logger } from '../../../utils/logger.js';
 import type { UserPromptRecord, LatestPromptResult } from '../../../types/database.js';
-import type { RecentUserPromptResult, PromptWithProject, GetPromptsByIdsOptions } from './types.js';
+import type {
+  RecentUserPromptResult,
+  PromptWithProject,
+  GetPromptsByIdsOptions,
+  UnsyncedPromptResult
+} from './types.js';
 
 /**
  * Get user prompt by session ID and prompt number
@@ -96,6 +101,7 @@ export function getPromptById(db: Database, id: number): PromptWithProject | nul
       p.content_session_id,
       p.prompt_number,
       p.prompt_text,
+      p.vector_synced_at,
       s.project,
       p.created_at,
       p.created_at_epoch
@@ -121,6 +127,7 @@ export function getPromptsByIds(db: Database, ids: number[]): PromptWithProject[
       p.content_session_id,
       p.prompt_number,
       p.prompt_text,
+      p.vector_synced_at,
       s.project,
       p.created_at,
       p.created_at_epoch
@@ -131,6 +138,31 @@ export function getPromptsByIds(db: Database, ids: number[]): PromptWithProject[
   `);
 
   return stmt.all(...ids) as PromptWithProject[];
+}
+
+/**
+ * Get un-synced user prompts for a session in stable insertion order.
+ */
+export function getUnsyncedUserPromptsByContentSessionId(
+  db: Database,
+  contentSessionId: string
+): UnsyncedPromptResult[] {
+  const stmt = db.prepare(`
+    SELECT
+      id,
+      content_session_id,
+      prompt_number,
+      prompt_text,
+      vector_synced_at,
+      created_at,
+      created_at_epoch
+    FROM user_prompts
+    WHERE content_session_id = ?
+      AND vector_synced_at IS NULL
+    ORDER BY id ASC
+  `);
+
+  return stmt.all(contentSessionId) as UnsyncedPromptResult[];
 }
 
 /**
