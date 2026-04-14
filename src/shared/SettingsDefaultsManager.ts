@@ -80,6 +80,12 @@ export interface SettingsDefaults {
   CLAUDE_MEM_CHROMA_DATABASE: string;
   // Chroma MCP Server
   CLAUDE_MEM_CHROMA_SERVER_PORT: string;
+  // Embedding Service (client-side pre-compute)
+  CLAUDE_MEM_EMBED_URL: string;
+  CLAUDE_MEM_EMBED_MODEL: string;
+  CLAUDE_MEM_EMBED_DIM: string;
+  CLAUDE_MEM_EMBED_QUERY_INSTRUCT: string;
+  CLAUDE_MEM_EMBED_TIMEOUT_MS: string;
 }
 
 export class SettingsDefaultsManager {
@@ -160,6 +166,15 @@ export class SettingsDefaultsManager {
     CLAUDE_MEM_CHROMA_DATABASE: 'default_database',
     // Chroma MCP Server
     CLAUDE_MEM_CHROMA_SERVER_PORT: '37778',
+    // Embedding Service (client-side pre-compute; default: Qwen3-Embedding-8B on gb10)
+    CLAUDE_MEM_EMBED_URL: 'http://gb10:18002/v1/embeddings',
+    CLAUDE_MEM_EMBED_MODEL: 'Qwen/Qwen3-Embedding-8B',
+    CLAUDE_MEM_EMBED_DIM: '4096',
+    CLAUDE_MEM_EMBED_QUERY_INSTRUCT:
+      'Instruct: Given a short title or user query about software engineering, code, ' +
+      'tool usage, or debugging (in Chinese or English), retrieve the detailed ' +
+      'description that most closely matches.\nQuery: ',
+    CLAUDE_MEM_EMBED_TIMEOUT_MS: '120000',
   };
 
   /**

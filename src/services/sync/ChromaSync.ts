@@ -13,6 +13,7 @@
  */
 
 import { ChromaMcpManager } from './ChromaMcpManager.js';
+import { EmbeddingClient } from './EmbeddingClient.js';
 import { ParsedObservation, ParsedSummary } from '../../sdk/parser.js';
 import { SessionStore } from '../sqlite/SessionStore.js';
 import { logger } from '../../utils/logger.js';
@@ -97,9 +98,14 @@ export class ChromaSync {
     }
 
     const chromaMcp = ChromaMcpManager.getInstance();
+    const embedClient = EmbeddingClient.getInstance();
+    const embedCfg = embedClient.getConfig();
     try {
-      await chromaMcp.callTool('chroma_create_collection', {
-        collection_name: this.collectionName
+      await chromaMcp.callTool('cm_ensure_collection', {
+        collection_name: this.collectionName,
+        hnsw_space: 'cosine',
+        embedding_model: embedCfg.model,
+        embedding_dim: embedCfg.dim,
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -263,13 +269,11 @@ export class ChromaSync {
     await this.ensureCollectionExists();
 
     const chromaMcp = ChromaMcpManager.getInstance();
+    const embedClient = EmbeddingClient.getInstance();
 
-    // Add in batches
     for (let i = 0; i < documents.length; i += this.BATCH_SIZE) {
       const batch = documents.slice(i, i + this.BATCH_SIZE);
 
-      // Sanitize metadata: filter out null, undefined, and empty string values
-      // that chroma-mcp may reject (e.g., null subtitle from raw SQLite rows)
       const cleanMetadatas = batch.map(d =>
         Object.fromEntries(
           Object.entries(d.metadata).filter(([_, v]) => v !== null && v !== undefined && v !== '')
@@ -277,49 +281,24 @@ export class ChromaSync {
       );
 
       try {
-        await chromaMcp.callTool('chroma_add_documents', {
+        const embeddings = await embedClient.embedDocuments(batch.map(d => d.document));
+        await chromaMcp.callTool('cm_upsert_with_embeddings', {
           collection_name: this.collectionName,
           ids: batch.map(d => d.id),
           documents: batch.map(d => d.document),
-          metadatas: cleanMetadatas
+          embeddings,
+          metadatas: cleanMetadatas,
         });
       } catch (error) {
-        const errMsg = error instanceof Error ? error.message : String(error);
-        if (errMsg.includes('already exist')) {
-          try {
-            await chromaMcp.callTool('chroma_delete_documents', {
-              collection_name: this.collectionName,
-              ids: batch.map(d => d.id)
-            });
-            await chromaMcp.callTool('chroma_add_documents', {
-              collection_name: this.collectionName,
-              ids: batch.map(d => d.id),
-              documents: batch.map(d => d.document),
-              metadatas: cleanMetadatas
-            });
-            logger.info('CHROMA_SYNC', 'Batch reconciled via delete+add after duplicate conflict', {
-              collection: this.collectionName,
-              batchStart: i,
-              batchSize: batch.length
-            });
-          } catch (reconcileError) {
-            logger.error('CHROMA_SYNC', 'Batch reconcile (delete+add) failed', {
-              collection: this.collectionName,
-              batchStart: i,
-              batchSize: batch.length
-            }, reconcileError as Error);
-          }
-        } else {
-          logger.error('CHROMA_SYNC', 'Batch add failed, continuing with remaining batches', {
-            collection: this.collectionName,
-            batchStart: i,
-            batchSize: batch.length
-          }, error as Error);
-        }
+        logger.error('CHROMA_SYNC', 'Batch upsert failed, continuing with remaining batches', {
+          collection: this.collectionName,
+          batchStart: i,
+          batchSize: batch.length
+        }, error as Error);
       }
     }
 
-    logger.debug('CHROMA_SYNC', 'Documents added', {
+    logger.debug('CHROMA_SYNC', 'Documents upserted', {
       collection: this.collectionName,
       count: documents.length
     });
@@ -721,9 +700,11 @@ export class ChromaSync {
 
     try {
       const chromaMcp = ChromaMcpManager.getInstance();
-      const results = await chromaMcp.callTool('chroma_query_documents', {
+      const embedClient = EmbeddingClient.getInstance();
+      const queryEmbedding = await embedClient.embedQuery(query);
+      const results = await chromaMcp.callTool('cm_query_with_embeddings', {
         collection_name: this.collectionName,
-        query_texts: [query],
+        query_embeddings: [queryEmbedding],
         n_results: limit,
         ...(whereFilter && { where: whereFilter }),
         include: ['documents', 'metadatas', 'distances']
