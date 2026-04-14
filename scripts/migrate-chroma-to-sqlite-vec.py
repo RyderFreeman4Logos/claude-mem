@@ -180,6 +180,18 @@ def clean_metadata(metadata: dict) -> dict[str, str | int | float | bool]:
     return cleaned
 
 
+def normalize_embedding(embedding: object) -> list[float]:
+    if hasattr(embedding, "tolist"):
+        embedding = embedding.tolist()
+    elif isinstance(embedding, tuple):
+        embedding = list(embedding)
+
+    if not isinstance(embedding, list):
+        raise TypeError(f"unsupported embedding payload type: {type(embedding).__name__}")
+
+    return [float(value) for value in embedding]
+
+
 def upsert_batch(conn: sqlite3.Connection, batch: dict) -> int:
     ids = batch.get("ids", [])
     documents = batch.get("documents", [])
@@ -269,7 +281,7 @@ def upsert_batch(conn: sqlite3.Connection, batch: dict) -> int:
 
             conn.execute(
                 f"INSERT INTO {EMBEDDINGS_TABLE}(rowid, embedding) VALUES (?, ?)",
-                (rowid, json.dumps(embedding)),
+                (rowid, json.dumps(normalize_embedding(embedding))),
             )
             inserted += 1
 
