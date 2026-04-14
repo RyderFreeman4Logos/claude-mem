@@ -49,7 +49,7 @@ CLAUDE_MEM_CHROMA_ENABLED=false \
 CLAUDE_MEM_TRANSCRIPTS_ENABLED=false \
 CLAUDE_MEM_WORKER_PORT="${WORKER_PORT}" \
 CLAUDE_MEM_DATA_DIR="$(dirname "${DB_PATH}")" \
-CLAUDE_MEM_DB_PATH="${DB_PATH}" bun plugin/scripts/worker-service.cjs start >/dev/null
+CLAUDE_MEM_DB_PATH="${DB_PATH}" bun plugin/scripts/worker-service.cjs start >/dev/null || true
 
 CLAUDE_MEM_WORKER_PORT="${WORKER_PORT}" bun -e '
   const workerPort = process.env.CLAUDE_MEM_WORKER_PORT;
