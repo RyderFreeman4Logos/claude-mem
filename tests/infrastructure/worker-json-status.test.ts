@@ -11,39 +11,86 @@
  */
 import { describe, it, expect } from 'bun:test';
 import { spawnSync } from 'child_process';
-import { existsSync } from 'fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
 import path from 'path';
 import { buildStatusOutput, StatusOutput } from '../../src/services/worker-service.js';
 
 const WORKER_SCRIPT = path.join(__dirname, '../../plugin/scripts/worker-service.cjs');
+const PLUGIN_SETTINGS_KEY = 'claude-mem@thedotmack';
+let nextWorkerPort = 39000;
+
+function allocateWorkerPort(): number {
+  return nextWorkerPort++;
+}
+
+function createIsolatedWorkerEnv(rootDir: string, port: number): NodeJS.ProcessEnv {
+  const homeDir = path.join(rootDir, 'home');
+  const claudeConfigDir = path.join(homeDir, '.claude');
+  const dataDir = path.join(homeDir, '.claude-mem');
+
+  mkdirSync(claudeConfigDir, { recursive: true });
+  mkdirSync(dataDir, { recursive: true });
+  writeFileSync(
+    path.join(claudeConfigDir, 'settings.json'),
+    JSON.stringify({
+      enabledPlugins: {
+        [PLUGIN_SETTINGS_KEY]: true
+      }
+    }),
+    'utf-8'
+  );
+
+  return {
+    ...process.env,
+    HOME: homeDir,
+    CLAUDE_CONFIG_DIR: claudeConfigDir,
+    CLAUDE_MEM_DATA_DIR: dataDir,
+    CLAUDE_MEM_WORKER_PORT: String(port),
+    TMPDIR: rootDir,
+    TMP: rootDir,
+    TEMP: rootDir
+  };
+}
+
+function runWorkerCommand(
+  command: 'start' | 'stop',
+  env: NodeJS.ProcessEnv
+): { stdout: string; stderr: string; exitCode: number } {
+  const result = spawnSync(process.execPath, [WORKER_SCRIPT, command], {
+    encoding: 'utf-8',
+    timeout: 60000,
+    env
+  });
+
+  return {
+    stdout: (result.stdout || '').trim(),
+    stderr: (result.stderr || '').trim(),
+    exitCode: result.status ?? 0
+  };
+}
 
 /**
  * Run worker CLI command and return captured output.
  *
- * Invoke through the platform shell instead of spawning `bun` directly.
- * Under Bun's own test runner, `spawnSync('bun', [...])` can intermittently
- * return empty stdout for this command even though the CLI printed JSON.
- * Shell invocation matches real user execution and keeps the capture stable.
+ * Invoke Bun directly through the current runtime executable.
+ * Shell-based login invocation is brittle in CI and local environments where
+ * `/bin/sh -lc` loads profile scripts with incompatible syntax.
  */
 function runWorkerStart(): { stdout: string; stderr: string; exitCode: number } {
-  const command = `bun "${WORKER_SCRIPT}" start`;
-  const result = process.platform === 'win32'
-    ? spawnSync('cmd.exe', ['/d', '/s', '/c', command], {
-        encoding: 'utf-8',
-        timeout: 60000,
-        env: process.env
-      })
-    : spawnSync('/bin/sh', ['-lc', command], {
-        encoding: 'utf-8',
-        timeout: 60000,
-        env: process.env
-      });
+  const tempDir = mkdtempSync(path.join(tmpdir(), 'worker-json-status-'));
+  const env = createIsolatedWorkerEnv(tempDir, allocateWorkerPort());
 
-  return {
-    stdout: result.stdout?.trim() || '',
-    stderr: result.stderr?.trim() || '',
-    exitCode: result.status ?? 0
-  };
+  try {
+    const firstStart = runWorkerCommand('start', env);
+    const secondStart = runWorkerCommand('start', env);
+    return secondStart.stdout ? secondStart : firstStart;
+  } finally {
+    try {
+      runWorkerCommand('stop', env);
+    } catch {}
+    rmSync(tempDir, { recursive: true, force: true });
+  }
 }
 
 describe('worker-json-status', () => {

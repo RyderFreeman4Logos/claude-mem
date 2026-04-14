@@ -69,6 +69,7 @@ export interface SettingsDefaults {
   CLAUDE_MEM_TIER_SIMPLE_MODEL: string;      // Tier alias or model ID for simple tool observations (Read, Glob, Grep)
   CLAUDE_MEM_TIER_SUMMARY_MODEL: string;     // Tier alias or model ID for session summaries
   // Chroma Vector Database Configuration
+  CLAUDE_MEM_VECTOR_BACKEND: string;  // 'chroma' | 'sqlite-vec' - primary vector backend selector
   CLAUDE_MEM_CHROMA_ENABLED: string;   // 'true' | 'false' - set to 'false' for SQLite-only mode
   CLAUDE_MEM_CHROMA_MODE: string;      // 'local' | 'remote'
   CLAUDE_MEM_CHROMA_HOST: string;
@@ -155,6 +156,7 @@ export class SettingsDefaultsManager {
     CLAUDE_MEM_TIER_SIMPLE_MODEL: 'haiku', // Portable tier alias — works across Direct API, Bedrock, Vertex, Azure (see #1463)
     CLAUDE_MEM_TIER_SUMMARY_MODEL: '',                // Empty = use default model for summaries
     // Chroma Vector Database Configuration
+    CLAUDE_MEM_VECTOR_BACKEND: 'chroma',
     CLAUDE_MEM_CHROMA_ENABLED: 'true',         // Set to 'false' to disable Chroma and use SQLite-only search
     CLAUDE_MEM_CHROMA_MODE: 'local',           // 'local' uses persistent chroma-mcp via uvx, 'remote' connects to existing server
     CLAUDE_MEM_CHROMA_HOST: '127.0.0.1',

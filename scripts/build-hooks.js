@@ -131,6 +131,7 @@ async function buildHooks() {
         '@tree-sitter-grammars/tree-sitter-yaml': '^0.7.1',
         '@derekstride/tree-sitter-sql': '^0.3.11',
         '@tree-sitter-grammars/tree-sitter-markdown': '^0.3.2',
+        'sqlite-vec': '^0.1.9',
       },
       engines: {
         node: '>=18.0.0',

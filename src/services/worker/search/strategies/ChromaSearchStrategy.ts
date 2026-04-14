@@ -20,8 +20,11 @@ import {
   SessionSummarySearchResult,
   UserPromptSearchResult
 } from '../types.js';
-import { ChromaSync } from '../../../sync/ChromaSync.js';
-import { isChromaQueryDisabledResult } from '../../../sync/ChromaSync.js';
+import {
+  isVectorQueryDisabledResult,
+  isVectorQueryNotReadyResult,
+  type VectorSyncBackend
+} from '../../../sync/VectorBackend.js';
 import { SessionStore } from '../../../sqlite/SessionStore.js';
 import { logger } from '../../../../utils/logger.js';
 
@@ -29,7 +32,7 @@ export class ChromaSearchStrategy extends BaseSearchStrategy implements SearchSt
   readonly name = 'chroma';
 
   constructor(
-    private chromaSync: ChromaSync,
+    private chromaSync: VectorSyncBackend,
     private sessionStore: SessionStore
   ) {
     super();
@@ -76,12 +79,23 @@ export class ChromaSearchStrategy extends BaseSearchStrategy implements SearchSt
         whereFilter
       );
 
-      if (isChromaQueryDisabledResult(chromaResults)) {
+      if (isVectorQueryDisabledResult(chromaResults)) {
         return {
           results: { observations: [], sessions: [], prompts: [] },
           usedChroma: false,
           fellBack: false,
           semanticSearchDisabled: true,
+          strategy: 'chroma'
+        };
+      }
+
+      if (isVectorQueryNotReadyResult(chromaResults)) {
+        return {
+          results: { observations: [], sessions: [], prompts: [] },
+          usedChroma: false,
+          fellBack: false,
+          vectorBackendNotReady: true,
+          backendNotReadyMessage: chromaResults.message,
           strategy: 'chroma'
         };
       }

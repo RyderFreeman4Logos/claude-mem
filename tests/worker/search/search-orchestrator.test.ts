@@ -179,6 +179,25 @@ describe('SearchOrchestrator', () => {
         expect(result.semanticSearchDisabled).toBe(true);
       });
 
+      it('should surface vectorBackendNotReady without falling back to SQLite', async () => {
+        mockChromaSync.queryChroma = mock(() => Promise.resolve({
+          notReady: true,
+          message: 'sqlite-vec backend not ready yet.',
+          ids: [],
+          distances: [],
+          metadatas: []
+        }));
+
+        const result = await orchestrator.search({
+          query: 'test query'
+        });
+
+        expect(result.usedChroma).toBe(false);
+        expect(result.fellBack).toBe(false);
+        expect(result.vectorBackendNotReady).toBe(true);
+        expect(result.backendNotReadyMessage).toContain('sqlite-vec backend not ready');
+      });
+
       it('should normalize comma-separated concepts', async () => {
         await orchestrator.search({
           concepts: 'concept1, concept2, concept3',

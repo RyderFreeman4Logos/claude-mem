@@ -16,12 +16,13 @@
 import { basename } from 'path';
 import { SessionSearch } from '../sqlite/SessionSearch.js';
 import { SessionStore } from '../sqlite/SessionStore.js';
-import { ChromaSync } from '../sync/ChromaSync.js';
 import {
-  isChromaQueryDisabledResult,
-  type ChromaQueryDisabledResult,
-  type ChromaQueryResult
-} from '../sync/ChromaSync.js';
+  isVectorQueryDisabledResult,
+  isVectorQueryNotReadyResult,
+  type VectorQueryNotReadyResult,
+  type VectorQueryResult,
+  type VectorSyncBackend
+} from '../sync/VectorBackend.js';
 import { FormattingService } from './FormattingService.js';
 import { TimelineService } from './TimelineService.js';
 import type { TimelineItem } from './TimelineService.js';
@@ -45,7 +46,7 @@ export class SearchManager {
   constructor(
     private sessionSearch: SessionSearch,
     private sessionStore: SessionStore,
-    private chromaSync: ChromaSync | null,
+    private chromaSync: VectorSyncBackend | null,
     private formatter: FormattingService,
     private timelineService: TimelineService
   ) {
@@ -66,17 +67,37 @@ export class SearchManager {
     query: string,
     limit: number,
     whereFilter?: Record<string, any>
-  ): Promise<ChromaQueryResult> {
+  ): Promise<VectorQueryResult> {
     if (!this.chromaSync) {
       return { ids: [], distances: [], metadatas: [] };
     }
     return await this.chromaSync.queryChroma(query, limit, whereFilter);
   }
 
+  private withProjectScope(
+    whereFilter: Record<string, any> | undefined,
+    project?: string
+  ): Record<string, any> | undefined {
+    if (!project) {
+      return whereFilter;
+    }
+
+    const projectFilter = { project };
+    return whereFilter
+      ? { $and: [whereFilter, projectFilter] }
+      : projectFilter;
+  }
+
   private isSemanticSearchDisabled(
-    chromaResults: ChromaQueryResult
-  ): chromaResults is ChromaQueryDisabledResult {
-    return isChromaQueryDisabledResult(chromaResults);
+    chromaResults: VectorQueryResult
+  ): chromaResults is Extract<VectorQueryResult, { disabled: true }> {
+    return isVectorQueryDisabledResult(chromaResults);
+  }
+
+  private isVectorBackendNotReady(
+    vectorResults: VectorQueryResult
+  ): vectorResults is VectorQueryNotReadyResult {
+    return isVectorQueryNotReadyResult(vectorResults);
   }
 
   private warnSemanticSearchUnavailableOnce(tool: string, query: string, project?: string): void {
@@ -103,6 +124,19 @@ Set CLAUDE_MEM_EMBED_URL in ~/.claude-mem/settings.json (or your environment) an
       content: [{
         type: 'text' as const,
         text: this.formatSemanticSearchDisabledMessage(query)
+      }]
+    };
+  }
+
+  private formatVectorBackendNotReadyMessage(query: string, message: string): string {
+    return `${message}\n\nQuery: "${query}"`;
+  }
+
+  private buildVectorBackendNotReadyResponse(query: string, message: string): any {
+    return {
+      content: [{
+        type: 'text' as const,
+        text: this.formatVectorBackendNotReadyMessage(query, message)
       }]
     };
   }
@@ -172,6 +206,8 @@ Set CLAUDE_MEM_EMBED_URL in ~/.claude-mem/settings.json (or your environment) an
     let prompts: UserPromptSearchResult[] = [];
     let chromaFailed = false;
     let semanticSearchDisabled = false;
+    let vectorBackendNotReady = false;
+    let backendNotReadyMessage: string | null = null;
 
     // Determine which types to query based on type filter
     const searchObservations = !type || type === 'observations';
@@ -222,6 +258,9 @@ Set CLAUDE_MEM_EMBED_URL in ~/.claude-mem/settings.json (or your environment) an
       if (this.isSemanticSearchDisabled(chromaResults)) {
         semanticSearchDisabled = true;
         this.warnSemanticSearchUnavailableOnce('search', query, options.project);
+      } else if (this.isVectorBackendNotReady(chromaResults)) {
+        vectorBackendNotReady = true;
+        backendNotReadyMessage = chromaResults.message;
       } else {
         logger.debug('SEARCH', 'ChromaDB returned semantic matches', { matchCount: chromaResults.ids.length });
 
@@ -316,13 +355,18 @@ Set CLAUDE_MEM_EMBED_URL in ~/.claude-mem/settings.json (or your environment) an
         prompts,
         totalResults,
         query: query || '',
-        semanticSearchDisabled
+        semanticSearchDisabled,
+        vectorBackendNotReady,
+        backendNotReadyMessage
       };
     }
 
     if (totalResults === 0) {
       if (semanticSearchDisabled) {
         return this.buildSemanticSearchDisabledResponse(query);
+      }
+      if (vectorBackendNotReady && backendNotReadyMessage) {
+        return this.buildVectorBackendNotReadyResponse(query, backendNotReadyMessage);
       }
       if (chromaFailed) {
         return {
@@ -479,10 +523,17 @@ Set CLAUDE_MEM_EMBED_URL in ~/.claude-mem/settings.json (or your environment) an
       if (this.chromaSync) {
         try {
           logger.debug('SEARCH', 'Using hybrid semantic search for timeline query', {});
-          const chromaResults = await this.queryChroma(query, 100);
+          const chromaResults = await this.queryChroma(
+            query,
+            100,
+            this.withProjectScope({ doc_type: 'observation' }, project)
+          );
           if (this.isSemanticSearchDisabled(chromaResults)) {
             this.warnSemanticSearchUnavailableOnce('timeline', query, project);
             return this.buildSemanticSearchDisabledResponse(query);
+          }
+          if (this.isVectorBackendNotReady(chromaResults)) {
+            return this.buildVectorBackendNotReadyResponse(query, chromaResults.message);
           }
           logger.debug('SEARCH', 'Chroma returned semantic matches for timeline', { matchCount: chromaResults?.ids?.length ?? 0 });
 
@@ -735,17 +786,28 @@ Set CLAUDE_MEM_EMBED_URL in ~/.claude-mem/settings.json (or your environment) an
         if (query) {
           // Semantic search filtered to decision type
           logger.debug('SEARCH', 'Using Chroma semantic search with type=decision filter', {});
-          const chromaResults = await this.queryChroma(query, Math.min((filters.limit || 20) * 2, 100), { type: 'decision' });
+          const chromaResults = await this.queryChroma(
+            query,
+            Math.min((filters.limit || 20) * 2, 100),
+            this.withProjectScope({ doc_type: 'observation', type: 'decision' }, filters.project)
+          );
           if (this.isSemanticSearchDisabled(chromaResults)) {
             this.warnSemanticSearchUnavailableOnce('decisions', query, filters.project);
             return this.buildSemanticSearchDisabledResponse(query);
           }
-          const obsIds = chromaResults.ids;
+          if (this.isVectorBackendNotReady(chromaResults)) {
+            logger.debug('SEARCH', 'Vector backend not ready for decision semantic search, falling back to metadata search', {
+              query,
+              project: filters.project
+            });
+          } else {
+            const obsIds = chromaResults.ids;
 
-          if (obsIds.length > 0) {
-            results = this.sessionStore.getObservationsByIds(obsIds, { ...filters, type: 'decision' });
-            // Preserve Chroma ranking order
-            results.sort((a, b) => obsIds.indexOf(a.id) - obsIds.indexOf(b.id));
+            if (obsIds.length > 0) {
+              results = this.sessionStore.getObservationsByIds(obsIds, { ...filters, type: 'decision' });
+              // Preserve Chroma ranking order
+              results.sort((a, b) => obsIds.indexOf(a.id) - obsIds.indexOf(b.id));
+            }
           }
         } else {
           // No query: get all decisions, rank by "decision" keyword
@@ -754,21 +816,30 @@ Set CLAUDE_MEM_EMBED_URL in ~/.claude-mem/settings.json (or your environment) an
 
           if (metadataResults.length > 0) {
             const ids = metadataResults.map(obs => obs.id);
-            const chromaResults = await this.queryChroma('decision', Math.min(ids.length, 100));
+            const chromaResults = await this.queryChroma(
+              'decision',
+              Math.min(ids.length, 100),
+              this.withProjectScope({ doc_type: 'observation' }, filters.project)
+            );
             if (this.isSemanticSearchDisabled(chromaResults)) {
               this.warnSemanticSearchUnavailableOnce('decisions', 'decision', filters.project);
             }
-
-            const rankedIds: number[] = [];
-            for (const chromaId of chromaResults.ids) {
-              if (ids.includes(chromaId) && !rankedIds.includes(chromaId)) {
-                rankedIds.push(chromaId);
+            if (this.isVectorBackendNotReady(chromaResults)) {
+              logger.debug('SEARCH', 'Vector backend not ready for decision ranking, falling back to metadata search', {
+                project: filters.project
+              });
+            } else {
+              const rankedIds: number[] = [];
+              for (const chromaId of chromaResults.ids) {
+                if (ids.includes(chromaId) && !rankedIds.includes(chromaId)) {
+                  rankedIds.push(chromaId);
+                }
               }
-            }
 
-            if (rankedIds.length > 0) {
-              results = this.sessionStore.getObservationsByIds(rankedIds, { limit: filters.limit || 20 });
-              results.sort((a, b) => rankedIds.indexOf(a.id) - rankedIds.indexOf(b.id));
+              if (rankedIds.length > 0) {
+                results = this.sessionStore.getObservationsByIds(rankedIds, { limit: filters.limit || 20 });
+                results.sort((a, b) => rankedIds.indexOf(a.id) - rankedIds.indexOf(b.id));
+              }
             }
           }
         }
@@ -826,21 +897,30 @@ Set CLAUDE_MEM_EMBED_URL in ~/.claude-mem/settings.json (or your environment) an
 
         if (allIds.size > 0) {
           const idsArray = Array.from(allIds);
-          const chromaResults = await this.queryChroma('what changed', Math.min(idsArray.length, 100));
+          const chromaResults = await this.queryChroma(
+            'what changed',
+            Math.min(idsArray.length, 100),
+            this.withProjectScope({ doc_type: 'observation' }, filters.project)
+          );
           if (this.isSemanticSearchDisabled(chromaResults)) {
             this.warnSemanticSearchUnavailableOnce('changes', 'what changed', filters.project);
           }
-
-          const rankedIds: number[] = [];
-          for (const chromaId of chromaResults.ids) {
-            if (idsArray.includes(chromaId) && !rankedIds.includes(chromaId)) {
-              rankedIds.push(chromaId);
+          if (this.isVectorBackendNotReady(chromaResults)) {
+            logger.debug('SEARCH', 'Vector backend not ready for changes ranking, falling back to metadata search', {
+              project: filters.project
+            });
+          } else {
+            const rankedIds: number[] = [];
+            for (const chromaId of chromaResults.ids) {
+              if (idsArray.includes(chromaId) && !rankedIds.includes(chromaId)) {
+                rankedIds.push(chromaId);
+              }
             }
-          }
 
-          if (rankedIds.length > 0) {
-            results = this.sessionStore.getObservationsByIds(rankedIds, { limit: filters.limit || 20 });
-            results.sort((a, b) => rankedIds.indexOf(a.id) - rankedIds.indexOf(b.id));
+            if (rankedIds.length > 0) {
+              results = this.sessionStore.getObservationsByIds(rankedIds, { limit: filters.limit || 20 });
+              results.sort((a, b) => rankedIds.indexOf(a.id) - rankedIds.indexOf(b.id));
+            }
           }
         }
       } catch (chromaError) {
@@ -903,20 +983,30 @@ Set CLAUDE_MEM_EMBED_URL in ~/.claude-mem/settings.json (or your environment) an
 
       if (metadataResults.length > 0) {
         const ids = metadataResults.map(obs => obs.id);
-        const chromaResults = await this.queryChroma('how it works architecture', Math.min(ids.length, 100));
+        const chromaResults = await this.queryChroma(
+          'how it works architecture',
+          Math.min(ids.length, 100),
+          this.withProjectScope({ doc_type: 'observation' }, filters.project)
+        );
         if (this.isSemanticSearchDisabled(chromaResults)) {
           this.warnSemanticSearchUnavailableOnce('how_it_works', 'how it works architecture', filters.project);
         } else {
-          const rankedIds: number[] = [];
-          for (const chromaId of chromaResults.ids) {
-            if (ids.includes(chromaId) && !rankedIds.includes(chromaId)) {
-              rankedIds.push(chromaId);
+          if (this.isVectorBackendNotReady(chromaResults)) {
+            logger.debug('SEARCH', 'Vector backend not ready for how-it-works ranking, falling back to metadata search', {
+              project: filters.project
+            });
+          } else {
+            const rankedIds: number[] = [];
+            for (const chromaId of chromaResults.ids) {
+              if (ids.includes(chromaId) && !rankedIds.includes(chromaId)) {
+                rankedIds.push(chromaId);
+              }
             }
-          }
 
-          if (rankedIds.length > 0) {
-            results = this.sessionStore.getObservationsByIds(rankedIds, { limit: filters.limit || 20 });
-            results.sort((a, b) => rankedIds.indexOf(a.id) - rankedIds.indexOf(b.id));
+            if (rankedIds.length > 0) {
+              results = this.sessionStore.getObservationsByIds(rankedIds, { limit: filters.limit || 20 });
+              results.sort((a, b) => rankedIds.indexOf(a.id) - rankedIds.indexOf(b.id));
+            }
           }
         }
       }
@@ -961,10 +1051,17 @@ Set CLAUDE_MEM_EMBED_URL in ~/.claude-mem/settings.json (or your environment) an
       logger.debug('SEARCH', 'Using hybrid semantic search (Chroma + SQLite)', {});
 
       // Step 1: Chroma semantic search (top 100)
-      const chromaResults = await this.queryChroma(query, 100);
+      const chromaResults = await this.queryChroma(
+        query,
+        100,
+        this.withProjectScope({ doc_type: 'observation' }, options.project)
+      );
       if (this.isSemanticSearchDisabled(chromaResults)) {
         this.warnSemanticSearchUnavailableOnce('search_observations', query, options.project);
         return this.buildSemanticSearchDisabledResponse(query);
+      }
+      if (this.isVectorBackendNotReady(chromaResults)) {
+        return this.buildVectorBackendNotReadyResponse(query, chromaResults.message);
       }
       logger.debug('SEARCH', 'Chroma returned semantic matches', { matchCount: chromaResults.ids.length });
 
@@ -1022,10 +1119,17 @@ Set CLAUDE_MEM_EMBED_URL in ~/.claude-mem/settings.json (or your environment) an
       logger.debug('SEARCH', 'Using hybrid semantic search for sessions', {});
 
       // Step 1: Chroma semantic search (top 100)
-      const chromaResults = await this.queryChroma(query, 100, { doc_type: 'session_summary' });
+      const chromaResults = await this.queryChroma(
+        query,
+        100,
+        this.withProjectScope({ doc_type: 'session_summary' }, options.project)
+      );
       if (this.isSemanticSearchDisabled(chromaResults)) {
         this.warnSemanticSearchUnavailableOnce('search_sessions', query, options.project);
         return this.buildSemanticSearchDisabledResponse(query);
+      }
+      if (this.isVectorBackendNotReady(chromaResults)) {
+        return this.buildVectorBackendNotReadyResponse(query, chromaResults.message);
       }
       logger.debug('SEARCH', 'Chroma returned semantic matches for sessions', { matchCount: chromaResults.ids.length });
 
@@ -1083,10 +1187,17 @@ Set CLAUDE_MEM_EMBED_URL in ~/.claude-mem/settings.json (or your environment) an
       logger.debug('SEARCH', 'Using hybrid semantic search for user prompts', {});
 
       // Step 1: Chroma semantic search (top 100)
-      const chromaResults = await this.queryChroma(query, 100, { doc_type: 'user_prompt' });
+      const chromaResults = await this.queryChroma(
+        query,
+        100,
+        this.withProjectScope({ doc_type: 'user_prompt' }, options.project)
+      );
       if (this.isSemanticSearchDisabled(chromaResults)) {
         this.warnSemanticSearchUnavailableOnce('search_user_prompts', query, options.project);
         return this.buildSemanticSearchDisabledResponse(query);
+      }
+      if (this.isVectorBackendNotReady(chromaResults)) {
+        return this.buildVectorBackendNotReadyResponse(query, chromaResults.message);
       }
       logger.debug('SEARCH', 'Chroma returned semantic matches for prompts', { matchCount: chromaResults.ids.length });
 
@@ -1150,25 +1261,36 @@ Set CLAUDE_MEM_EMBED_URL in ~/.claude-mem/settings.json (or your environment) an
       if (metadataResults.length > 0) {
         // Step 2: Chroma semantic ranking (rank by relevance to concept)
         const ids = metadataResults.map(obs => obs.id);
-        const chromaResults = await this.queryChroma(concept, Math.min(ids.length, 100));
+        const chromaResults = await this.queryChroma(
+          concept,
+          Math.min(ids.length, 100),
+          this.withProjectScope({ doc_type: 'observation' }, filters.project)
+        );
         if (this.isSemanticSearchDisabled(chromaResults)) {
           this.warnSemanticSearchUnavailableOnce('find_by_concept', concept, filters.project);
         } else {
-          // Intersect: Keep only IDs that passed metadata filter, in semantic rank order
-          const rankedIds: number[] = [];
-          for (const chromaId of chromaResults.ids) {
-            if (ids.includes(chromaId) && !rankedIds.includes(chromaId)) {
-              rankedIds.push(chromaId);
+          if (this.isVectorBackendNotReady(chromaResults)) {
+            logger.debug('SEARCH', 'Vector backend not ready for concept ranking, falling back to metadata search', {
+              concept,
+              project: filters.project
+            });
+          } else {
+            // Intersect: Keep only IDs that passed metadata filter, in semantic rank order
+            const rankedIds: number[] = [];
+            for (const chromaId of chromaResults.ids) {
+              if (ids.includes(chromaId) && !rankedIds.includes(chromaId)) {
+                rankedIds.push(chromaId);
+              }
             }
-          }
 
-          logger.debug('SEARCH', 'Chroma ranked results by semantic relevance', { count: rankedIds.length });
+            logger.debug('SEARCH', 'Chroma ranked results by semantic relevance', { count: rankedIds.length });
 
-          // Step 3: Hydrate in semantic rank order
-          if (rankedIds.length > 0) {
-            results = this.sessionStore.getObservationsByIds(rankedIds, { limit: filters.limit || 20 });
-            // Restore semantic ranking order
-            results.sort((a, b) => rankedIds.indexOf(a.id) - rankedIds.indexOf(b.id));
+            // Step 3: Hydrate in semantic rank order
+            if (rankedIds.length > 0) {
+              results = this.sessionStore.getObservationsByIds(rankedIds, { limit: filters.limit || 20 });
+              // Restore semantic ranking order
+              results.sort((a, b) => rankedIds.indexOf(a.id) - rankedIds.indexOf(b.id));
+            }
           }
         }
       }
@@ -1228,26 +1350,38 @@ Set CLAUDE_MEM_EMBED_URL in ~/.claude-mem/settings.json (or your environment) an
       if (metadataResults.observations.length > 0) {
         // Step 2: Chroma semantic ranking (rank by relevance to file path)
         const ids = metadataResults.observations.map(obs => obs.id);
-        const chromaResults = await this.queryChroma(filePath, Math.min(ids.length, 100));
+        const chromaResults = await this.queryChroma(
+          filePath,
+          Math.min(ids.length, 100),
+          this.withProjectScope({ doc_type: 'observation' }, filters.project)
+        );
         if (this.isSemanticSearchDisabled(chromaResults)) {
           this.warnSemanticSearchUnavailableOnce('find_by_file', filePath, filters.project);
           observations = metadataResults.observations;
         } else {
-          // Intersect: Keep only IDs that passed metadata filter, in semantic rank order
-          const rankedIds: number[] = [];
-          for (const chromaId of chromaResults.ids) {
-            if (ids.includes(chromaId) && !rankedIds.includes(chromaId)) {
-              rankedIds.push(chromaId);
+          if (this.isVectorBackendNotReady(chromaResults)) {
+            logger.debug('SEARCH', 'Vector backend not ready for file ranking, falling back to metadata search', {
+              filePath,
+              project: filters.project
+            });
+            observations = metadataResults.observations;
+          } else {
+            // Intersect: Keep only IDs that passed metadata filter, in semantic rank order
+            const rankedIds: number[] = [];
+            for (const chromaId of chromaResults.ids) {
+              if (ids.includes(chromaId) && !rankedIds.includes(chromaId)) {
+                rankedIds.push(chromaId);
+              }
             }
-          }
 
-          logger.debug('SEARCH', 'Chroma ranked observations by semantic relevance', { count: rankedIds.length });
+            logger.debug('SEARCH', 'Chroma ranked observations by semantic relevance', { count: rankedIds.length });
 
-          // Step 3: Hydrate in semantic rank order
-          if (rankedIds.length > 0) {
-            observations = this.sessionStore.getObservationsByIds(rankedIds, { limit: filters.limit || 20 });
-            // Restore semantic ranking order
-            observations.sort((a, b) => rankedIds.indexOf(a.id) - rankedIds.indexOf(b.id));
+            // Step 3: Hydrate in semantic rank order
+            if (rankedIds.length > 0) {
+              observations = this.sessionStore.getObservationsByIds(rankedIds, { limit: filters.limit || 20 });
+              // Restore semantic ranking order
+              observations.sort((a, b) => rankedIds.indexOf(a.id) - rankedIds.indexOf(b.id));
+            }
           }
         }
       }
@@ -1348,25 +1482,36 @@ Set CLAUDE_MEM_EMBED_URL in ~/.claude-mem/settings.json (or your environment) an
       if (metadataResults.length > 0) {
         // Step 2: Chroma semantic ranking (rank by relevance to type)
         const ids = metadataResults.map(obs => obs.id);
-        const chromaResults = await this.queryChroma(typeStr, Math.min(ids.length, 100));
+        const chromaResults = await this.queryChroma(
+          typeStr,
+          Math.min(ids.length, 100),
+          this.withProjectScope({ doc_type: 'observation' }, filters.project)
+        );
         if (this.isSemanticSearchDisabled(chromaResults)) {
           this.warnSemanticSearchUnavailableOnce('find_by_type', typeStr, filters.project);
         } else {
-          // Intersect: Keep only IDs that passed metadata filter, in semantic rank order
-          const rankedIds: number[] = [];
-          for (const chromaId of chromaResults.ids) {
-            if (ids.includes(chromaId) && !rankedIds.includes(chromaId)) {
-              rankedIds.push(chromaId);
+          if (this.isVectorBackendNotReady(chromaResults)) {
+            logger.debug('SEARCH', 'Vector backend not ready for type ranking, falling back to metadata search', {
+              type: typeStr,
+              project: filters.project
+            });
+          } else {
+            // Intersect: Keep only IDs that passed metadata filter, in semantic rank order
+            const rankedIds: number[] = [];
+            for (const chromaId of chromaResults.ids) {
+              if (ids.includes(chromaId) && !rankedIds.includes(chromaId)) {
+                rankedIds.push(chromaId);
+              }
             }
-          }
 
-          logger.debug('SEARCH', 'Chroma ranked results by semantic relevance', { count: rankedIds.length });
+            logger.debug('SEARCH', 'Chroma ranked results by semantic relevance', { count: rankedIds.length });
 
-          // Step 3: Hydrate in semantic rank order
-          if (rankedIds.length > 0) {
-            results = this.sessionStore.getObservationsByIds(rankedIds, { limit: filters.limit || 20 });
-            // Restore semantic ranking order
-            results.sort((a, b) => rankedIds.indexOf(a.id) - rankedIds.indexOf(b.id));
+            // Step 3: Hydrate in semantic rank order
+            if (rankedIds.length > 0) {
+              results = this.sessionStore.getObservationsByIds(rankedIds, { limit: filters.limit || 20 });
+              // Restore semantic ranking order
+              results.sort((a, b) => rankedIds.indexOf(a.id) - rankedIds.indexOf(b.id));
+            }
           }
         }
       }
@@ -1751,10 +1896,17 @@ Set CLAUDE_MEM_EMBED_URL in ~/.claude-mem/settings.json (or your environment) an
     // Use hybrid search if available
     if (this.chromaSync) {
       logger.debug('SEARCH', 'Using hybrid semantic search for timeline query', {});
-      const chromaResults = await this.queryChroma(query, 100);
+      const chromaResults = await this.queryChroma(
+        query,
+        100,
+        this.withProjectScope({ doc_type: 'observation' }, project)
+      );
       if (this.isSemanticSearchDisabled(chromaResults)) {
         this.warnSemanticSearchUnavailableOnce('get_timeline_by_query', query, project);
         return this.buildSemanticSearchDisabledResponse(query);
+      }
+      if (this.isVectorBackendNotReady(chromaResults)) {
+        return this.buildVectorBackendNotReadyResponse(query, chromaResults.message);
       }
       logger.debug('SEARCH', 'Chroma returned semantic matches for timeline', { matchCount: chromaResults.ids.length });
 

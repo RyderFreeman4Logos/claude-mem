@@ -11,7 +11,7 @@
 
 import { SessionSearch } from '../../sqlite/SessionSearch.js';
 import { SessionStore } from '../../sqlite/SessionStore.js';
-import { ChromaSync } from '../../sync/ChromaSync.js';
+import type { VectorSyncBackend } from '../../sync/VectorBackend.js';
 
 import { ChromaSearchStrategy } from './strategies/ChromaSearchStrategy.js';
 import { SQLiteSearchStrategy } from './strategies/SQLiteSearchStrategy.js';
@@ -51,7 +51,7 @@ export class SearchOrchestrator {
   constructor(
     private sessionSearch: SessionSearch,
     private sessionStore: SessionStore,
-    private chromaSync: ChromaSync | null
+    private chromaSync: VectorSyncBackend | null
   ) {
     // Initialize strategies
     this.sqliteStrategy = new SQLiteSearchStrategy(sessionSearch);
@@ -92,8 +92,9 @@ export class SearchOrchestrator {
       logger.debug('SEARCH', 'Orchestrator: Using Chroma semantic search', {});
       const result = await this.chromaStrategy.search(options);
 
-      // If Chroma succeeded (even with 0 results), return
-      if (result.usedChroma || result.semanticSearchDisabled) {
+      // If vector search succeeded (even with 0 results), or it returned a typed
+      // disabled/not-ready state, do not mask it with SQLite fallback.
+      if (result.usedChroma || result.semanticSearchDisabled || result.vectorBackendNotReady) {
         return result;
       }
 
