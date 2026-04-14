@@ -9,10 +9,16 @@
  * The chroma-mcp server handles its own embedding and persistent storage,
  * eliminating the need for chromadb npm package and ONNX/WASM dependencies.
  *
- * Design: Fail-fast with no fallbacks - if Chroma is unavailable, syncing fails.
+ * Design: fail fast for runtime Chroma errors, but treat missing embedding
+ * configuration as an operator-controlled disabled state.
  */
 
 import { ChromaMcpManager } from './ChromaMcpManager.js';
+import {
+  EmbeddingClient,
+  isMissingEmbeddingConfigError,
+  MISSING_EMBEDDING_URL_MESSAGE
+} from './EmbeddingClient.js';
 import { ParsedObservation, ParsedSummary } from '../../sdk/parser.js';
 import { SessionStore } from '../sqlite/SessionStore.js';
 import { logger } from '../../utils/logger.js';
@@ -70,7 +76,30 @@ interface StoredUserPrompt {
   project: string;
 }
 
+export interface ChromaQueryEnabledResult {
+  disabled?: false;
+  ids: number[];
+  distances: number[];
+  metadatas: any[];
+}
+
+export interface ChromaQueryDisabledResult {
+  disabled: true;
+  ids: [];
+  distances: [];
+  metadatas: [];
+}
+
+export type ChromaQueryResult = ChromaQueryEnabledResult | ChromaQueryDisabledResult;
+
+export function isChromaQueryDisabledResult(
+  result: ChromaQueryResult
+): result is ChromaQueryDisabledResult {
+  return result.disabled === true;
+}
+
 export class ChromaSync {
+  private static missingEmbeddingConfigWarningLogged = false;
   private project: string;
   private collectionName: string;
   private collectionCreated = false;
@@ -91,15 +120,19 @@ export class ChromaSync {
    * chroma_create_collection is idempotent - safe to call multiple times.
    * Uses collectionCreated flag to avoid redundant calls within a session.
    */
-  private async ensureCollectionExists(): Promise<void> {
+  private async ensureCollectionExists(embedClient?: EmbeddingClient): Promise<void> {
     if (this.collectionCreated) {
       return;
     }
 
     const chromaMcp = ChromaMcpManager.getInstance();
+    const embedCfg = (embedClient ?? EmbeddingClient.getInstance()).getConfig();
     try {
-      await chromaMcp.callTool('chroma_create_collection', {
-        collection_name: this.collectionName
+      await chromaMcp.callTool('cm_ensure_collection', {
+        collection_name: this.collectionName,
+        hnsw_space: 'cosine',
+        embedding_model: embedCfg.model,
+        embedding_dim: embedCfg.dim,
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -114,6 +147,26 @@ export class ChromaSync {
     logger.debug('CHROMA_SYNC', 'Collection ready', {
       collection: this.collectionName
     });
+  }
+
+  private getEmbeddingClientOrSkip(operation: 'sync' | 'query' | 'backfill'): EmbeddingClient | null {
+    try {
+      return EmbeddingClient.getInstance();
+    } catch (error) {
+      if (!isMissingEmbeddingConfigError(error)) {
+        throw error;
+      }
+
+      if (!ChromaSync.missingEmbeddingConfigWarningLogged) {
+        ChromaSync.missingEmbeddingConfigWarningLogged = true;
+        logger.warn('CHROMA_SYNC', 'Skipping Chroma embedding operation because the endpoint is not configured', {
+          project: this.project,
+          operation
+        }, MISSING_EMBEDDING_URL_MESSAGE);
+      }
+
+      return null;
+    }
   }
 
   /**
@@ -260,16 +313,18 @@ export class ChromaSync {
       return;
     }
 
-    await this.ensureCollectionExists();
+    const embedClient = this.getEmbeddingClientOrSkip('sync');
+    if (!embedClient) {
+      return;
+    }
+
+    await this.ensureCollectionExists(embedClient);
 
     const chromaMcp = ChromaMcpManager.getInstance();
 
-    // Add in batches
     for (let i = 0; i < documents.length; i += this.BATCH_SIZE) {
       const batch = documents.slice(i, i + this.BATCH_SIZE);
 
-      // Sanitize metadata: filter out null, undefined, and empty string values
-      // that chroma-mcp may reject (e.g., null subtitle from raw SQLite rows)
       const cleanMetadatas = batch.map(d =>
         Object.fromEntries(
           Object.entries(d.metadata).filter(([_, v]) => v !== null && v !== undefined && v !== '')
@@ -277,49 +332,24 @@ export class ChromaSync {
       );
 
       try {
-        await chromaMcp.callTool('chroma_add_documents', {
+        const embeddings = await embedClient.embedDocuments(batch.map(d => d.document));
+        await chromaMcp.callTool('cm_upsert_with_embeddings', {
           collection_name: this.collectionName,
           ids: batch.map(d => d.id),
           documents: batch.map(d => d.document),
-          metadatas: cleanMetadatas
+          embeddings,
+          metadatas: cleanMetadatas,
         });
       } catch (error) {
-        const errMsg = error instanceof Error ? error.message : String(error);
-        if (errMsg.includes('already exist')) {
-          try {
-            await chromaMcp.callTool('chroma_delete_documents', {
-              collection_name: this.collectionName,
-              ids: batch.map(d => d.id)
-            });
-            await chromaMcp.callTool('chroma_add_documents', {
-              collection_name: this.collectionName,
-              ids: batch.map(d => d.id),
-              documents: batch.map(d => d.document),
-              metadatas: cleanMetadatas
-            });
-            logger.info('CHROMA_SYNC', 'Batch reconciled via delete+add after duplicate conflict', {
-              collection: this.collectionName,
-              batchStart: i,
-              batchSize: batch.length
-            });
-          } catch (reconcileError) {
-            logger.error('CHROMA_SYNC', 'Batch reconcile (delete+add) failed', {
-              collection: this.collectionName,
-              batchStart: i,
-              batchSize: batch.length
-            }, reconcileError as Error);
-          }
-        } else {
-          logger.error('CHROMA_SYNC', 'Batch add failed, continuing with remaining batches', {
-            collection: this.collectionName,
-            batchStart: i,
-            batchSize: batch.length
-          }, error as Error);
-        }
+        logger.error('CHROMA_SYNC', 'Batch upsert failed, continuing with remaining batches', {
+          collection: this.collectionName,
+          batchStart: i,
+          batchSize: batch.length
+        }, error as Error);
       }
     }
 
-    logger.debug('CHROMA_SYNC', 'Documents added', {
+    logger.debug('CHROMA_SYNC', 'Documents upserted', {
       collection: this.collectionName,
       count: documents.length
     });
@@ -546,7 +576,12 @@ export class ChromaSync {
     const backfillProject = projectOverride ?? this.project;
     logger.info('CHROMA_SYNC', 'Starting smart backfill', { project: backfillProject });
 
-    await this.ensureCollectionExists();
+    const embedClient = this.getEmbeddingClientOrSkip('backfill');
+    if (!embedClient) {
+      return;
+    }
+
+    await this.ensureCollectionExists(embedClient);
 
     // Fetch existing IDs from Chroma (fast, metadata only)
     const existing = await this.getExistingChromaIds(backfillProject);
@@ -716,14 +751,20 @@ export class ChromaSync {
     query: string,
     limit: number,
     whereFilter?: Record<string, any>
-  ): Promise<{ ids: number[]; distances: number[]; metadatas: any[] }> {
-    await this.ensureCollectionExists();
+  ): Promise<ChromaQueryResult> {
+    const embedClient = this.getEmbeddingClientOrSkip('query');
+    if (!embedClient) {
+      return { disabled: true, ids: [], distances: [], metadatas: [] };
+    }
 
     try {
+      await this.ensureCollectionExists(embedClient);
+
       const chromaMcp = ChromaMcpManager.getInstance();
-      const results = await chromaMcp.callTool('chroma_query_documents', {
+      const queryEmbedding = await embedClient.embedQuery(query);
+      const results = await chromaMcp.callTool('cm_query_with_embeddings', {
         collection_name: this.collectionName,
-        query_texts: [query],
+        query_embeddings: [queryEmbedding],
         n_results: limit,
         ...(whereFilter && { where: whereFilter }),
         include: ['documents', 'metadatas', 'distances']

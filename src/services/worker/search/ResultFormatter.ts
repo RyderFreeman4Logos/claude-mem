@@ -25,13 +25,17 @@ export class ResultFormatter {
   formatSearchResults(
     results: SearchResults,
     query: string,
-    chromaFailed: boolean = false
+    chromaFailed: boolean = false,
+    semanticSearchDisabled: boolean = false
   ): string {
     const totalResults = results.observations.length +
       results.sessions.length +
       results.prompts.length;
 
     if (totalResults === 0) {
+      if (semanticSearchDisabled) {
+        return this.formatSemanticSearchDisabledMessage(query);
+      }
       if (chromaFailed) {
         return this.formatChromaFailureMessage();
       }
@@ -280,6 +284,15 @@ To enable semantic search:
 2. Restart the worker: npm run worker:restart
 
 Note: You can still use filter-only searches (date ranges, types, files) without a query term.`;
+  }
+
+  /**
+   * Format missing-embedding-config message
+   */
+  private formatSemanticSearchDisabledMessage(query: string): string {
+    return `Semantic search unavailable for "${query}" because embeddings are not configured.
+
+Set CLAUDE_MEM_EMBED_URL in ~/.claude-mem/settings.json (or your environment) and restart the worker.`;
   }
 
   /**

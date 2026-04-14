@@ -19,6 +19,7 @@ import {
   SessionSummarySearchResult
 } from '../types.js';
 import { ChromaSync } from '../../../sync/ChromaSync.js';
+import { isChromaQueryDisabledResult } from '../../../sync/ChromaSync.js';
 import { SessionStore } from '../../../sqlite/SessionStore.js';
 import { SessionSearch } from '../../../sqlite/SessionSearch.js';
 import { logger } from '../../../../utils/logger.js';
@@ -88,6 +89,16 @@ export class HybridSearchStrategy extends BaseSearchStrategy implements SearchSt
         Math.min(ids.length, SEARCH_CONSTANTS.CHROMA_BATCH_SIZE)
       );
 
+      if (isChromaQueryDisabledResult(chromaResults)) {
+        return {
+          results: { observations: metadataResults, sessions: [], prompts: [] },
+          usedChroma: false,
+          fellBack: true,
+          semanticSearchDisabled: true,
+          strategy: 'hybrid'
+        };
+      }
+
       // Step 3: Intersect - keep only IDs from metadata, in Chroma rank order
       const rankedIds = this.intersectWithRanking(ids, chromaResults.ids);
       logger.debug('SEARCH', 'HybridSearchStrategy: Ranked by semantic relevance', {
@@ -153,6 +164,16 @@ export class HybridSearchStrategy extends BaseSearchStrategy implements SearchSt
         typeStr,
         Math.min(ids.length, SEARCH_CONSTANTS.CHROMA_BATCH_SIZE)
       );
+
+      if (isChromaQueryDisabledResult(chromaResults)) {
+        return {
+          results: { observations: metadataResults, sessions: [], prompts: [] },
+          usedChroma: false,
+          fellBack: true,
+          semanticSearchDisabled: true,
+          strategy: 'hybrid'
+        };
+      }
 
       // Step 3: Intersect with ranking
       const rankedIds = this.intersectWithRanking(ids, chromaResults.ids);
@@ -224,6 +245,10 @@ export class HybridSearchStrategy extends BaseSearchStrategy implements SearchSt
         filePath,
         Math.min(ids.length, SEARCH_CONSTANTS.CHROMA_BATCH_SIZE)
       );
+
+      if (isChromaQueryDisabledResult(chromaResults)) {
+        return { observations: metadataResults.observations, sessions, usedChroma: false };
+      }
 
       // Step 3: Intersect with ranking
       const rankedIds = this.intersectWithRanking(ids, chromaResults.ids);

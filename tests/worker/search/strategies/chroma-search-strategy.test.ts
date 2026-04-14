@@ -289,6 +289,22 @@ describe('ChromaSearchStrategy', () => {
       expect(result.usedChroma).toBe(true); // Still used Chroma, just no results
     });
 
+    it('should surface semanticSearchDisabled when embeddings are unconfigured', async () => {
+      mockChromaSync.queryChroma = mock(() => Promise.resolve({
+        disabled: true,
+        ids: [],
+        distances: [],
+        metadatas: []
+      }));
+
+      const result = await strategy.search({ query: 'disabled query' });
+
+      expect(result.usedChroma).toBe(false);
+      expect(result.fellBack).toBe(false);
+      expect(result.semanticSearchDisabled).toBe(true);
+      expect(result.results.observations).toHaveLength(0);
+    });
+
     it('should filter out old results (beyond 90-day window)', async () => {
       const oldEpoch = Date.now() - 1000 * 60 * 60 * 24 * 100; // 100 days ago
 

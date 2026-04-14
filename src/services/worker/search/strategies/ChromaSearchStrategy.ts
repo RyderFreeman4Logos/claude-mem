@@ -21,6 +21,7 @@ import {
   UserPromptSearchResult
 } from '../types.js';
 import { ChromaSync } from '../../../sync/ChromaSync.js';
+import { isChromaQueryDisabledResult } from '../../../sync/ChromaSync.js';
 import { SessionStore } from '../../../sqlite/SessionStore.js';
 import { logger } from '../../../../utils/logger.js';
 
@@ -74,6 +75,16 @@ export class ChromaSearchStrategy extends BaseSearchStrategy implements SearchSt
         SEARCH_CONSTANTS.CHROMA_BATCH_SIZE,
         whereFilter
       );
+
+      if (isChromaQueryDisabledResult(chromaResults)) {
+        return {
+          results: { observations: [], sessions: [], prompts: [] },
+          usedChroma: false,
+          fellBack: false,
+          semanticSearchDisabled: true,
+          strategy: 'chroma'
+        };
+      }
 
       logger.debug('SEARCH', 'ChromaSearchStrategy: Chroma returned matches', {
         matchCount: chromaResults.ids.length

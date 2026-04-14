@@ -210,6 +210,20 @@ describe('ResultFormatter', () => {
       expect(formatted).toContain('Vector search failed');
       expect(formatted).toContain('semantic search unavailable');
     });
+
+    it('should indicate disabled semantic search when embeddings are unconfigured', () => {
+      const results: SearchResults = {
+        observations: [],
+        sessions: [],
+        prompts: []
+      };
+
+      const formatted = formatter.formatSearchResults(results, 'test', false, true);
+
+      expect(formatted).toContain('Semantic search unavailable');
+      expect(formatted).toContain('CLAUDE_MEM_EMBED_URL');
+      expect(formatted).not.toContain('No results found');
+    });
   });
 
   describe('combineResults', () => {

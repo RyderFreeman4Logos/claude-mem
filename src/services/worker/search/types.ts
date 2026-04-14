@@ -4,9 +4,15 @@
  */
 
 import type { ObservationSearchResult, SessionSummarySearchResult, UserPromptSearchResult, SearchOptions, DateRange } from '../../sqlite/types.js';
+import type {
+  ChromaQueryResult,
+  ChromaQueryEnabledResult,
+  ChromaQueryDisabledResult
+} from '../../sync/ChromaSync.js';
 
 // Re-export base types for convenience
 export type { ObservationSearchResult, SessionSummarySearchResult, UserPromptSearchResult, SearchOptions, DateRange };
+export type { ChromaQueryResult, ChromaQueryEnabledResult, ChromaQueryDisabledResult };
 
 /**
  * Constants used across search strategies
@@ -22,15 +28,6 @@ export const SEARCH_CONSTANTS = {
  * Document types stored in Chroma
  */
 export type ChromaDocType = 'observation' | 'session_summary' | 'user_prompt';
-
-/**
- * Chroma query result with typed metadata
- */
-export interface ChromaQueryResult {
-  ids: number[];
-  distances: number[];
-  metadatas: ChromaMetadata[];
-}
 
 /**
  * Metadata stored with each Chroma document
@@ -105,6 +102,8 @@ export interface StrategySearchResult {
   usedChroma: boolean;
   /** Whether fallback was triggered */
   fellBack: boolean;
+  /** Whether semantic search is intentionally disabled because embeddings are unconfigured */
+  semanticSearchDisabled?: boolean;
   /** Strategy that produced the results */
   strategy: SearchStrategyHint;
 }
