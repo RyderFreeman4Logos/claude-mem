@@ -10,11 +10,12 @@ DB_PATH="${CLAUDE_MEM_DB_PATH:-$HOME/.claude-mem/claude-mem.db}"
 CHROMA_DIR="${CLAUDE_MEM_CHROMA_DIR:-$HOME/.claude-mem/chroma-qwen3}"
 PROJECT_NAME="${CLAUDE_MEM_PROJECT_NAME:-claude-mem}"
 WORKER_PORT="${CLAUDE_MEM_WORKER_PORT:-37979}"
+ROLLBACK_MAX_CHUNKS="${CLAUDE_MEM_ROLLBACK_MAX_CHUNKS:-5}"
 
 if python3 -c 'import chromadb' >/dev/null 2>&1; then
-  PYTHON_CMD=(python3)
+  PYTHON_CMD=(python3 -B)
 elif command -v uv >/dev/null 2>&1; then
-  PYTHON_CMD=(uv run --with chromadb python)
+  PYTHON_CMD=(uv run --with chromadb python -B)
 else
   echo "error: chromadb is unavailable and uv is not installed; cannot run rollback migration" >&2
   exit 1
@@ -38,6 +39,7 @@ trap cleanup EXIT
 "${PYTHON_CMD[@]}" scripts/migrate-chroma-to-sqlite-vec.py \
   --db-path "${DB_PATH}" \
   --chroma-dir "${CHROMA_DIR}" \
+  --max-chunks "${ROLLBACK_MAX_CHUNKS}" \
   --repo-root "${REPO_ROOT}"
 
 git checkout "${MAIN_BRANCH}"

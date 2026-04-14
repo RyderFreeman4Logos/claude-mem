@@ -39,6 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chroma-dir", type=Path, default=home / "chroma-qwen3")
     parser.add_argument("--collection", default=COLLECTION_NAME)
     parser.add_argument("--batch-size", type=int, default=200)
+    parser.add_argument("--max-chunks", type=int)
     parser.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args()
@@ -327,18 +328,22 @@ def main() -> int:
 
     try:
         collection = get_collection(args.chroma_dir, args.collection)
-        total = collection.count()
-        LOG.info("collection %s contains %d chunks", args.collection, total)
+        available = collection.count()
+        total = min(available, args.max_chunks) if args.max_chunks is not None else available
+        LOG.info("collection %s contains %d chunks", args.collection, available)
+        if args.max_chunks is not None:
+            LOG.info("limiting migration to %d chunks for this run", total)
 
         migrated = 0
         for offset in range(0, total, args.batch_size):
+            limit = min(args.batch_size, total - offset)
             batch = collection.get(
                 include=["documents", "metadatas", "embeddings"],
-                limit=args.batch_size,
+                limit=limit,
                 offset=offset,
             )
             migrated += upsert_batch(conn, batch)
-            LOG.info("migrated %d/%d chunks", min(offset + args.batch_size, total), total)
+            LOG.info("migrated %d/%d chunks", min(offset + limit, total), total)
 
         set_state(
             conn,
