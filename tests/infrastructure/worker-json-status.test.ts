@@ -11,12 +11,64 @@
  */
 import { describe, it, expect } from 'bun:test';
 import { spawnSync } from 'child_process';
-import { closeSync, existsSync, mkdtempSync, openSync, readFileSync, rmSync } from 'fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import path from 'path';
 import { buildStatusOutput, StatusOutput } from '../../src/services/worker-service.js';
 
 const WORKER_SCRIPT = path.join(__dirname, '../../plugin/scripts/worker-service.cjs');
+const PLUGIN_SETTINGS_KEY = 'claude-mem@thedotmack';
+let nextWorkerPort = 39000;
+
+function allocateWorkerPort(): number {
+  return nextWorkerPort++;
+}
+
+function createIsolatedWorkerEnv(rootDir: string, port: number): NodeJS.ProcessEnv {
+  const homeDir = path.join(rootDir, 'home');
+  const claudeConfigDir = path.join(homeDir, '.claude');
+  const dataDir = path.join(homeDir, '.claude-mem');
+
+  mkdirSync(claudeConfigDir, { recursive: true });
+  mkdirSync(dataDir, { recursive: true });
+  writeFileSync(
+    path.join(claudeConfigDir, 'settings.json'),
+    JSON.stringify({
+      enabledPlugins: {
+        [PLUGIN_SETTINGS_KEY]: true
+      }
+    }),
+    'utf-8'
+  );
+
+  return {
+    ...process.env,
+    HOME: homeDir,
+    CLAUDE_CONFIG_DIR: claudeConfigDir,
+    CLAUDE_MEM_DATA_DIR: dataDir,
+    CLAUDE_MEM_WORKER_PORT: String(port),
+    TMPDIR: rootDir,
+    TMP: rootDir,
+    TEMP: rootDir
+  };
+}
+
+function runWorkerCommand(
+  command: 'start' | 'stop',
+  env: NodeJS.ProcessEnv
+): { stdout: string; stderr: string; exitCode: number } {
+  const result = spawnSync(process.execPath, [WORKER_SCRIPT, command], {
+    encoding: 'utf-8',
+    timeout: 60000,
+    env
+  });
+
+  return {
+    stdout: (result.stdout || '').trim(),
+    stderr: (result.stderr || '').trim(),
+    exitCode: result.status ?? 0
+  };
+}
 
 /**
  * Run worker CLI command and return captured output.
@@ -27,36 +79,15 @@ const WORKER_SCRIPT = path.join(__dirname, '../../plugin/scripts/worker-service.
  */
 function runWorkerStart(): { stdout: string; stderr: string; exitCode: number } {
   const tempDir = mkdtempSync(path.join(tmpdir(), 'worker-json-status-'));
-  const stdoutPath = path.join(tempDir, 'stdout.log');
-  const stderrPath = path.join(tempDir, 'stderr.log');
-  const stdoutFd = openSync(stdoutPath, 'w');
-  const stderrFd = openSync(stderrPath, 'w');
+  const env = createIsolatedWorkerEnv(tempDir, allocateWorkerPort());
 
   try {
-    const result = spawnSync(process.execPath, [WORKER_SCRIPT, 'start'], {
-      encoding: 'utf-8',
-      timeout: 60000,
-      env: process.env,
-      stdio: ['ignore', stdoutFd, stderrFd]
-    });
-
-    closeSync(stdoutFd);
-    closeSync(stderrFd);
-
-    const stdout = existsSync(stdoutPath) ? readFileSync(stdoutPath, 'utf-8').trim() : '';
-    const stderr = existsSync(stderrPath) ? readFileSync(stderrPath, 'utf-8').trim() : '';
-
-    return {
-      stdout,
-      stderr,
-      exitCode: result.status ?? 0
-    };
+    const firstStart = runWorkerCommand('start', env);
+    const secondStart = runWorkerCommand('start', env);
+    return secondStart.stdout ? secondStart : firstStart;
   } finally {
     try {
-      closeSync(stdoutFd);
-    } catch {}
-    try {
-      closeSync(stderrFd);
+      runWorkerCommand('stop', env);
     } catch {}
     rmSync(tempDir, { recursive: true, force: true });
   }

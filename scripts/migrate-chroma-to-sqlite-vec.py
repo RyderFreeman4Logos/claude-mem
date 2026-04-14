@@ -13,6 +13,7 @@ Safety guarantees:
 from __future__ import annotations
 
 import argparse
+from contextlib import closing
 import json
 import logging
 import platform as host_platform
@@ -79,13 +80,10 @@ def configure_logging(level: str) -> None:
 def backup_db(db_path: Path) -> Path:
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     backup_path = db_path.with_name(f"{db_path.name}.sqlite-vec-bak-{timestamp}")
-    source = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=30.0)
-    backup = sqlite3.connect(backup_path, timeout=30.0)
-    try:
+    with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=30.0)) as source, closing(
+        sqlite3.connect(backup_path, timeout=30.0)
+    ) as backup:
         source.backup(backup)
-    finally:
-        backup.close()
-        source.close()
     LOG.info("database backup created at %s", backup_path)
     return backup_path
 
