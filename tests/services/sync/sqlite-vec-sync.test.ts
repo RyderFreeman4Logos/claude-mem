@@ -283,4 +283,38 @@ describe('SqliteVecSync', () => {
 
     await sync.close();
   });
+
+  it('allows global sqlite-vec queries when vectors exist even without a readiness row', async () => {
+    spyOn(EmbeddingClient, 'getInstance').mockReturnValue({
+      embedDocuments: mock(async (docs: string[]) => docs.map((_doc, index) => makeEmbedding(index + 1))),
+      embedQuery: mock(async () => makeEmbedding(1)),
+      getConfig: () => ({ model: 'test-model', dim: 4096 })
+    } as any);
+
+    const sync = new SqliteVecSync('test-project', ':memory:');
+
+    await sync.syncObservation(
+      1,
+      'memory-session',
+      'test-project',
+      {
+        type: 'decision',
+        title: 'SQLite vec',
+        subtitle: null,
+        facts: [],
+        narrative: 'store this narrative',
+        concepts: ['vector'],
+        files_read: ['src/a.ts'],
+        files_modified: ['src/b.ts']
+      },
+      1,
+      Date.now()
+    );
+
+    const queried = await sync.queryChroma('store this narrative', 5);
+    expect(queried.notReady).toBeUndefined();
+    expect(queried.ids).toEqual([1]);
+
+    await sync.close();
+  });
 });

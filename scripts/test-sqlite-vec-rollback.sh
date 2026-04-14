@@ -55,7 +55,7 @@ CLAUDE_MEM_WORKER_PORT="${WORKER_PORT}" bun -e '
   const workerPort = process.env.CLAUDE_MEM_WORKER_PORT;
   if (!workerPort) throw new Error("CLAUDE_MEM_WORKER_PORT is required");
 
-  const url = `http://127.0.0.1:${workerPort}/api/search?project=${encodeURIComponent("claude-mem")}&format=json`;
+  const url = `http://127.0.0.1:${workerPort}/api/search?query=${encodeURIComponent("rollback smoke")}&format=json`;
   let response;
   for (let attempt = 0; attempt < 60; attempt += 1) {
     try {
