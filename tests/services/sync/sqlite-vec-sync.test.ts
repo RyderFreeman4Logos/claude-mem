@@ -381,4 +381,176 @@ describe('SqliteVecSync', () => {
 
     await sync.close();
   });
+
+  it('keeps doc_type-scoped queries not-ready when only another slice has vectors', async () => {
+    spyOn(EmbeddingClient, 'getInstance').mockReturnValue({
+      embedDocuments: mock(async (docs: string[]) => docs.map((_doc, index) => makeEmbedding(index + 1))),
+      embedQuery: mock(async () => makeEmbedding(1)),
+      getConfig: () => ({ model: 'test-model', dim: 4096 })
+    } as any);
+
+    const dbPath = join(tempRoot, 'scoped-readiness.db');
+    const store = new SessionStore(dbPath);
+    const now = Date.now();
+
+    store.db.prepare(`
+      INSERT INTO sdk_sessions (
+        content_session_id,
+        memory_session_id,
+        project,
+        platform_source,
+        user_prompt,
+        started_at,
+        started_at_epoch,
+        status
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      'content-a',
+      'memory-a',
+      'project-a',
+      'claude',
+      'test prompt',
+      new Date(now).toISOString(),
+      now,
+      'completed'
+    );
+    store.db.prepare(`
+      INSERT INTO session_summaries (
+        id,
+        memory_session_id,
+        project,
+        request,
+        investigated,
+        learned,
+        completed,
+        next_steps,
+        notes,
+        prompt_number,
+        discovery_tokens,
+        created_at,
+        created_at_epoch
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      1,
+      'memory-a',
+      'project-a',
+      'legacy request',
+      'legacy investigated',
+      'legacy learned',
+      'legacy completed',
+      null,
+      null,
+      1,
+      0,
+      new Date(now).toISOString(),
+      now
+    );
+    store.close();
+
+    const sync = new SqliteVecSync('project-a', dbPath);
+    await sync.syncObservation(
+      2,
+      'memory-a',
+      'project-a',
+      {
+        type: 'decision',
+        title: 'New observation',
+        subtitle: null,
+        facts: [],
+        narrative: 'new vectorized observation',
+        concepts: [],
+        files_read: [],
+        files_modified: []
+      },
+      1,
+      now
+    );
+
+    const result = await sync.queryChroma('legacy request', 5, {
+      project: 'project-a',
+      doc_type: 'session_summary'
+    });
+
+    expect(result.notReady).toBe(true);
+    expect(result.message).toContain('sqlite-vec backend not ready');
+
+    await sync.close();
+  });
+
+  it('preserves hits from different doc types that share the same sqlite_id', async () => {
+    spyOn(EmbeddingClient, 'getInstance').mockReturnValue({
+      embedDocuments: mock(async (docs: string[]) => docs.map((_doc, index) => makeEmbedding(index + 1))),
+      embedQuery: mock(async () => makeEmbedding(1)),
+      getConfig: () => ({ model: 'test-model', dim: 4096 })
+    } as any);
+
+    const dbPath = join(tempRoot, 'sqlite-id-collision.db');
+    const store = new SessionStore(dbPath);
+    const now = Date.now();
+
+    store.db.prepare(`
+      INSERT INTO sdk_sessions (
+        content_session_id,
+        memory_session_id,
+        project,
+        platform_source,
+        user_prompt,
+        started_at,
+        started_at_epoch,
+        status
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      'content-a',
+      'memory-a',
+      'project-a',
+      'claude',
+      'test prompt',
+      new Date(now).toISOString(),
+      now,
+      'completed'
+    );
+    store.close();
+
+    const sync = new SqliteVecSync('project-a', dbPath);
+    await sync.syncObservation(
+      1,
+      'memory-a',
+      'project-a',
+      {
+        type: 'decision',
+        title: 'Obs one',
+        subtitle: null,
+        facts: [],
+        narrative: 'shared hit',
+        concepts: [],
+        files_read: [],
+        files_modified: []
+      },
+      1,
+      now
+    );
+    await sync.syncSummary(
+      1,
+      'memory-a',
+      'project-a',
+      {
+        request: 'shared hit',
+        investigated: null,
+        learned: null,
+        completed: null,
+        next_steps: null,
+        notes: null
+      },
+      1,
+      now
+    );
+
+    const result = await sync.queryChroma('shared hit', 10, { project: 'project-a' });
+    const returnedDocTypes = result.metadatas.map((metadata: any) => metadata.doc_type).sort();
+
+    expect(result.ids).toHaveLength(2);
+    expect(returnedDocTypes).toEqual(['observation', 'session_summary']);
+
+    await sync.close();
+  });
 });

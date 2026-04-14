@@ -106,6 +106,12 @@ type SqliteVecStateRow = {
   last_error: string | null;
 };
 
+type QueryScope = {
+  project?: string;
+  docType?: string;
+  observationType?: string;
+};
+
 const READY_STATE_KEY = 'sqlite_vec_readiness';
 const NOT_READY_MESSAGE =
   'sqlite-vec backend not ready yet. Run scripts/migrate-chroma-to-sqlite-vec.py to import chroma-qwen3 before querying.';
@@ -230,8 +236,8 @@ export class SqliteVecSync implements VectorSyncBackend {
 
     await this.ensureDatabaseReady();
 
-    const scopedProject = this.extractScopedProject(whereFilter);
-    if (!this.isBackendReadyForQuery(scopedProject)) {
+    const scope = this.extractQueryScope(whereFilter);
+    if (!this.isBackendReadyForQuery(scope)) {
       return {
         notReady: true,
         message: NOT_READY_MESSAGE,
@@ -276,13 +282,14 @@ export class SqliteVecSync implements VectorSyncBackend {
     const ids: number[] = [];
     const distances: number[] = [];
     const metadatas: any[] = [];
-    const seen = new Set<number>();
+    const seen = new Set<string>();
 
     for (const row of rows) {
-      if (seen.has(row.sqlite_id)) {
+      const resultKey = `${row.doc_type}:${row.sqlite_id}`;
+      if (seen.has(resultKey)) {
         continue;
       }
-      seen.add(row.sqlite_id);
+      seen.add(resultKey);
       ids.push(row.sqlite_id);
       distances.push(row.distance);
       metadatas.push({
@@ -726,19 +733,35 @@ export class SqliteVecSync implements VectorSyncBackend {
     return conditions;
   }
 
-  private extractScopedProject(whereFilter?: Record<string, any>): string | undefined {
+  private extractQueryScope(whereFilter?: Record<string, any>): QueryScope {
+    return {
+      project: this.extractScopeValue(whereFilter, 'project'),
+      docType: this.extractScopeValue(whereFilter, 'doc_type'),
+      observationType: this.extractScopeValue(whereFilter, 'type')
+    };
+  }
+
+  private extractScopeValue(
+    whereFilter: Record<string, any> | undefined,
+    key: 'project' | 'doc_type' | 'type'
+  ): string | undefined {
     if (!whereFilter) {
       return undefined;
     }
 
-    if (typeof whereFilter.project === 'string' && whereFilter.project.trim()) {
-      return whereFilter.project;
+    const directValue = whereFilter[key];
+    if (typeof directValue === 'string' && directValue.trim()) {
+      return directValue;
     }
 
     if (Array.isArray(whereFilter.$and)) {
       for (const entry of whereFilter.$and) {
-        if (entry && typeof entry.project === 'string' && entry.project.trim()) {
-          return entry.project;
+        if (!entry || typeof entry !== 'object') {
+          continue;
+        }
+        const nestedValue = this.extractScopeValue(entry, key);
+        if (nestedValue) {
+          return nestedValue;
         }
       }
     }
@@ -746,7 +769,7 @@ export class SqliteVecSync implements VectorSyncBackend {
     return undefined;
   }
 
-  private isBackendReadyForQuery(project?: string): boolean {
+  private isBackendReadyForQuery(scope: QueryScope): boolean {
     const state = this.db.prepare(
       `SELECT * FROM ${STATE_TABLE} WHERE state_key = ?`
     ).get(READY_STATE_KEY) as SqliteVecStateRow | null;
@@ -759,68 +782,113 @@ export class SqliteVecSync implements VectorSyncBackend {
       return false;
     }
 
+    return !this.hasUnvectorizedSourceRecords(scope);
+  }
+
+  private hasUnvectorizedSourceRecords(scope: QueryScope): boolean {
+    if (!this.hasSourceTables()) {
+      return false;
+    }
+
+    const { project, docType, observationType } = scope;
+
+    if (docType === 'observation') {
+      return this.hasUnvectorizedObservations(project, observationType);
+    }
+
+    if (docType === 'session_summary') {
+      return this.hasUnvectorizedSummaries(project);
+    }
+
+    if (docType === 'user_prompt') {
+      return this.hasUnvectorizedPrompts(project);
+    }
+
+    return this.hasUnvectorizedObservations(project, observationType)
+      || this.hasUnvectorizedSummaries(project)
+      || this.hasUnvectorizedPrompts(project);
+  }
+
+  private hasUnvectorizedObservations(project?: string, observationType?: string): boolean {
+    const conditions: string[] = [];
+    const params: Array<string> = [];
+
     if (project) {
-      if (this.hasVectorsForProject(project)) {
-        return true;
-      }
-
-      return !this.hasSourceDataForProject(project);
+      conditions.push('o.project = ?');
+      params.push(project);
     }
 
-    if (this.hasAnySourceData()) {
-      return false;
+    if (observationType) {
+      conditions.push('o.type = ?');
+      params.push(observationType);
     }
 
-    return true;
-  }
-
-  private hasVectorsForProject(project: string): boolean {
-    const vectorCountRow = this.db.prepare(
-      `SELECT COUNT(*) AS count FROM ${CHUNKS_TABLE} WHERE project = ?`
-    ).get(project) as { count: number };
-
-    return vectorCountRow.count > 0;
-  }
-
-  private hasSourceDataForProject(project: string): boolean {
-    if (!this.hasSourceTables()) {
-      return false;
-    }
-
-    const sourceDataRow = this.db.prepare(
+    const whereClause = conditions.length > 0
+      ? `WHERE ${conditions.join(' AND ')}`
+      : '';
+    const row = this.db.prepare(
       `
-        SELECT (
-          (SELECT COUNT(*) FROM observations WHERE project = ?)
-          + (SELECT COUNT(*) FROM session_summaries WHERE project = ?)
-          + (
-            SELECT COUNT(*)
-            FROM user_prompts up
-            JOIN sdk_sessions s ON s.content_session_id = up.content_session_id
-            WHERE s.project = ?
+        SELECT 1 AS missing
+        FROM observations o
+        ${whereClause}
+          ${whereClause ? 'AND' : 'WHERE'}
+          NOT EXISTS (
+            SELECT 1
+            FROM ${CHUNKS_TABLE} c
+            WHERE c.doc_type = 'observation'
+              AND c.sqlite_id = o.id
+              AND c.project = o.project
           )
-        ) AS count
+        LIMIT 1
       `
-    ).get(project, project, project) as { count: number };
+    ).get(...params) as { missing: number } | null;
 
-    return sourceDataRow.count > 0;
+    return row !== null;
   }
 
-  private hasAnySourceData(): boolean {
-    if (!this.hasSourceTables()) {
-      return false;
-    }
-
-    const sourceDataRow = this.db.prepare(
+  private hasUnvectorizedSummaries(project?: string): boolean {
+    const whereClause = project ? 'WHERE ss.project = ?' : '';
+    const row = this.db.prepare(
       `
-        SELECT (
-          (SELECT COUNT(*) FROM observations)
-          + (SELECT COUNT(*) FROM session_summaries)
-          + (SELECT COUNT(*) FROM user_prompts)
-        ) AS count
+        SELECT 1 AS missing
+        FROM session_summaries ss
+        ${whereClause}
+          ${whereClause ? 'AND' : 'WHERE'}
+          NOT EXISTS (
+            SELECT 1
+            FROM ${CHUNKS_TABLE} c
+            WHERE c.doc_type = 'session_summary'
+              AND c.sqlite_id = ss.id
+              AND c.project = ss.project
+          )
+        LIMIT 1
       `
-    ).get() as { count: number };
+    ).get(...(project ? [project] : [])) as { missing: number } | null;
 
-    return sourceDataRow.count > 0;
+    return row !== null;
+  }
+
+  private hasUnvectorizedPrompts(project?: string): boolean {
+    const whereClause = project ? 'WHERE s.project = ?' : '';
+    const row = this.db.prepare(
+      `
+        SELECT 1 AS missing
+        FROM user_prompts up
+        JOIN sdk_sessions s ON s.content_session_id = up.content_session_id
+        ${whereClause}
+          ${whereClause ? 'AND' : 'WHERE'}
+          NOT EXISTS (
+            SELECT 1
+            FROM ${CHUNKS_TABLE} c
+            WHERE c.doc_type = 'user_prompt'
+              AND c.sqlite_id = up.id
+              AND c.project = s.project
+          )
+        LIMIT 1
+      `
+    ).get(...(project ? [project] : [])) as { missing: number } | null;
+
+    return row !== null;
   }
 
   private hasSourceTables(): boolean {
