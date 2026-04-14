@@ -264,6 +264,22 @@ describe('HybridSearchStrategy', () => {
       expect(result.fellBack).toBe(true);
       expect(result.results.observations).toHaveLength(3); // All metadata results
     });
+
+    it('should fall back to metadata-only when semantic search is disabled', async () => {
+      mockChromaSync.queryChroma = mock(() => Promise.resolve({
+        disabled: true,
+        ids: [],
+        distances: [],
+        metadatas: []
+      }));
+
+      const result = await strategy.findByConcept('test-concept', { limit: 10 });
+
+      expect(result.usedChroma).toBe(false);
+      expect(result.fellBack).toBe(true);
+      expect(result.semanticSearchDisabled).toBe(true);
+      expect(result.results.observations).toHaveLength(3);
+    });
   });
 
   describe('findByType', () => {
@@ -318,6 +334,22 @@ describe('HybridSearchStrategy', () => {
 
       expect(result.usedChroma).toBe(false);
       expect(result.fellBack).toBe(true);
+      expect(result.results.observations.length).toBeGreaterThan(0);
+    });
+
+    it('should fall back on disabled semantic ranking', async () => {
+      mockChromaSync.queryChroma = mock(() => Promise.resolve({
+        disabled: true,
+        ids: [],
+        distances: [],
+        metadatas: []
+      }));
+
+      const result = await strategy.findByType('bugfix', { limit: 10 });
+
+      expect(result.usedChroma).toBe(false);
+      expect(result.fellBack).toBe(true);
+      expect(result.semanticSearchDisabled).toBe(true);
       expect(result.results.observations.length).toBeGreaterThan(0);
     });
 

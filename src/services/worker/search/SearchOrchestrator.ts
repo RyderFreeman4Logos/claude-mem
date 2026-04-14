@@ -93,7 +93,7 @@ export class SearchOrchestrator {
       const result = await this.chromaStrategy.search(options);
 
       // If Chroma succeeded (even with 0 results), return
-      if (result.usedChroma) {
+      if (result.usedChroma || result.semanticSearchDisabled) {
         return result;
       }
 
@@ -214,9 +214,15 @@ export class SearchOrchestrator {
   formatSearchResults(
     results: SearchResults,
     query: string,
-    chromaFailed: boolean = false
+    chromaFailed: boolean = false,
+    semanticSearchDisabled: boolean = false
   ): string {
-    return this.resultFormatter.formatSearchResults(results, query, chromaFailed);
+    return this.resultFormatter.formatSearchResults(
+      results,
+      query,
+      chromaFailed,
+      semanticSearchDisabled
+    );
   }
 
   /**

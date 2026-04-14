@@ -162,6 +162,23 @@ describe('SearchOrchestrator', () => {
         expect(result.usedChroma).toBe(false);
       });
 
+      it('should surface semanticSearchDisabled without pretending there were no hits', async () => {
+        mockChromaSync.queryChroma = mock(() => Promise.resolve({
+          disabled: true,
+          ids: [],
+          distances: [],
+          metadatas: []
+        }));
+
+        const result = await orchestrator.search({
+          query: 'test query'
+        });
+
+        expect(result.usedChroma).toBe(false);
+        expect(result.fellBack).toBe(false);
+        expect(result.semanticSearchDisabled).toBe(true);
+      });
+
       it('should normalize comma-separated concepts', async () => {
         await orchestrator.search({
           concepts: 'concept1, concept2, concept3',
@@ -297,6 +314,19 @@ describe('SearchOrchestrator', () => {
         const formatted = orchestrator.formatSearchResults(results, 'test', true);
 
         expect(formatted).toContain('Vector search failed');
+      });
+
+      it('should indicate disabled semantic search when embeddings are unconfigured', () => {
+        const results = {
+          observations: [],
+          sessions: [],
+          prompts: []
+        };
+
+        const formatted = orchestrator.formatSearchResults(results, 'test', false, true);
+
+        expect(formatted).toContain('Semantic search unavailable');
+        expect(formatted).not.toContain('No results found');
       });
     });
   });

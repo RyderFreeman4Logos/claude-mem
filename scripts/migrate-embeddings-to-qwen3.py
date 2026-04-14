@@ -327,7 +327,8 @@ def process_batch(state: sqlite3.Connection, source: sqlite3.Connection, writer:
             if not doc or not doc.strip():
                 missing_ids.append(chunks[i]["chunk_id"])
             else:
-                valid.append((chunks[i]["chunk_id"], doc[:8000], md))  # cap at 8K chars for safety
+                # Client-side document size is intentionally uncapped here; Qwen3 supports 32K context.
+                valid.append((chunks[i]["chunk_id"], doc, md))
     if missing_ids:
         # source row/chunk no longer exists → mark as failed-missing so we skip
         mark(state, missing_ids, "failed", "source_missing")

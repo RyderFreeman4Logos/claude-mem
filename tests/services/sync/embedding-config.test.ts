@@ -37,12 +37,14 @@ describe('Embedding configuration safeguards', () => {
     const sync = new ChromaSync('test-project');
 
     await expect(sync.queryChroma('first query', 5)).resolves.toEqual({
+      disabled: true,
       ids: [],
       distances: [],
       metadatas: [],
     });
 
     await expect(sync.queryChroma('second query', 5)).resolves.toEqual({
+      disabled: true,
       ids: [],
       distances: [],
       metadatas: [],

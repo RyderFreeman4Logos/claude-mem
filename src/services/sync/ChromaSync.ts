@@ -76,6 +76,28 @@ interface StoredUserPrompt {
   project: string;
 }
 
+export interface ChromaQueryEnabledResult {
+  disabled?: false;
+  ids: number[];
+  distances: number[];
+  metadatas: any[];
+}
+
+export interface ChromaQueryDisabledResult {
+  disabled: true;
+  ids: [];
+  distances: [];
+  metadatas: [];
+}
+
+export type ChromaQueryResult = ChromaQueryEnabledResult | ChromaQueryDisabledResult;
+
+export function isChromaQueryDisabledResult(
+  result: ChromaQueryResult
+): result is ChromaQueryDisabledResult {
+  return result.disabled === true;
+}
+
 export class ChromaSync {
   private static missingEmbeddingConfigWarningLogged = false;
   private project: string;
@@ -729,10 +751,10 @@ export class ChromaSync {
     query: string,
     limit: number,
     whereFilter?: Record<string, any>
-  ): Promise<{ ids: number[]; distances: number[]; metadatas: any[] }> {
+  ): Promise<ChromaQueryResult> {
     const embedClient = this.getEmbeddingClientOrSkip('query');
     if (!embedClient) {
-      return { ids: [], distances: [], metadatas: [] };
+      return { disabled: true, ids: [], distances: [], metadatas: [] };
     }
 
     try {
