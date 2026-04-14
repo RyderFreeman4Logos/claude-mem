@@ -136,7 +136,7 @@ CLAUDE_MEM_PROJECT_NAME="${PROJECT_NAME}" bun -e '
   if (!project) throw new Error("CLAUDE_MEM_PROJECT_NAME is required");
 
   const params = new URLSearchParams({
-    type: "decision",
+    obs_type: "decision",
     project,
     format: "json"
   });
