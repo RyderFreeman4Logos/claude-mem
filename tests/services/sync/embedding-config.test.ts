@@ -21,9 +21,8 @@ describe('Embedding configuration safeguards', () => {
 
   it('throws a clear error when CLAUDE_MEM_EMBED_URL is empty', () => {
     spyOn(SettingsDefaultsManager, 'loadFromFile').mockReturnValue({
-      ...SettingsDefaultsManager.getAllDefaults(),
       CLAUDE_MEM_EMBED_URL: ''
-    });
+    } as any);
 
     expect(() => EmbeddingClient.getInstance()).toThrow(MISSING_EMBEDDING_URL_MESSAGE);
   });

@@ -38,6 +38,11 @@ export class HybridSearchStrategy extends BaseSearchStrategy implements SearchSt
     super();
   }
 
+  private observationFilter(project?: string): Record<string, any> {
+    const baseFilter: Record<string, any> = { doc_type: 'observation' };
+    return project ? { $and: [baseFilter, { project }] } : baseFilter;
+  }
+
   canHandle(options: StrategySearchOptions): boolean {
     // Can handle when we have metadata filters and Chroma is available
     return !!this.chromaSync && (
@@ -89,7 +94,8 @@ export class HybridSearchStrategy extends BaseSearchStrategy implements SearchSt
       const ids = metadataResults.map(obs => obs.id);
       const chromaResults = await this.chromaSync.queryChroma(
         concept,
-        Math.min(ids.length, SEARCH_CONSTANTS.CHROMA_BATCH_SIZE)
+        Math.min(ids.length, SEARCH_CONSTANTS.CHROMA_BATCH_SIZE),
+        this.observationFilter(project)
       );
 
       if (isVectorQueryDisabledResult(chromaResults)) {
@@ -176,7 +182,8 @@ export class HybridSearchStrategy extends BaseSearchStrategy implements SearchSt
       const ids = metadataResults.map(obs => obs.id);
       const chromaResults = await this.chromaSync.queryChroma(
         typeStr,
-        Math.min(ids.length, SEARCH_CONSTANTS.CHROMA_BATCH_SIZE)
+        Math.min(ids.length, SEARCH_CONSTANTS.CHROMA_BATCH_SIZE),
+        this.observationFilter(project)
       );
 
       if (isVectorQueryDisabledResult(chromaResults)) {
@@ -268,7 +275,8 @@ export class HybridSearchStrategy extends BaseSearchStrategy implements SearchSt
       const ids = metadataResults.observations.map(obs => obs.id);
       const chromaResults = await this.chromaSync.queryChroma(
         filePath,
-        Math.min(ids.length, SEARCH_CONSTANTS.CHROMA_BATCH_SIZE)
+        Math.min(ids.length, SEARCH_CONSTANTS.CHROMA_BATCH_SIZE),
+        this.observationFilter(project)
       );
 
       if (isVectorQueryDisabledResult(chromaResults)) {

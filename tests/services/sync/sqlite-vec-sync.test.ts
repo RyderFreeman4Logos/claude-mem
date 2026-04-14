@@ -284,17 +284,81 @@ describe('SqliteVecSync', () => {
     await sync.close();
   });
 
-  it('allows global sqlite-vec queries when vectors exist even without a readiness row', async () => {
+  it('keeps global sqlite-vec queries not-ready when source data exists without a readiness row', async () => {
     spyOn(EmbeddingClient, 'getInstance').mockReturnValue({
       embedDocuments: mock(async (docs: string[]) => docs.map((_doc, index) => makeEmbedding(index + 1))),
       embedQuery: mock(async () => makeEmbedding(1)),
       getConfig: () => ({ model: 'test-model', dim: 4096 })
     } as any);
 
-    const sync = new SqliteVecSync('test-project', ':memory:');
+    const dbPath = join(tempRoot, 'global-readiness.db');
+    const store = new SessionStore(dbPath);
+    const now = Date.now();
+
+    store.db.prepare(`
+      INSERT INTO sdk_sessions (
+        content_session_id,
+        memory_session_id,
+        project,
+        platform_source,
+        user_prompt,
+        started_at,
+        started_at_epoch,
+        status
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      'content-a',
+      'memory-a',
+      'project-a',
+      'claude',
+      'test prompt',
+      new Date(now).toISOString(),
+      now,
+      'completed'
+    );
+    store.db.prepare(`
+      INSERT INTO observations (
+        id,
+        memory_session_id,
+        project,
+        text,
+        type,
+        title,
+        subtitle,
+        facts,
+        narrative,
+        concepts,
+        files_read,
+        files_modified,
+        prompt_number,
+        discovery_tokens,
+        created_at,
+        created_at_epoch
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      1,
+      'memory-a',
+      'project-a',
+      'source observation',
+      'decision',
+      'Project A',
+      null,
+      '[]',
+      'source observation',
+      '[]',
+      '[]',
+      '[]',
+      1,
+      0,
+      new Date(now).toISOString(),
+      now
+    );
+    store.close();
+
+    const sync = new SqliteVecSync('test-project', dbPath);
 
     await sync.syncObservation(
-      1,
+      2,
       'memory-session',
       'test-project',
       {
@@ -312,8 +376,8 @@ describe('SqliteVecSync', () => {
     );
 
     const queried = await sync.queryChroma('store this narrative', 5);
-    expect(queried.notReady).toBeUndefined();
-    expect(queried.ids).toEqual([1]);
+    expect(queried.notReady).toBe(true);
+    expect(queried.message).toContain('sqlite-vec backend not ready');
 
     await sync.close();
   });

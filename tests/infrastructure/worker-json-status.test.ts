@@ -11,7 +11,8 @@
  */
 import { describe, it, expect } from 'bun:test';
 import { spawnSync } from 'child_process';
-import { existsSync } from 'fs';
+import { closeSync, existsSync, mkdtempSync, openSync, readFileSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
 import path from 'path';
 import { buildStatusOutput, StatusOutput } from '../../src/services/worker-service.js';
 
@@ -20,30 +21,45 @@ const WORKER_SCRIPT = path.join(__dirname, '../../plugin/scripts/worker-service.
 /**
  * Run worker CLI command and return captured output.
  *
- * Invoke through the platform shell instead of spawning `bun` directly.
- * Under Bun's own test runner, `spawnSync('bun', [...])` can intermittently
- * return empty stdout for this command even though the CLI printed JSON.
- * Shell invocation matches real user execution and keeps the capture stable.
+ * Invoke Bun directly through the current runtime executable.
+ * Shell-based login invocation is brittle in CI and local environments where
+ * `/bin/sh -lc` loads profile scripts with incompatible syntax.
  */
 function runWorkerStart(): { stdout: string; stderr: string; exitCode: number } {
-  const command = `bun "${WORKER_SCRIPT}" start`;
-  const result = process.platform === 'win32'
-    ? spawnSync('cmd.exe', ['/d', '/s', '/c', command], {
-        encoding: 'utf-8',
-        timeout: 60000,
-        env: process.env
-      })
-    : spawnSync('/bin/sh', ['-lc', command], {
-        encoding: 'utf-8',
-        timeout: 60000,
-        env: process.env
-      });
+  const tempDir = mkdtempSync(path.join(tmpdir(), 'worker-json-status-'));
+  const stdoutPath = path.join(tempDir, 'stdout.log');
+  const stderrPath = path.join(tempDir, 'stderr.log');
+  const stdoutFd = openSync(stdoutPath, 'w');
+  const stderrFd = openSync(stderrPath, 'w');
 
-  return {
-    stdout: result.stdout?.trim() || '',
-    stderr: result.stderr?.trim() || '',
-    exitCode: result.status ?? 0
-  };
+  try {
+    const result = spawnSync(process.execPath, [WORKER_SCRIPT, 'start'], {
+      encoding: 'utf-8',
+      timeout: 60000,
+      env: process.env,
+      stdio: ['ignore', stdoutFd, stderrFd]
+    });
+
+    closeSync(stdoutFd);
+    closeSync(stderrFd);
+
+    const stdout = existsSync(stdoutPath) ? readFileSync(stdoutPath, 'utf-8').trim() : '';
+    const stderr = existsSync(stderrPath) ? readFileSync(stderrPath, 'utf-8').trim() : '';
+
+    return {
+      stdout,
+      stderr,
+      exitCode: result.status ?? 0
+    };
+  } finally {
+    try {
+      closeSync(stdoutFd);
+    } catch {}
+    try {
+      closeSync(stderrFd);
+    } catch {}
+    rmSync(tempDir, { recursive: true, force: true });
+  }
 }
 
 describe('worker-json-status', () => {

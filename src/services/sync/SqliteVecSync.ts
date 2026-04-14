@@ -767,10 +767,6 @@ export class SqliteVecSync implements VectorSyncBackend {
       return !this.hasSourceDataForProject(project);
     }
 
-    if (this.hasAnyVectors()) {
-      return true;
-    }
-
     if (this.hasAnySourceData()) {
       return false;
     }
@@ -782,14 +778,6 @@ export class SqliteVecSync implements VectorSyncBackend {
     const vectorCountRow = this.db.prepare(
       `SELECT COUNT(*) AS count FROM ${CHUNKS_TABLE} WHERE project = ?`
     ).get(project) as { count: number };
-
-    return vectorCountRow.count > 0;
-  }
-
-  private hasAnyVectors(): boolean {
-    const vectorCountRow = this.db.prepare(
-      `SELECT COUNT(*) AS count FROM ${CHUNKS_TABLE}`
-    ).get() as { count: number };
 
     return vectorCountRow.count > 0;
   }

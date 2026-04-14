@@ -196,10 +196,24 @@ describe('HybridSearchStrategy', () => {
       const result = await strategy.findByConcept('test-concept', options);
 
       expect(mockSessionSearch.findByConcept).toHaveBeenCalledWith('test-concept', expect.any(Object));
-      expect(mockChromaSync.queryChroma).toHaveBeenCalledWith('test-concept', expect.any(Number));
+      expect(mockChromaSync.queryChroma).toHaveBeenCalledWith(
+        'test-concept',
+        expect.any(Number),
+        { doc_type: 'observation' }
+      );
       expect(result.usedChroma).toBe(true);
       expect(result.fellBack).toBe(false);
       expect(result.strategy).toBe('hybrid');
+    });
+
+    it('scopes concept ranking to observation documents in the requested project', async () => {
+      await strategy.findByConcept('test-concept', { limit: 10, project: 'project-b' });
+
+      expect(mockChromaSync.queryChroma).toHaveBeenCalledWith(
+        'test-concept',
+        expect.any(Number),
+        { $and: [{ doc_type: 'observation' }, { project: 'project-b' }] }
+      );
     });
 
     it('should preserve semantic ranking order from Chroma', async () => {
@@ -295,6 +309,16 @@ describe('HybridSearchStrategy', () => {
       expect(result.usedChroma).toBe(true);
     });
 
+    it('scopes type ranking to observation documents in the requested project', async () => {
+      await strategy.findByType('decision', { limit: 10, project: 'project-b' });
+
+      expect(mockChromaSync.queryChroma).toHaveBeenCalledWith(
+        'decision',
+        expect.any(Number),
+        { $and: [{ doc_type: 'observation' }, { project: 'project-b' }] }
+      );
+    });
+
     it('should handle array of types', async () => {
       const options: StrategySearchOptions = {
         limit: 10
@@ -304,7 +328,11 @@ describe('HybridSearchStrategy', () => {
 
       expect(mockSessionSearch.findByType).toHaveBeenCalledWith(['decision', 'bugfix'], expect.any(Object));
       // Chroma query should use joined type string
-      expect(mockChromaSync.queryChroma).toHaveBeenCalledWith('decision, bugfix', expect.any(Number));
+      expect(mockChromaSync.queryChroma).toHaveBeenCalledWith(
+        'decision, bugfix',
+        expect.any(Number),
+        { doc_type: 'observation' }
+      );
     });
 
     it('should preserve Chroma ranking order for types', async () => {
@@ -377,6 +405,16 @@ describe('HybridSearchStrategy', () => {
       expect(mockSessionSearch.findByFile).toHaveBeenCalledWith('/path/to/file.ts', expect.any(Object));
       expect(result.observations.length).toBeGreaterThanOrEqual(0);
       expect(result.sessions).toHaveLength(1);
+    });
+
+    it('scopes file ranking to observation documents in the requested project', async () => {
+      await strategy.findByFile('/path/to/file.ts', { limit: 10, project: 'project-b' });
+
+      expect(mockChromaSync.queryChroma).toHaveBeenCalledWith(
+        '/path/to/file.ts',
+        expect.any(Number),
+        { $and: [{ doc_type: 'observation' }, { project: 'project-b' }] }
+      );
     });
 
     it('should return sessions without semantic ranking', async () => {

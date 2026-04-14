@@ -3,6 +3,42 @@ import { SearchManager } from '../../src/services/worker/SearchManager.js';
 import { logger } from '../../src/utils/logger.js';
 
 describe('SearchManager', () => {
+  const buildManager = (
+    queryChromaImpl: ReturnType<typeof mock>,
+    sessionSearchOverrides: Record<string, any> = {},
+    sessionStoreOverrides: Record<string, any> = {}
+  ) => new SearchManager(
+    {
+      searchObservations: mock(() => []),
+      searchSessions: mock(() => []),
+      searchUserPrompts: mock(() => []),
+      findByType: mock(() => []),
+      findByConcept: mock(() => []),
+      findByFile: mock(() => ({ observations: [], sessions: [] })),
+      ...sessionSearchOverrides
+    } as any,
+    {
+      getObservationsByIds: mock(() => []),
+      getSessionSummariesByIds: mock(() => []),
+      getUserPromptsByIds: mock(() => []),
+      getTimelineAroundObservation: mock(() => []),
+      getTimelineAroundTimestamp: mock(() => []),
+      ...sessionStoreOverrides
+    } as any,
+    { queryChroma: queryChromaImpl } as any,
+    {
+      formatTableHeader: mock(() => 'HEADER'),
+      formatObservationIndex: mock((_obs: any, index: number) => `OBS-${index}`),
+      formatSessionIndex: mock((_session: any, index: number) => `SESSION-${index}`),
+      formatUserPromptIndex: mock((_prompt: any, index: number) => `PROMPT-${index}`),
+      formatSearchTableHeader: mock(() => 'SEARCH-HEADER'),
+      formatObservationSearchRow: mock(() => 'OBS-ROW'),
+      formatSessionSearchRow: mock(() => 'SESSION-ROW'),
+      formatUserPromptSearchRow: mock(() => 'PROMPT-ROW')
+    } as any,
+    {} as any
+  );
+
   beforeEach(() => {
     (SearchManager as any).semanticSearchUnavailableWarningLogged = false;
     mock.restore();
@@ -221,6 +257,167 @@ describe('SearchManager', () => {
     expect(queryChroma).toHaveBeenCalledWith(
       ['vector'],
       1,
+      { $and: [{ doc_type: 'observation' }, { project: 'project-b' }] }
+    );
+  });
+
+  it('scopes timeline semantic queries to the requested project', async () => {
+    const queryChroma = mock(() => Promise.resolve({
+      ids: [],
+      distances: [],
+      metadatas: []
+    }));
+    const manager = buildManager(queryChroma);
+
+    await manager.timeline({ query: 'matching', project: 'project-b' });
+
+    expect(queryChroma).toHaveBeenCalledWith(
+      'matching',
+      100,
+      { $and: [{ doc_type: 'observation' }, { project: 'project-b' }] }
+    );
+  });
+
+  it('scopes decision semantic queries to the requested project', async () => {
+    const queryChroma = mock(() => Promise.resolve({
+      ids: [],
+      distances: [],
+      metadatas: []
+    }));
+    const manager = buildManager(queryChroma);
+
+    await manager.decisions({ query: 'matching', project: 'project-b' });
+
+    expect(queryChroma).toHaveBeenCalledWith(
+      'matching',
+      40,
+      { $and: [{ doc_type: 'observation', type: 'decision' }, { project: 'project-b' }] }
+    );
+  });
+
+  it('scopes decision ranking queries without a free-text query to the requested project', async () => {
+    const queryChroma = mock(() => Promise.resolve({
+      ids: [],
+      distances: [],
+      metadatas: []
+    }));
+    const manager = buildManager(queryChroma, {
+      findByType: mock(() => [{
+        id: 2,
+        memory_session_id: 'session-456',
+        project: 'project-b',
+        text: 'Vector note',
+        type: 'decision',
+        title: 'Vector note',
+        subtitle: null,
+        facts: '[]',
+        narrative: 'Vector note',
+        concepts: '["vector"]',
+        files_read: '[]',
+        files_modified: '[]',
+        prompt_number: 1,
+        discovery_tokens: 0,
+        created_at: '2025-01-01T12:00:00.000Z',
+        created_at_epoch: Date.now()
+      }])
+    });
+
+    await manager.decisions({ project: 'project-b' });
+
+    expect(queryChroma).toHaveBeenCalledWith(
+      'decision',
+      1,
+      { $and: [{ doc_type: 'observation' }, { project: 'project-b' }] }
+    );
+  });
+
+  it('scopes change ranking queries to the requested project', async () => {
+    const queryChroma = mock(() => Promise.resolve({
+      ids: [],
+      distances: [],
+      metadatas: []
+    }));
+    const matchingObservation = {
+      id: 2,
+      memory_session_id: 'session-456',
+      project: 'project-b',
+      text: 'Vector note',
+      type: 'change',
+      title: 'Vector note',
+      subtitle: null,
+      facts: '[]',
+      narrative: 'Vector note',
+      concepts: '["change"]',
+      files_read: '[]',
+      files_modified: '[]',
+      prompt_number: 1,
+      discovery_tokens: 0,
+      created_at: '2025-01-01T12:00:00.000Z',
+      created_at_epoch: Date.now()
+    };
+    const manager = buildManager(queryChroma, {
+      findByType: mock(() => [matchingObservation]),
+      findByConcept: mock(() => [])
+    });
+
+    await manager.changes({ project: 'project-b' });
+
+    expect(queryChroma).toHaveBeenCalledWith(
+      'what changed',
+      1,
+      { $and: [{ doc_type: 'observation' }, { project: 'project-b' }] }
+    );
+  });
+
+  it('scopes how-it-works ranking queries to the requested project', async () => {
+    const queryChroma = mock(() => Promise.resolve({
+      ids: [],
+      distances: [],
+      metadatas: []
+    }));
+    const manager = buildManager(queryChroma, {
+      findByConcept: mock(() => [{
+        id: 2,
+        memory_session_id: 'session-456',
+        project: 'project-b',
+        text: 'Vector note',
+        type: 'decision',
+        title: 'Vector note',
+        subtitle: null,
+        facts: '[]',
+        narrative: 'Vector note',
+        concepts: '["how-it-works"]',
+        files_read: '[]',
+        files_modified: '[]',
+        prompt_number: 1,
+        discovery_tokens: 0,
+        created_at: '2025-01-01T12:00:00.000Z',
+        created_at_epoch: Date.now()
+      }])
+    });
+
+    await manager.howItWorks({ project: 'project-b' });
+
+    expect(queryChroma).toHaveBeenCalledWith(
+      'how it works architecture',
+      1,
+      { $and: [{ doc_type: 'observation' }, { project: 'project-b' }] }
+    );
+  });
+
+  it('scopes getTimelineByQuery semantic queries to the requested project', async () => {
+    const queryChroma = mock(() => Promise.resolve({
+      ids: [],
+      distances: [],
+      metadatas: []
+    }));
+    const manager = buildManager(queryChroma);
+
+    await manager.getTimelineByQuery({ query: 'matching', project: 'project-b' });
+
+    expect(queryChroma).toHaveBeenCalledWith(
+      'matching',
+      100,
       { $and: [{ doc_type: 'observation' }, { project: 'project-b' }] }
     );
   });

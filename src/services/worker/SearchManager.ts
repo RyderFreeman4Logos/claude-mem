@@ -523,7 +523,11 @@ Set CLAUDE_MEM_EMBED_URL in ~/.claude-mem/settings.json (or your environment) an
       if (this.chromaSync) {
         try {
           logger.debug('SEARCH', 'Using hybrid semantic search for timeline query', {});
-          const chromaResults = await this.queryChroma(query, 100);
+          const chromaResults = await this.queryChroma(
+            query,
+            100,
+            this.withProjectScope({ doc_type: 'observation' }, project)
+          );
           if (this.isSemanticSearchDisabled(chromaResults)) {
             this.warnSemanticSearchUnavailableOnce('timeline', query, project);
             return this.buildSemanticSearchDisabledResponse(query);
@@ -782,7 +786,11 @@ Set CLAUDE_MEM_EMBED_URL in ~/.claude-mem/settings.json (or your environment) an
         if (query) {
           // Semantic search filtered to decision type
           logger.debug('SEARCH', 'Using Chroma semantic search with type=decision filter', {});
-          const chromaResults = await this.queryChroma(query, Math.min((filters.limit || 20) * 2, 100), { type: 'decision' });
+          const chromaResults = await this.queryChroma(
+            query,
+            Math.min((filters.limit || 20) * 2, 100),
+            this.withProjectScope({ doc_type: 'observation', type: 'decision' }, filters.project)
+          );
           if (this.isSemanticSearchDisabled(chromaResults)) {
             this.warnSemanticSearchUnavailableOnce('decisions', query, filters.project);
             return this.buildSemanticSearchDisabledResponse(query);
@@ -804,7 +812,11 @@ Set CLAUDE_MEM_EMBED_URL in ~/.claude-mem/settings.json (or your environment) an
 
           if (metadataResults.length > 0) {
             const ids = metadataResults.map(obs => obs.id);
-            const chromaResults = await this.queryChroma('decision', Math.min(ids.length, 100));
+            const chromaResults = await this.queryChroma(
+              'decision',
+              Math.min(ids.length, 100),
+              this.withProjectScope({ doc_type: 'observation' }, filters.project)
+            );
             if (this.isSemanticSearchDisabled(chromaResults)) {
               this.warnSemanticSearchUnavailableOnce('decisions', 'decision', filters.project);
             }
@@ -879,7 +891,11 @@ Set CLAUDE_MEM_EMBED_URL in ~/.claude-mem/settings.json (or your environment) an
 
         if (allIds.size > 0) {
           const idsArray = Array.from(allIds);
-          const chromaResults = await this.queryChroma('what changed', Math.min(idsArray.length, 100));
+          const chromaResults = await this.queryChroma(
+            'what changed',
+            Math.min(idsArray.length, 100),
+            this.withProjectScope({ doc_type: 'observation' }, filters.project)
+          );
           if (this.isSemanticSearchDisabled(chromaResults)) {
             this.warnSemanticSearchUnavailableOnce('changes', 'what changed', filters.project);
           }
@@ -959,7 +975,11 @@ Set CLAUDE_MEM_EMBED_URL in ~/.claude-mem/settings.json (or your environment) an
 
       if (metadataResults.length > 0) {
         const ids = metadataResults.map(obs => obs.id);
-        const chromaResults = await this.queryChroma('how it works architecture', Math.min(ids.length, 100));
+        const chromaResults = await this.queryChroma(
+          'how it works architecture',
+          Math.min(ids.length, 100),
+          this.withProjectScope({ doc_type: 'observation' }, filters.project)
+        );
         if (this.isSemanticSearchDisabled(chromaResults)) {
           this.warnSemanticSearchUnavailableOnce('how_it_works', 'how it works architecture', filters.project);
         } else {
@@ -1852,7 +1872,11 @@ Set CLAUDE_MEM_EMBED_URL in ~/.claude-mem/settings.json (or your environment) an
     // Use hybrid search if available
     if (this.chromaSync) {
       logger.debug('SEARCH', 'Using hybrid semantic search for timeline query', {});
-      const chromaResults = await this.queryChroma(query, 100);
+      const chromaResults = await this.queryChroma(
+        query,
+        100,
+        this.withProjectScope({ doc_type: 'observation' }, project)
+      );
       if (this.isSemanticSearchDisabled(chromaResults)) {
         this.warnSemanticSearchUnavailableOnce('get_timeline_by_query', query, project);
         return this.buildSemanticSearchDisabledResponse(query);
