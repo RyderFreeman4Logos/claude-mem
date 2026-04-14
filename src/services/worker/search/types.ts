@@ -5,14 +5,20 @@
 
 import type { ObservationSearchResult, SessionSummarySearchResult, UserPromptSearchResult, SearchOptions, DateRange } from '../../sqlite/types.js';
 import type {
-  ChromaQueryResult,
-  ChromaQueryEnabledResult,
-  ChromaQueryDisabledResult
-} from '../../sync/ChromaSync.js';
+  VectorQueryResult,
+  VectorQueryEnabledResult,
+  VectorQueryDisabledResult,
+  VectorQueryNotReadyResult
+} from '../../sync/VectorBackend.js';
 
 // Re-export base types for convenience
 export type { ObservationSearchResult, SessionSummarySearchResult, UserPromptSearchResult, SearchOptions, DateRange };
-export type { ChromaQueryResult, ChromaQueryEnabledResult, ChromaQueryDisabledResult };
+export type {
+  VectorQueryResult,
+  VectorQueryEnabledResult,
+  VectorQueryDisabledResult,
+  VectorQueryNotReadyResult
+};
 
 /**
  * Constants used across search strategies
@@ -104,6 +110,10 @@ export interface StrategySearchResult {
   fellBack: boolean;
   /** Whether semantic search is intentionally disabled because embeddings are unconfigured */
   semanticSearchDisabled?: boolean;
+  /** Whether the selected vector backend exists but has not been populated yet */
+  vectorBackendNotReady?: boolean;
+  /** Backend-specific readiness message */
+  backendNotReadyMessage?: string;
   /** Strategy that produced the results */
   strategy: SearchStrategyHint;
 }

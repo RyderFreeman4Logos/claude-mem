@@ -23,6 +23,11 @@ import { ParsedObservation, ParsedSummary } from '../../sdk/parser.js';
 import { SessionStore } from '../sqlite/SessionStore.js';
 import { logger } from '../../utils/logger.js';
 import { parseFileList } from '../sqlite/observations/files.js';
+import type {
+  VectorQueryResult,
+  VectorSyncBackend
+} from './VectorBackend.js';
+import { isVectorQueryDisabledResult } from './VectorBackend.js';
 
 interface ChromaDocument {
   id: string;
@@ -76,30 +81,17 @@ interface StoredUserPrompt {
   project: string;
 }
 
-export interface ChromaQueryEnabledResult {
-  disabled?: false;
-  ids: number[];
-  distances: number[];
-  metadatas: any[];
+export type ChromaQueryResult = VectorQueryResult;
+export type ChromaQueryEnabledResult = Extract<VectorQueryResult, { ids: number[]; disabled?: false; notReady?: false }>;
+export type ChromaQueryDisabledResult = Extract<VectorQueryResult, { disabled: true }>;
+
+export function isChromaQueryDisabledResult(result: ChromaQueryResult): result is ChromaQueryDisabledResult {
+  return isVectorQueryDisabledResult(result);
 }
 
-export interface ChromaQueryDisabledResult {
-  disabled: true;
-  ids: [];
-  distances: [];
-  metadatas: [];
-}
-
-export type ChromaQueryResult = ChromaQueryEnabledResult | ChromaQueryDisabledResult;
-
-export function isChromaQueryDisabledResult(
-  result: ChromaQueryResult
-): result is ChromaQueryDisabledResult {
-  return result.disabled === true;
-}
-
-export class ChromaSync {
+export class ChromaSync implements VectorSyncBackend {
   private static missingEmbeddingConfigWarningLogged = false;
+  readonly backend = 'chroma' as const;
   private project: string;
   private collectionName: string;
   private collectionCreated = false;

@@ -98,4 +98,39 @@ describe('SearchManager', () => {
     expect(result.semanticSearchDisabled).toBe(true);
     expect(result.query).toBe('relevant observation');
   });
+
+  it('surfaces backend-not-ready state instead of pretending there were no results', async () => {
+    const manager = new SearchManager(
+      {
+        searchObservations: mock(() => []),
+        searchSessions: mock(() => []),
+        searchUserPrompts: mock(() => []),
+        findByType: mock(() => []),
+        findByConcept: mock(() => []),
+        findByFile: mock(() => ({ observations: [], sessions: [] }))
+      } as any,
+      {
+        getObservationsByIds: mock(() => []),
+        getSessionSummariesByIds: mock(() => []),
+        getUserPromptsByIds: mock(() => [])
+      } as any,
+      {
+        queryChroma: mock(() => Promise.resolve({
+          notReady: true,
+          message: 'sqlite-vec backend not ready yet.',
+          ids: [],
+          distances: [],
+          metadatas: []
+        }))
+      } as any,
+      {} as any,
+      {} as any
+    );
+
+    const result = await manager.search({ query: 'relevant observation' });
+    const text = result.content[0].text;
+
+    expect(text).toContain('sqlite-vec backend not ready yet.');
+    expect(text).not.toContain('No results found');
+  });
 });

@@ -16,12 +16,13 @@
 import { basename } from 'path';
 import { SessionSearch } from '../sqlite/SessionSearch.js';
 import { SessionStore } from '../sqlite/SessionStore.js';
-import { ChromaSync } from '../sync/ChromaSync.js';
 import {
-  isChromaQueryDisabledResult,
-  type ChromaQueryDisabledResult,
-  type ChromaQueryResult
-} from '../sync/ChromaSync.js';
+  isVectorQueryDisabledResult,
+  isVectorQueryNotReadyResult,
+  type VectorQueryNotReadyResult,
+  type VectorQueryResult,
+  type VectorSyncBackend
+} from '../sync/VectorBackend.js';
 import { FormattingService } from './FormattingService.js';
 import { TimelineService } from './TimelineService.js';
 import type { TimelineItem } from './TimelineService.js';
@@ -45,7 +46,7 @@ export class SearchManager {
   constructor(
     private sessionSearch: SessionSearch,
     private sessionStore: SessionStore,
-    private chromaSync: ChromaSync | null,
+    private chromaSync: VectorSyncBackend | null,
     private formatter: FormattingService,
     private timelineService: TimelineService
   ) {
@@ -66,7 +67,7 @@ export class SearchManager {
     query: string,
     limit: number,
     whereFilter?: Record<string, any>
-  ): Promise<ChromaQueryResult> {
+  ): Promise<VectorQueryResult> {
     if (!this.chromaSync) {
       return { ids: [], distances: [], metadatas: [] };
     }
@@ -74,9 +75,15 @@ export class SearchManager {
   }
 
   private isSemanticSearchDisabled(
-    chromaResults: ChromaQueryResult
-  ): chromaResults is ChromaQueryDisabledResult {
-    return isChromaQueryDisabledResult(chromaResults);
+    chromaResults: VectorQueryResult
+  ): chromaResults is Extract<VectorQueryResult, { disabled: true }> {
+    return isVectorQueryDisabledResult(chromaResults);
+  }
+
+  private isVectorBackendNotReady(
+    vectorResults: VectorQueryResult
+  ): vectorResults is VectorQueryNotReadyResult {
+    return isVectorQueryNotReadyResult(vectorResults);
   }
 
   private warnSemanticSearchUnavailableOnce(tool: string, query: string, project?: string): void {
@@ -103,6 +110,19 @@ Set CLAUDE_MEM_EMBED_URL in ~/.claude-mem/settings.json (or your environment) an
       content: [{
         type: 'text' as const,
         text: this.formatSemanticSearchDisabledMessage(query)
+      }]
+    };
+  }
+
+  private formatVectorBackendNotReadyMessage(query: string, message: string): string {
+    return `${message}\n\nQuery: "${query}"`;
+  }
+
+  private buildVectorBackendNotReadyResponse(query: string, message: string): any {
+    return {
+      content: [{
+        type: 'text' as const,
+        text: this.formatVectorBackendNotReadyMessage(query, message)
       }]
     };
   }
@@ -172,6 +192,8 @@ Set CLAUDE_MEM_EMBED_URL in ~/.claude-mem/settings.json (or your environment) an
     let prompts: UserPromptSearchResult[] = [];
     let chromaFailed = false;
     let semanticSearchDisabled = false;
+    let vectorBackendNotReady = false;
+    let backendNotReadyMessage: string | null = null;
 
     // Determine which types to query based on type filter
     const searchObservations = !type || type === 'observations';
@@ -222,6 +244,9 @@ Set CLAUDE_MEM_EMBED_URL in ~/.claude-mem/settings.json (or your environment) an
       if (this.isSemanticSearchDisabled(chromaResults)) {
         semanticSearchDisabled = true;
         this.warnSemanticSearchUnavailableOnce('search', query, options.project);
+      } else if (this.isVectorBackendNotReady(chromaResults)) {
+        vectorBackendNotReady = true;
+        backendNotReadyMessage = chromaResults.message;
       } else {
         logger.debug('SEARCH', 'ChromaDB returned semantic matches', { matchCount: chromaResults.ids.length });
 
@@ -316,13 +341,18 @@ Set CLAUDE_MEM_EMBED_URL in ~/.claude-mem/settings.json (or your environment) an
         prompts,
         totalResults,
         query: query || '',
-        semanticSearchDisabled
+        semanticSearchDisabled,
+        vectorBackendNotReady,
+        backendNotReadyMessage
       };
     }
 
     if (totalResults === 0) {
       if (semanticSearchDisabled) {
         return this.buildSemanticSearchDisabledResponse(query);
+      }
+      if (vectorBackendNotReady && backendNotReadyMessage) {
+        return this.buildVectorBackendNotReadyResponse(query, backendNotReadyMessage);
       }
       if (chromaFailed) {
         return {
@@ -483,6 +513,9 @@ Set CLAUDE_MEM_EMBED_URL in ~/.claude-mem/settings.json (or your environment) an
           if (this.isSemanticSearchDisabled(chromaResults)) {
             this.warnSemanticSearchUnavailableOnce('timeline', query, project);
             return this.buildSemanticSearchDisabledResponse(query);
+          }
+          if (this.isVectorBackendNotReady(chromaResults)) {
+            return this.buildVectorBackendNotReadyResponse(query, chromaResults.message);
           }
           logger.debug('SEARCH', 'Chroma returned semantic matches for timeline', { matchCount: chromaResults?.ids?.length ?? 0 });
 
@@ -740,6 +773,9 @@ Set CLAUDE_MEM_EMBED_URL in ~/.claude-mem/settings.json (or your environment) an
             this.warnSemanticSearchUnavailableOnce('decisions', query, filters.project);
             return this.buildSemanticSearchDisabledResponse(query);
           }
+          if (this.isVectorBackendNotReady(chromaResults)) {
+            return this.buildVectorBackendNotReadyResponse(query, chromaResults.message);
+          }
           const obsIds = chromaResults.ids;
 
           if (obsIds.length > 0) {
@@ -757,6 +793,9 @@ Set CLAUDE_MEM_EMBED_URL in ~/.claude-mem/settings.json (or your environment) an
             const chromaResults = await this.queryChroma('decision', Math.min(ids.length, 100));
             if (this.isSemanticSearchDisabled(chromaResults)) {
               this.warnSemanticSearchUnavailableOnce('decisions', 'decision', filters.project);
+            }
+            if (this.isVectorBackendNotReady(chromaResults)) {
+              return this.buildVectorBackendNotReadyResponse('decision', chromaResults.message);
             }
 
             const rankedIds: number[] = [];
@@ -829,6 +868,9 @@ Set CLAUDE_MEM_EMBED_URL in ~/.claude-mem/settings.json (or your environment) an
           const chromaResults = await this.queryChroma('what changed', Math.min(idsArray.length, 100));
           if (this.isSemanticSearchDisabled(chromaResults)) {
             this.warnSemanticSearchUnavailableOnce('changes', 'what changed', filters.project);
+          }
+          if (this.isVectorBackendNotReady(chromaResults)) {
+            return this.buildVectorBackendNotReadyResponse('what changed', chromaResults.message);
           }
 
           const rankedIds: number[] = [];
@@ -907,6 +949,9 @@ Set CLAUDE_MEM_EMBED_URL in ~/.claude-mem/settings.json (or your environment) an
         if (this.isSemanticSearchDisabled(chromaResults)) {
           this.warnSemanticSearchUnavailableOnce('how_it_works', 'how it works architecture', filters.project);
         } else {
+          if (this.isVectorBackendNotReady(chromaResults)) {
+            return this.buildVectorBackendNotReadyResponse('how it works architecture', chromaResults.message);
+          }
           const rankedIds: number[] = [];
           for (const chromaId of chromaResults.ids) {
             if (ids.includes(chromaId) && !rankedIds.includes(chromaId)) {
@@ -965,6 +1010,9 @@ Set CLAUDE_MEM_EMBED_URL in ~/.claude-mem/settings.json (or your environment) an
       if (this.isSemanticSearchDisabled(chromaResults)) {
         this.warnSemanticSearchUnavailableOnce('search_observations', query, options.project);
         return this.buildSemanticSearchDisabledResponse(query);
+      }
+      if (this.isVectorBackendNotReady(chromaResults)) {
+        return this.buildVectorBackendNotReadyResponse(query, chromaResults.message);
       }
       logger.debug('SEARCH', 'Chroma returned semantic matches', { matchCount: chromaResults.ids.length });
 
@@ -1027,6 +1075,9 @@ Set CLAUDE_MEM_EMBED_URL in ~/.claude-mem/settings.json (or your environment) an
         this.warnSemanticSearchUnavailableOnce('search_sessions', query, options.project);
         return this.buildSemanticSearchDisabledResponse(query);
       }
+      if (this.isVectorBackendNotReady(chromaResults)) {
+        return this.buildVectorBackendNotReadyResponse(query, chromaResults.message);
+      }
       logger.debug('SEARCH', 'Chroma returned semantic matches for sessions', { matchCount: chromaResults.ids.length });
 
       if (chromaResults.ids.length > 0) {
@@ -1087,6 +1138,9 @@ Set CLAUDE_MEM_EMBED_URL in ~/.claude-mem/settings.json (or your environment) an
       if (this.isSemanticSearchDisabled(chromaResults)) {
         this.warnSemanticSearchUnavailableOnce('search_user_prompts', query, options.project);
         return this.buildSemanticSearchDisabledResponse(query);
+      }
+      if (this.isVectorBackendNotReady(chromaResults)) {
+        return this.buildVectorBackendNotReadyResponse(query, chromaResults.message);
       }
       logger.debug('SEARCH', 'Chroma returned semantic matches for prompts', { matchCount: chromaResults.ids.length });
 
@@ -1154,6 +1208,9 @@ Set CLAUDE_MEM_EMBED_URL in ~/.claude-mem/settings.json (or your environment) an
         if (this.isSemanticSearchDisabled(chromaResults)) {
           this.warnSemanticSearchUnavailableOnce('find_by_concept', concept, filters.project);
         } else {
+          if (this.isVectorBackendNotReady(chromaResults)) {
+            return this.buildVectorBackendNotReadyResponse(concept, chromaResults.message);
+          }
           // Intersect: Keep only IDs that passed metadata filter, in semantic rank order
           const rankedIds: number[] = [];
           for (const chromaId of chromaResults.ids) {
@@ -1233,6 +1290,9 @@ Set CLAUDE_MEM_EMBED_URL in ~/.claude-mem/settings.json (or your environment) an
           this.warnSemanticSearchUnavailableOnce('find_by_file', filePath, filters.project);
           observations = metadataResults.observations;
         } else {
+          if (this.isVectorBackendNotReady(chromaResults)) {
+            return this.buildVectorBackendNotReadyResponse(filePath, chromaResults.message);
+          }
           // Intersect: Keep only IDs that passed metadata filter, in semantic rank order
           const rankedIds: number[] = [];
           for (const chromaId of chromaResults.ids) {
@@ -1352,6 +1412,9 @@ Set CLAUDE_MEM_EMBED_URL in ~/.claude-mem/settings.json (or your environment) an
         if (this.isSemanticSearchDisabled(chromaResults)) {
           this.warnSemanticSearchUnavailableOnce('find_by_type', typeStr, filters.project);
         } else {
+          if (this.isVectorBackendNotReady(chromaResults)) {
+            return this.buildVectorBackendNotReadyResponse(typeStr, chromaResults.message);
+          }
           // Intersect: Keep only IDs that passed metadata filter, in semantic rank order
           const rankedIds: number[] = [];
           for (const chromaId of chromaResults.ids) {
@@ -1755,6 +1818,9 @@ Set CLAUDE_MEM_EMBED_URL in ~/.claude-mem/settings.json (or your environment) an
       if (this.isSemanticSearchDisabled(chromaResults)) {
         this.warnSemanticSearchUnavailableOnce('get_timeline_by_query', query, project);
         return this.buildSemanticSearchDisabledResponse(query);
+      }
+      if (this.isVectorBackendNotReady(chromaResults)) {
+        return this.buildVectorBackendNotReadyResponse(query, chromaResults.message);
       }
       logger.debug('SEARCH', 'Chroma returned semantic matches for timeline', { matchCount: chromaResults.ids.length });
 

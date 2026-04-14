@@ -18,8 +18,11 @@ import {
   ObservationSearchResult,
   SessionSummarySearchResult
 } from '../types.js';
-import { ChromaSync } from '../../../sync/ChromaSync.js';
-import { isChromaQueryDisabledResult } from '../../../sync/ChromaSync.js';
+import {
+  isVectorQueryDisabledResult,
+  isVectorQueryNotReadyResult,
+  type VectorSyncBackend
+} from '../../../sync/VectorBackend.js';
 import { SessionStore } from '../../../sqlite/SessionStore.js';
 import { SessionSearch } from '../../../sqlite/SessionSearch.js';
 import { logger } from '../../../../utils/logger.js';
@@ -28,7 +31,7 @@ export class HybridSearchStrategy extends BaseSearchStrategy implements SearchSt
   readonly name = 'hybrid';
 
   constructor(
-    private chromaSync: ChromaSync,
+    private chromaSync: VectorSyncBackend,
     private sessionStore: SessionStore,
     private sessionSearch: SessionSearch
   ) {
@@ -89,12 +92,23 @@ export class HybridSearchStrategy extends BaseSearchStrategy implements SearchSt
         Math.min(ids.length, SEARCH_CONSTANTS.CHROMA_BATCH_SIZE)
       );
 
-      if (isChromaQueryDisabledResult(chromaResults)) {
+      if (isVectorQueryDisabledResult(chromaResults)) {
         return {
           results: { observations: metadataResults, sessions: [], prompts: [] },
           usedChroma: false,
           fellBack: true,
           semanticSearchDisabled: true,
+          strategy: 'hybrid'
+        };
+      }
+
+      if (isVectorQueryNotReadyResult(chromaResults)) {
+        return {
+          results: { observations: [], sessions: [], prompts: [] },
+          usedChroma: false,
+          fellBack: false,
+          vectorBackendNotReady: true,
+          backendNotReadyMessage: chromaResults.message,
           strategy: 'hybrid'
         };
       }
@@ -165,12 +179,23 @@ export class HybridSearchStrategy extends BaseSearchStrategy implements SearchSt
         Math.min(ids.length, SEARCH_CONSTANTS.CHROMA_BATCH_SIZE)
       );
 
-      if (isChromaQueryDisabledResult(chromaResults)) {
+      if (isVectorQueryDisabledResult(chromaResults)) {
         return {
           results: { observations: metadataResults, sessions: [], prompts: [] },
           usedChroma: false,
           fellBack: true,
           semanticSearchDisabled: true,
+          strategy: 'hybrid'
+        };
+      }
+
+      if (isVectorQueryNotReadyResult(chromaResults)) {
+        return {
+          results: { observations: [], sessions: [], prompts: [] },
+          usedChroma: false,
+          fellBack: false,
+          vectorBackendNotReady: true,
+          backendNotReadyMessage: chromaResults.message,
           strategy: 'hybrid'
         };
       }
@@ -246,8 +271,12 @@ export class HybridSearchStrategy extends BaseSearchStrategy implements SearchSt
         Math.min(ids.length, SEARCH_CONSTANTS.CHROMA_BATCH_SIZE)
       );
 
-      if (isChromaQueryDisabledResult(chromaResults)) {
+      if (isVectorQueryDisabledResult(chromaResults)) {
         return { observations: metadataResults.observations, sessions, usedChroma: false };
+      }
+
+      if (isVectorQueryNotReadyResult(chromaResults)) {
+        return { observations: [], sessions: [], usedChroma: false };
       }
 
       // Step 3: Intersect with ranking

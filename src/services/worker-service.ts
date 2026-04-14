@@ -21,6 +21,7 @@ import { getAuthMethodDescription } from '../shared/EnvManager.js';
 import { logger } from '../utils/logger.js';
 import { ChromaMcpManager } from './sync/ChromaMcpManager.js';
 import { ChromaSync } from './sync/ChromaSync.js';
+import { resolveVectorBackend } from './sync/VectorBackend.js';
 import { configureSupervisorSignalHandlers, getSupervisor, startSupervisor } from '../supervisor/index.js';
 import { sanitizeEnv } from '../supervisor/env-sanitizer.js';
 
@@ -377,24 +378,29 @@ export class WorkerService {
         runOneTimeChromaMigration();
       }
 
-      // Initialize ChromaMcpManager only if Chroma is enabled
-      const chromaEnabled = settings.CLAUDE_MEM_CHROMA_ENABLED !== 'false';
-      if (chromaEnabled) {
+      const vectorBackend = resolveVectorBackend(settings);
+
+      // Initialize ChromaMcpManager only when Chroma is the active vector backend.
+      if (vectorBackend === 'chroma') {
         this.chromaMcpManager = ChromaMcpManager.getInstance();
         logger.info('SYSTEM', 'ChromaMcpManager initialized (lazy - connects on first use)');
       } else {
-        logger.info('SYSTEM', 'Chroma disabled via CLAUDE_MEM_CHROMA_ENABLED=false, skipping ChromaMcpManager');
+        logger.info('SYSTEM', 'Skipping ChromaMcpManager for non-Chroma backend', {
+          vectorBackend
+        });
       }
 
       const modeId = settings.CLAUDE_MEM_MODE;
       ModeManager.getInstance().loadMode(modeId);
       logger.info('SYSTEM', `Mode loaded: ${modeId}`);
 
-      // Start chroma-mcp SSE server before DB init (ChromaSync needs it)
-      try {
-        await this.chromaServerLifecycle.start();
-      } catch (error) {
-        logger.warn('SYSTEM', 'Chroma SSE server failed to start, vector search will be unavailable', {}, error as Error);
+      // Start chroma-mcp SSE server only when Chroma is active.
+      if (vectorBackend === 'chroma') {
+        try {
+          await this.chromaServerLifecycle.start();
+        } catch (error) {
+          logger.warn('SYSTEM', 'Chroma SSE server failed to start, vector search will be unavailable', {}, error as Error);
+        }
       }
 
       await this.dbManager.initialize();
@@ -447,7 +453,7 @@ export class WorkerService {
       await this.startTranscriptWatcher(settings);
 
       // Auto-backfill Chroma for all projects if out of sync with SQLite (fire-and-forget)
-      if (this.chromaMcpManager) {
+      if (vectorBackend === 'chroma' && this.chromaMcpManager) {
         ChromaSync.backfillAllProjects().then(() => {
           logger.info('CHROMA_SYNC', 'Backfill check complete for all projects');
         }).catch(error => {
