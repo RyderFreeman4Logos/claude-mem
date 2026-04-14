@@ -8,6 +8,11 @@ Safety guarantees:
 - never writes to chroma-qwen3 (read-only source)
 - resume-safe via chunk_id upserts
 - records backend readiness so worker can return "backend not ready" until done
+
+Concurrent-writes safety:
+- after the initial pass, the script re-checks the Chroma collection count and migrates
+  any newly appended chunks in bounded convergence passes
+- state remains "running" until the count stabilizes; chunk_id upserts keep reruns safe
 """
 
 from __future__ import annotations
@@ -64,6 +69,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--collection", default=COLLECTION_NAME)
     parser.add_argument("--batch-size", type=int, default=200)
     parser.add_argument("--max-chunks", type=int)
+    parser.add_argument("--max-convergence-passes", type=int, default=5)
+    parser.add_argument("--convergence-sleep-seconds", type=float, default=2.0)
     parser.add_argument("--embedding-dim", type=int, default=load_embedding_dim(home))
     parser.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--log-level", default="INFO")
@@ -388,17 +395,75 @@ def main() -> int:
             migrated += upsert_batch(conn, batch)
             LOG.info("migrated %d/%d chunks", min(offset + limit, total), total)
 
+        converged = True
+        latest_total = total
+        if args.max_chunks is None:
+            previous_total = total
+            for convergence_pass in range(1, args.max_convergence_passes + 1):
+                if args.convergence_sleep_seconds > 0:
+                    time.sleep(args.convergence_sleep_seconds)
+                latest_total = collection.count()
+                delta = latest_total - previous_total
+                LOG.info(
+                    "convergence pass %d/%d: collection count=%d delta=%+d",
+                    convergence_pass,
+                    args.max_convergence_passes,
+                    latest_total,
+                    delta,
+                )
+                if delta <= 0:
+                    break
+
+                converged = False
+                for offset in range(previous_total, latest_total, args.batch_size):
+                    limit = min(args.batch_size, latest_total - offset)
+                    batch = collection.get(
+                        include=["documents", "metadatas", "embeddings"],
+                        limit=limit,
+                        offset=offset,
+                    )
+                    migrated += upsert_batch(conn, batch)
+                    LOG.info(
+                        "convergence migrated %d/%d chunks",
+                        min(offset + limit, latest_total),
+                        latest_total,
+                    )
+                previous_total = latest_total
+                converged = True
+            else:
+                latest_total = collection.count()
+                delta = latest_total - previous_total
+                if delta <= 0:
+                    LOG.info(
+                        "convergence stabilized after %d passes: collection count=%d delta=%+d",
+                        args.max_convergence_passes,
+                        latest_total,
+                        delta,
+                    )
+                    converged = True
+                else:
+                    LOG.warning(
+                        "convergence did not stabilize after %d passes: collection count=%d delta=%+d",
+                        args.max_convergence_passes,
+                        latest_total,
+                        delta,
+                    )
+                    converged = False
+
         final_status = "complete"
         if args.max_chunks is not None and total < available:
             final_status = "partial"
+        elif not converged:
+            final_status = "partial"
         set_state(conn, status=final_status, completed_at_epoch=int(time.time()), last_error=None)
         LOG.info(
-            "sqlite-vec migration %s: upserted %d chunks from %s into %s (backup: %s)",
+            "sqlite-vec migration %s: upserted %d chunks from %s into %s (backup: %s, final count: %d)",
             final_status,
             migrated,
             args.chroma_dir,
             args.db_path,
             backup_path,
+            latest_total,
         )
         return 0
     except Exception as exc:
