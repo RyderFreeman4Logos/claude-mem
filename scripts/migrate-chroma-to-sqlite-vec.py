@@ -16,6 +16,7 @@ import argparse
 import json
 import logging
 import platform as host_platform
+import re
 import shutil
 import sqlite3
 import sys
@@ -28,8 +29,30 @@ CHUNKS_TABLE = "claude_mem_vec_chunks"
 STATE_TABLE = "claude_mem_vec_state"
 EMBEDDINGS_TABLE = "claude_mem_vec_embeddings"
 COLLECTION_NAME = "cm__claude-mem"
+EMBEDDING_DIMENSION_PATTERN = r"float\[(\d+)\]"
 
 LOG = logging.getLogger("sqlite-vec-migrate")
+
+
+def load_embedding_dim(home: Path) -> int:
+    settings_path = home / "settings.json"
+    try:
+        settings = json.loads(settings_path.read_text())
+        if isinstance(settings.get("env"), dict):
+            settings = settings["env"]
+        raw_dim = settings.get("CLAUDE_MEM_EMBED_DIM", 4096)
+        return int(raw_dim)
+    except Exception:
+        return 4096
+
+
+def extract_embedding_dimension(sql: str | None) -> int | None:
+    if not sql:
+        return None
+    match = re.search(EMBEDDING_DIMENSION_PATTERN, sql)
+    if not match:
+        return None
+    return int(match.group(1))
 
 
 def parse_args() -> argparse.Namespace:
@@ -40,6 +63,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--collection", default=COLLECTION_NAME)
     parser.add_argument("--batch-size", type=int, default=200)
     parser.add_argument("--max-chunks", type=int)
+    parser.add_argument("--embedding-dim", type=int, default=load_embedding_dim(home))
     parser.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args()
@@ -99,7 +123,7 @@ def open_target(db_path: Path, ext_path: Path) -> sqlite3.Connection:
     return conn
 
 
-def ensure_schema(conn: sqlite3.Connection) -> None:
+def ensure_schema(conn: sqlite3.Connection, embedding_dim: int) -> None:
     conn.executescript(
         f"""
         CREATE TABLE IF NOT EXISTS {CHUNKS_TABLE} (
@@ -132,10 +156,25 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             completed_at_epoch INTEGER,
             last_error TEXT
         );
-        CREATE VIRTUAL TABLE IF NOT EXISTS {EMBEDDINGS_TABLE}
-            USING vec0(embedding float[4096]);
         """
     )
+
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE name = ?",
+        (EMBEDDINGS_TABLE,),
+    ).fetchone()
+    if row is None:
+        conn.execute(
+            f"CREATE VIRTUAL TABLE IF NOT EXISTS {EMBEDDINGS_TABLE} USING vec0(embedding float[{embedding_dim}])"
+        )
+        return
+
+    existing_dim = extract_embedding_dimension(row["sql"])
+    if existing_dim is not None and existing_dim != embedding_dim:
+        raise RuntimeError(
+            f"sqlite-vec table dimension mismatch: expected {embedding_dim}, found {existing_dim}. "
+            "Remove claude_mem_vec_embeddings and rerun the migration with the current embedding config."
+        )
 
 
 def set_state(
@@ -323,7 +362,7 @@ def main() -> int:
     LOG.info("resume-safe mode enabled via chunk_id upsert")
 
     conn = open_target(args.db_path, ext_path)
-    ensure_schema(conn)
+    ensure_schema(conn, args.embedding_dim)
     set_state(conn, status="running", started_at_epoch=int(time.time()))
 
     try:
@@ -345,14 +384,13 @@ def main() -> int:
             migrated += upsert_batch(conn, batch)
             LOG.info("migrated %d/%d chunks", min(offset + limit, total), total)
 
-        set_state(
-            conn,
-            status="complete",
-            completed_at_epoch=int(time.time()),
-            last_error=None,
-        )
+        final_status = "complete"
+        if args.max_chunks is not None and total < available:
+            final_status = "partial"
+        set_state(conn, status=final_status, completed_at_epoch=int(time.time()), last_error=None)
         LOG.info(
-            "sqlite-vec migration complete: upserted %d chunks from %s into %s (backup: %s)",
+            "sqlite-vec migration %s: upserted %d chunks from %s into %s (backup: %s)",
+            final_status,
             migrated,
             args.chroma_dir,
             args.db_path,

@@ -13,6 +13,7 @@
 
 import { Database } from 'bun:sqlite';
 import { DB_PATH, USER_SETTINGS_PATH } from '../../shared/paths.js';
+import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
 import { logger } from '../../utils/logger.js';
 import { parseFileList } from '../sqlite/observations/files.js';
 import { ParsedObservation, ParsedSummary } from '../../sdk/parser.js';
@@ -111,6 +112,7 @@ const NOT_READY_MESSAGE =
 const CHUNKS_TABLE = 'claude_mem_vec_chunks';
 const STATE_TABLE = 'claude_mem_vec_state';
 const EMBEDDINGS_TABLE = 'claude_mem_vec_embeddings';
+const EMBEDDING_DIMENSION_PATTERN = /float\[(\d+)\]/;
 
 export class SqliteVecSync implements VectorSyncBackend {
   private static missingEmbeddingConfigWarningLogged = false;
@@ -358,6 +360,8 @@ export class SqliteVecSync implements VectorSyncBackend {
       return;
     }
 
+    const embeddingDim = this.getConfiguredEmbeddingDimension();
+
     this.db.run(`
       CREATE TABLE IF NOT EXISTS ${CHUNKS_TABLE} (
         rowid INTEGER PRIMARY KEY,
@@ -396,12 +400,48 @@ export class SqliteVecSync implements VectorSyncBackend {
         last_error TEXT
       )
     `);
-    this.db.run(`
-      CREATE VIRTUAL TABLE IF NOT EXISTS ${EMBEDDINGS_TABLE}
-      USING vec0(embedding float[4096])
-    `);
+
+    const embeddingsTableSql = this.db.prepare(
+      `SELECT sql FROM sqlite_master WHERE name = ?`
+    ).get(EMBEDDINGS_TABLE) as { sql: string | null } | null;
+    if (!embeddingsTableSql) {
+      this.db.run(`
+        CREATE VIRTUAL TABLE IF NOT EXISTS ${EMBEDDINGS_TABLE}
+        USING vec0(embedding float[${embeddingDim}])
+      `);
+    } else {
+      const existingDim = this.extractEmbeddingDimension(embeddingsTableSql.sql);
+      if (existingDim !== null && existingDim !== embeddingDim) {
+        throw new Error(
+          `sqlite-vec table dimension mismatch: expected ${embeddingDim}, found ${existingDim}. ` +
+          'Remove claude_mem_vec_embeddings and rerun the migration with the current embedding config.'
+        );
+      }
+    }
 
     this.schemaReady = true;
+  }
+
+  private getConfiguredEmbeddingDimension(): number {
+    const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
+    const rawDim = settings.CLAUDE_MEM_EMBED_DIM || '4096';
+    const parsed = Number.parseInt(rawDim, 10);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      throw new Error(`Invalid CLAUDE_MEM_EMBED_DIM: ${rawDim}`);
+    }
+    return parsed;
+  }
+
+  private extractEmbeddingDimension(sql: string | null): number | null {
+    if (!sql) {
+      return null;
+    }
+    const match = sql.match(EMBEDDING_DIMENSION_PATTERN);
+    if (!match) {
+      return null;
+    }
+    const parsed = Number.parseInt(match[1], 10);
+    return Number.isFinite(parsed) ? parsed : null;
   }
 
   private getEmbeddingClientOrSkip(operation: 'sync' | 'query'): EmbeddingClient | null {

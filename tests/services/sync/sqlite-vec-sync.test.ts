@@ -6,9 +6,10 @@ import { randomUUID } from 'crypto';
 import { SessionStore } from '../../../src/services/sqlite/SessionStore.js';
 import { EmbeddingClient } from '../../../src/services/sync/EmbeddingClient.js';
 import { SqliteVecSync } from '../../../src/services/sync/SqliteVecSync.js';
+import { SettingsDefaultsManager } from '../../../src/shared/SettingsDefaultsManager.js';
 
-function makeEmbedding(seed: number): number[] {
-  return Array.from({ length: 4096 }, () => seed);
+function makeEmbedding(seed: number, dim = 4096): number[] {
+  return Array.from({ length: dim }, () => seed);
 }
 
 describe('SqliteVecSync', () => {
@@ -19,6 +20,9 @@ describe('SqliteVecSync', () => {
     mkdirSync(tempRoot, { recursive: true });
     (EmbeddingClient as any).instance = null;
     mock.restore();
+    spyOn(SettingsDefaultsManager, 'loadFromFile').mockReturnValue({
+      CLAUDE_MEM_EMBED_DIM: '4096'
+    } as any);
   });
 
   afterEach(() => {
@@ -208,5 +212,75 @@ describe('SqliteVecSync', () => {
     expect(result.message).toContain('sqlite-vec backend not ready');
 
     await sharedBackend.close();
+  });
+
+  it('keeps sqlite-vec queries not-ready when migration state is partial', async () => {
+    spyOn(EmbeddingClient, 'getInstance').mockReturnValue({
+      embedDocuments: mock(async (docs: string[]) => docs.map((_doc, index) => makeEmbedding(index + 1))),
+      embedQuery: mock(async () => makeEmbedding(1)),
+      getConfig: () => ({ model: 'test-model', dim: 4096 })
+    } as any);
+
+    const sync = new SqliteVecSync('test-project', ':memory:');
+    await (sync as any).ensureDatabaseReady();
+    (sync as any).db.prepare(`
+      INSERT INTO claude_mem_vec_state (
+        state_key,
+        status,
+        source,
+        started_at_epoch,
+        completed_at_epoch,
+        last_error
+      ) VALUES (?, ?, ?, ?, ?, ?)
+    `).run(
+      'sqlite_vec_readiness',
+      'partial',
+      'chroma-qwen3',
+      Date.now(),
+      Date.now(),
+      null
+    );
+
+    const result = await sync.queryChroma('source observation', 5, { project: 'test-project' });
+    expect(result.notReady).toBe(true);
+    expect(result.message).toContain('sqlite-vec backend not ready');
+
+    await sync.close();
+  });
+
+  it('uses the configured embedding dimension for sqlite-vec tables', async () => {
+    (SettingsDefaultsManager.loadFromFile as any).mockReturnValue({
+      CLAUDE_MEM_EMBED_DIM: '8'
+    } as any);
+    spyOn(EmbeddingClient, 'getInstance').mockReturnValue({
+      embedDocuments: mock(async (docs: string[]) => docs.map((_doc, index) => makeEmbedding(index + 1, 8))),
+      embedQuery: mock(async () => makeEmbedding(1, 8)),
+      getConfig: () => ({ model: 'test-model', dim: 8 })
+    } as any);
+
+    const sync = new SqliteVecSync('test-project', ':memory:');
+
+    await sync.syncObservation(
+      1,
+      'memory-session',
+      'test-project',
+      {
+        type: 'decision',
+        title: 'SQLite vec',
+        subtitle: null,
+        facts: [],
+        narrative: 'store this narrative',
+        concepts: ['vector'],
+        files_read: ['src/a.ts'],
+        files_modified: ['src/b.ts']
+      },
+      1,
+      Date.now()
+    );
+
+    const queried = await sync.queryChroma('store this narrative', 5, { project: 'test-project' });
+    expect(queried.ids).toEqual([1]);
+
+    await sync.close();
   });
 });
