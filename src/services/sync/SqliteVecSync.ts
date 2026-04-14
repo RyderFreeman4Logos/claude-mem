@@ -312,11 +312,26 @@ export class SqliteVecSync implements VectorSyncBackend {
     return { ids, distances, metadatas };
   }
 
-  async deleteBySqliteId(sqliteId: number): Promise<void> {
+  async deleteBySqliteId(
+    sqliteId: number,
+    options: {
+      docType: string;
+      project?: string;
+    }
+  ): Promise<void> {
     await this.ensureDatabaseReady();
+    const { docType, project } = options;
+    const filters = ['sqlite_id = ?', 'doc_type = ?'];
+    const params: Array<number | string> = [sqliteId, docType];
+
+    if (project) {
+      filters.push('project = ?');
+      params.push(project);
+    }
+
     const rows = this.db.query(
-      `SELECT rowid FROM ${CHUNKS_TABLE} WHERE sqlite_id = ?`
-    ).all(sqliteId) as Array<{ rowid: number }>;
+      `SELECT rowid FROM ${CHUNKS_TABLE} WHERE ${filters.join(' AND ')}`
+    ).all(...params) as Array<{ rowid: number }>;
 
     this.db.run('BEGIN');
     try {
@@ -773,10 +788,6 @@ export class SqliteVecSync implements VectorSyncBackend {
     const state = this.db.prepare(
       `SELECT * FROM ${STATE_TABLE} WHERE state_key = ?`
     ).get(READY_STATE_KEY) as SqliteVecStateRow | null;
-
-    if (state?.status === 'complete') {
-      return true;
-    }
 
     if (state && state.status !== 'complete') {
       return false;

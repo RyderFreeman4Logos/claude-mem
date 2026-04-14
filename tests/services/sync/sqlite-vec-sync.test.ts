@@ -68,7 +68,7 @@ describe('SqliteVecSync', () => {
       field_type: 'narrative'
     }));
 
-    await sync.deleteBySqliteId(1);
+    await sync.deleteBySqliteId(1, { docType: 'observation', project: 'test-project' });
 
     const afterDelete = await sync.queryChroma('store this narrative', 5, { project: 'test-project' });
     expect(afterDelete.ids).toEqual([]);
@@ -238,6 +238,104 @@ describe('SqliteVecSync', () => {
       'chroma-qwen3',
       Date.now(),
       Date.now(),
+      null
+    );
+
+    const result = await sync.queryChroma('source observation', 5, { project: 'test-project' });
+    expect(result.notReady).toBe(true);
+    expect(result.message).toContain('sqlite-vec backend not ready');
+
+    await sync.close();
+  });
+
+  it('does not treat a complete migration row as ready when source rows are still missing vectors', async () => {
+    spyOn(EmbeddingClient, 'getInstance').mockReturnValue({
+      embedDocuments: mock(async (docs: string[]) => docs.map((_doc, index) => makeEmbedding(index + 1))),
+      embedQuery: mock(async () => makeEmbedding(1)),
+      getConfig: () => ({ model: 'test-model', dim: 4096 })
+    } as any);
+
+    const dbPath = join(tempRoot, 'complete-state-readiness.db');
+    const store = new SessionStore(dbPath);
+    const now = Date.now();
+
+    store.db.prepare(`
+      INSERT INTO sdk_sessions (
+        content_session_id,
+        memory_session_id,
+        project,
+        platform_source,
+        user_prompt,
+        started_at,
+        started_at_epoch,
+        status
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      'content-1',
+      'memory-1',
+      'test-project',
+      'claude',
+      'test prompt',
+      new Date(now).toISOString(),
+      now,
+      'completed'
+    );
+    store.db.prepare(`
+      INSERT INTO observations (
+        id,
+        memory_session_id,
+        project,
+        text,
+        type,
+        title,
+        subtitle,
+        facts,
+        narrative,
+        concepts,
+        files_read,
+        files_modified,
+        prompt_number,
+        discovery_tokens,
+        created_at,
+        created_at_epoch
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      1,
+      'memory-1',
+      'test-project',
+      'source observation',
+      'decision',
+      'Missing vector',
+      null,
+      '[]',
+      'source observation',
+      '[]',
+      '[]',
+      '[]',
+      1,
+      0,
+      new Date(now).toISOString(),
+      now
+    );
+    store.close();
+
+    const sync = new SqliteVecSync('test-project', dbPath);
+    await (sync as any).ensureDatabaseReady();
+    (sync as any).db.prepare(`
+      INSERT INTO claude_mem_vec_state (
+        state_key,
+        status,
+        source,
+        started_at_epoch,
+        completed_at_epoch,
+        last_error
+      ) VALUES (?, ?, ?, ?, ?, ?)
+    `).run(
+      'sqlite_vec_readiness',
+      'complete',
+      'chroma-qwen3',
+      now,
+      now,
       null
     );
 
@@ -550,6 +648,96 @@ describe('SqliteVecSync', () => {
 
     expect(result.ids).toHaveLength(2);
     expect(returnedDocTypes).toEqual(['observation', 'session_summary']);
+
+    await sync.close();
+  });
+
+  it('deletes only the targeted doc type when sqlite ids overlap across source tables', async () => {
+    spyOn(EmbeddingClient, 'getInstance').mockReturnValue({
+      embedDocuments: mock(async (docs: string[]) => docs.map((_doc, index) => makeEmbedding(index + 1))),
+      embedQuery: mock(async () => makeEmbedding(1)),
+      getConfig: () => ({ model: 'test-model', dim: 4096 })
+    } as any);
+
+    const dbPath = join(tempRoot, 'delete-collision.db');
+    const store = new SessionStore(dbPath);
+    const now = Date.now();
+
+    store.db.prepare(`
+      INSERT INTO sdk_sessions (
+        content_session_id,
+        memory_session_id,
+        project,
+        platform_source,
+        user_prompt,
+        started_at,
+        started_at_epoch,
+        status
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      'content-a',
+      'memory-a',
+      'project-a',
+      'claude',
+      'test prompt',
+      new Date(now).toISOString(),
+      now,
+      'completed'
+    );
+    store.close();
+
+    const sync = new SqliteVecSync('project-a', dbPath);
+    await sync.syncObservation(
+      1,
+      'memory-a',
+      'project-a',
+      {
+        type: 'decision',
+        title: 'Obs one',
+        subtitle: null,
+        facts: [],
+        narrative: 'observation hit',
+        concepts: [],
+        files_read: [],
+        files_modified: []
+      },
+      1,
+      now
+    );
+    await sync.syncSummary(
+      1,
+      'memory-a',
+      'project-a',
+      {
+        request: 'summary hit',
+        investigated: null,
+        learned: null,
+        completed: null,
+        next_steps: null,
+        notes: null
+      },
+      1,
+      now
+    );
+
+    await sync.deleteBySqliteId(1, { docType: 'observation', project: 'project-a' });
+
+    const observationResult = await sync.queryChroma('observation hit', 5, {
+      project: 'project-a',
+      doc_type: 'observation'
+    });
+    expect(observationResult.ids).toEqual([]);
+
+    const summaryResult = await sync.queryChroma('summary hit', 5, {
+      project: 'project-a',
+      doc_type: 'session_summary'
+    });
+    expect(summaryResult.notReady).toBeUndefined();
+    expect(summaryResult.ids).toEqual([1]);
+    expect(summaryResult.metadatas[0]).toEqual(expect.objectContaining({
+      doc_type: 'session_summary',
+      sqlite_id: 1
+    }));
 
     await sync.close();
   });
