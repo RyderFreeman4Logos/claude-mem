@@ -32,6 +32,7 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
 fi
 
 cleanup() {
+  CLAUDE_MEM_WORKER_PORT="${WORKER_PORT}" bun plugin/scripts/worker-service.cjs stop >/dev/null 2>&1 || true
   git checkout "${ORIGINAL_BRANCH}" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -48,31 +49,44 @@ CLAUDE_MEM_CHROMA_ENABLED=false \
 CLAUDE_MEM_TRANSCRIPTS_ENABLED=false \
 CLAUDE_MEM_WORKER_PORT="${WORKER_PORT}" \
 CLAUDE_MEM_DATA_DIR="$(dirname "${DB_PATH}")" \
-CLAUDE_MEM_DB_PATH="${DB_PATH}" bun -e '
-  import { WorkerService } from "./src/services/worker-service.ts";
-  import { DatabaseManager } from "./src/services/worker/DatabaseManager.ts";
+CLAUDE_MEM_DB_PATH="${DB_PATH}" bun plugin/scripts/worker-service.cjs start >/dev/null
 
-  const worker = new WorkerService();
-  await worker.start();
+CLAUDE_MEM_WORKER_PORT="${WORKER_PORT}" bun -e '
+  const workerPort = process.env.CLAUDE_MEM_WORKER_PORT;
+  if (!workerPort) throw new Error("CLAUDE_MEM_WORKER_PORT is required");
 
-  const url = `http://127.0.0.1:${process.env.CLAUDE_MEM_WORKER_PORT}/api/search?project=${encodeURIComponent("claude-mem")}&format=json`;
-  const res = await fetch(url);
-  if (!res.ok) {
-    throw new Error(`rollback search api failed: ${res.status}`);
+  const url = `http://127.0.0.1:${workerPort}/api/search?project=${encodeURIComponent("claude-mem")}&format=json`;
+  let response;
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    try {
+      response = await fetch(url);
+      if (response.ok) break;
+    } catch {}
+    await new Promise(resolve => setTimeout(resolve, 500));
   }
-  await res.json();
+
+  if (!response?.ok) {
+    throw new Error(`rollback search api failed: ${response?.status ?? "unreachable"}`);
+  }
+
+  await response.json();
+'
+
+CLAUDE_MEM_DB_PATH="${DB_PATH}" bun -e '
+  import { Database } from "bun:sqlite";
 
   const dbPath = process.env.CLAUDE_MEM_DB_PATH;
   if (!dbPath) throw new Error("CLAUDE_MEM_DB_PATH is required");
 
-  const dbManager = new DatabaseManager(dbPath);
-  await dbManager.initialize();
-  const store = dbManager.getSessionStore();
+  const db = new Database(dbPath);
+  db.run("PRAGMA journal_mode = WAL");
+
   const now = Date.now();
+  const iso = new Date(now).toISOString();
   const contentSessionId = `rollback-content-${now}`;
   const memorySessionId = `rollback-memory-${now}`;
 
-  store.db.prepare(`
+  db.prepare(`
     INSERT INTO sdk_sessions (
       content_session_id,
       memory_session_id,
@@ -89,12 +103,12 @@ CLAUDE_MEM_DB_PATH="${DB_PATH}" bun -e '
     "claude-mem",
     "claude",
     "rollback smoke",
-    new Date(now).toISOString(),
+    iso,
     now,
     "completed",
   );
 
-  store.db.prepare(`
+  db.prepare(`
     INSERT INTO observations (
       memory_session_id,
       project,
@@ -108,12 +122,13 @@ CLAUDE_MEM_DB_PATH="${DB_PATH}" bun -e '
     "claude-mem",
     "rollback smoke observation",
     "decision",
-    new Date(now).toISOString(),
+    iso,
     now,
   );
 
-  await dbManager.close();
-  await worker.shutdown("rollback-test");
+  db.close();
 '
+
+CLAUDE_MEM_WORKER_PORT="${WORKER_PORT}" bun plugin/scripts/worker-service.cjs stop >/dev/null
 
 echo "rollback smoke passed on ${MAIN_BRANCH} using ${DB_PATH}"
