@@ -5,6 +5,7 @@ import type {
   StorageWorkerData,
   StorageWorkerErrorResponse,
   StorageWorkerRequest,
+  StorageWorkerRequestMap,
   StorageWorkerRequestType,
   StorageWorkerResponseMap,
   StorageWorkerSuccessResponse,
@@ -12,7 +13,9 @@ import type {
 
 const data = workerData as StorageWorkerData;
 
-if (!parentPort) {
+const port = parentPort;
+
+if (!port) {
   throw new Error('Sqlite writer worker requires a parentPort');
 }
 
@@ -31,10 +34,12 @@ function blockFor(ms: number): void {
 
 function runRequest<T extends StorageWorkerRequestType>(request: StorageWorkerRequest<T>): StorageWorkerResponseMap[T] {
   switch (request.type) {
-    case 'claim':
-      return pendingStore.claimNextMessage(request.payload.sessionDbId) as StorageWorkerResponseMap[T];
+    case 'claim': {
+      const { sessionDbId } = request.payload as StorageWorkerRequestMap['claim'];
+      return pendingStore.claimNextMessage(sessionDbId) as StorageWorkerResponseMap[T];
+    }
     case 'persist': {
-      const { job } = request.payload;
+      const { job } = request.payload as StorageWorkerRequestMap['persist'];
 
       sessionStore.ensureMemorySessionIdRegistered(job.sessionDbId, job.memorySessionId);
       blockFor(data.options?.commitDelayMs ?? 0);
@@ -56,11 +61,13 @@ function runRequest<T extends StorageWorkerRequestType>(request: StorageWorkerRe
 
       return result as StorageWorkerResponseMap[T];
     }
-    case 'markFailed':
-      for (const messageId of request.payload.messageIds) {
+    case 'markFailed': {
+      const { messageIds } = request.payload as StorageWorkerRequestMap['markFailed'];
+      for (const messageId of messageIds) {
         pendingStore.markFailed(messageId);
       }
       return null as StorageWorkerResponseMap[T];
+    }
     case 'shutdown':
       sessionStore.close();
       return null as StorageWorkerResponseMap[T];
@@ -71,7 +78,7 @@ function runRequest<T extends StorageWorkerRequestType>(request: StorageWorkerRe
   }
 }
 
-parentPort.on('message', (request: StorageWorkerRequest) => {
+port.on('message', (request: StorageWorkerRequest) => {
   try {
     const result = runRequest(request as never);
     const response: StorageWorkerSuccessResponse = {
@@ -80,10 +87,10 @@ parentPort.on('message', (request: StorageWorkerRequest) => {
       type: request.type,
       result
     };
-    parentPort.postMessage(response);
+    port.postMessage(response);
   } catch (error) {
     if (request.type === 'persist') {
-      const { messageIds } = { messageIds: request.payload.job.processingMessageIds };
+      const { messageIds } = { messageIds: (request.payload as StorageWorkerRequestMap['persist']).job.processingMessageIds };
       for (const messageId of messageIds) {
         pendingStore.markFailed(messageId);
       }
@@ -99,6 +106,6 @@ parentPort.on('message', (request: StorageWorkerRequest) => {
         stack: typedError.stack
       }
     };
-    parentPort.postMessage(response);
+    port.postMessage(response);
   }
 });

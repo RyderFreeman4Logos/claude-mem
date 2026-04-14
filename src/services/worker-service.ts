@@ -145,7 +145,7 @@ export class WorkerService {
   // Service layer
   private dbManager: DatabaseManager;
   private sessionManager: SessionManager;
-  private sseBroadcaster: SSEBroadcaster;
+  public sseBroadcaster: SSEBroadcaster;
   private sdkAgent: SDKAgent;
   private geminiAgent: GeminiAgent;
   private openRouterAgent: OpenRouterAgent;
@@ -435,7 +435,7 @@ export class WorkerService {
       const searchManager = new SearchManager(
         this.dbManager.getSessionSearch(),
         this.dbManager.getSessionStore(),
-        this.dbManager.getChromaSync(),
+        this.dbManager.getVectorSync(),
         formattingService,
         timelineService
       );
@@ -476,7 +476,9 @@ export class WorkerService {
       const transport = new StdioClientTransport({
         command: 'node',
         args: [mcpServerPath],
-        env: sanitizeEnv(process.env)
+        env: Object.fromEntries(
+          Object.entries(sanitizeEnv(process.env)).filter(([, value]) => value !== undefined)
+        ) as Record<string, string>
       });
 
       const MCP_INIT_TIMEOUT_MS = 300000;

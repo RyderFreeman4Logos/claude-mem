@@ -36,7 +36,7 @@ export class MemoryRoutes extends BaseRouteHandler {
     }
 
     const sessionStore = this.dbManager.getSessionStore();
-    const chromaSync = this.dbManager.getChromaSync();
+    const vectorSync = this.dbManager.getVectorSync();
 
     // 1. Get or create manual session for project
     const memorySessionId = sessionStore.getOrCreateManualSession(targetProject);
@@ -68,8 +68,8 @@ export class MemoryRoutes extends BaseRouteHandler {
       title: observation.title
     });
 
-    // 4. Sync to ChromaDB (async, fire-and-forget)
-    chromaSync.syncObservation(
+    // 4. Sync to the active vector backend (async, fire-and-forget)
+    vectorSync?.syncObservation(
       result.id,
       memorySessionId,
       targetProject,
@@ -78,7 +78,7 @@ export class MemoryRoutes extends BaseRouteHandler {
       result.createdAtEpoch,
       0
     ).catch(err => {
-      logger.error('CHROMA', 'ChromaDB sync failed', { id: result.id }, err as Error);
+      logger.error('VECTOR_BACKEND', 'Vector sync failed for manual observation', { id: result.id }, err as Error);
     });
 
     // 5. Return success

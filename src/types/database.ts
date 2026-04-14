@@ -48,7 +48,9 @@ export interface SdkSessionRecord {
   content_session_id: string;
   memory_session_id: string | null;
   project: string;
+  platform_source: string;
   user_prompt: string | null;
+  custom_title?: string | null;
   started_at: string;
   started_at_epoch: number;
   completed_at: string | null;
@@ -67,13 +69,19 @@ export interface ObservationRecord {
   project: string;
   text: string | null;
   type: 'decision' | 'bugfix' | 'feature' | 'refactor' | 'discovery' | 'change';
+  title: string | null;
+  subtitle: string | null;
+  facts: string | null;
+  narrative: string | null;
+  concepts: string | null;
+  files_read: string | null;
+  files_modified: string | null;
   created_at: string;
   created_at_epoch: number;
-  title?: string;
-  concept?: string;
-  source_files?: string;
-  prompt_number?: number;
-  discovery_tokens?: number;
+  prompt_number: number | null;
+  discovery_tokens: number;
+  generated_by_model?: string | null;
+  relevance_count?: number;
 }
 
 /**
@@ -88,10 +96,13 @@ export interface SessionSummaryRecord {
   learned: string | null;
   completed: string | null;
   next_steps: string | null;
+  files_read: string | null;
+  files_edited: string | null;
+  notes: string | null;
   created_at: string;
   created_at_epoch: number;
-  prompt_number?: number;
-  discovery_tokens?: number;
+  prompt_number: number | null;
+  discovery_tokens: number;
 }
 
 /**
@@ -103,6 +114,7 @@ export interface UserPromptRecord {
   prompt_number: number;
   prompt_text: string;
   project?: string;  // From JOIN with sdk_sessions
+  memory_session_id?: string | null;
   platform_source?: string;
   created_at: string;
   created_at_epoch: number;
@@ -131,11 +143,15 @@ export interface ObservationWithContext {
   project: string;
   text: string | null;
   type: string;
+  title: string | null;
+  subtitle: string | null;
+  facts: string | null;
+  narrative: string | null;
+  concepts: string | null;
+  files_read: string | null;
+  files_modified: string | null;
   created_at: string;
   created_at_epoch: number;
-  title?: string;
-  concept?: string;
-  source_files?: string;
-  prompt_number?: number;
-  discovery_tokens?: number;
+  prompt_number: number | null;
+  discovery_tokens: number;
 }

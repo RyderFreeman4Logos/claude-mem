@@ -35,9 +35,19 @@ export class SettingsManager {
 
       const settings: ViewerSettings = { ...this.defaultSettings };
       for (const row of rows) {
-        const key = row.key as keyof ViewerSettings;
-        if (key in settings) {
-          settings[key] = JSON.parse(row.value) as ViewerSettings[typeof key];
+        const parsedValue = JSON.parse(row.value);
+        switch (row.key) {
+          case 'sidebarOpen':
+            settings.sidebarOpen = Boolean(parsedValue);
+            break;
+          case 'selectedProject':
+            settings.selectedProject = typeof parsedValue === 'string' || parsedValue === null ? parsedValue : null;
+            break;
+          case 'theme':
+            if (parsedValue === 'light' || parsedValue === 'dark' || parsedValue === 'system') {
+              settings.theme = parsedValue;
+            }
+            break;
         }
       }
 

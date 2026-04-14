@@ -4,7 +4,7 @@
  * Responsibility:
  * - Parse observations and summaries from agent responses
  * - Execute atomic database transactions
- * - Orchestrate Chroma sync (fire-and-forget)
+ * - Orchestrate vector backend sync (fire-and-forget)
  * - Broadcast to SSE clients
  * - Clean up processed messages
  *
@@ -27,13 +27,13 @@ import { broadcastObservation, broadcastSummary } from './ObservationBroadcaster
 import { cleanupProcessedMessages } from './SessionCleanupHelper.js';
 
 /**
- * Process agent response text (parse XML, save to database, sync to Chroma, broadcast SSE)
+ * Process agent response text (parse XML, save to database, sync to the active vector backend, broadcast SSE)
  *
  * This is the unified response processor that handles:
  * 1. Adding response to conversation history (for provider interop)
  * 2. Parsing observations and summaries from XML
  * 3. Atomic database transaction to store observations + summary
- * 4. Async Chroma sync (fire-and-forget, failures are non-critical)
+ * 4. Async vector backend sync (fire-and-forget, failures are non-critical)
  * 5. SSE broadcast to web UI clients
  * 6. Session cleanup
  *
@@ -316,7 +316,7 @@ async function finalizeSuccessfulPersist(
 }
 
 /**
- * Sync observations to Chroma and broadcast to SSE clients
+ * Sync observations to the active vector backend and broadcast to SSE clients
  */
 async function syncAndBroadcastObservations(
   observations: ParsedObservation[],
@@ -331,10 +331,10 @@ async function syncAndBroadcastObservations(
   for (let i = 0; i < observations.length; i++) {
     const obsId = result.observationIds[i];
     const obs = observations[i];
-    const chromaStart = Date.now();
+    const vectorSyncStart = Date.now();
 
-    // Sync to Chroma (fire-and-forget, skipped if Chroma is disabled)
-    dbManager.getChromaSync()?.syncObservation(
+    // Sync to the selected vector backend (fire-and-forget, skipped if vector search is disabled)
+    dbManager.getVectorSync()?.syncObservation(
       obsId,
       session.contentSessionId,
       session.project,
@@ -343,15 +343,15 @@ async function syncAndBroadcastObservations(
       result.createdAtEpoch,
       discoveryTokens
     ).then(() => {
-      const chromaDuration = Date.now() - chromaStart;
+      const vectorSyncDuration = Date.now() - vectorSyncStart;
       logger.debug('CHROMA', 'Observation synced', {
         obsId,
-        duration: `${chromaDuration}ms`,
+        duration: `${vectorSyncDuration}ms`,
         type: obs.type,
         title: obs.title || '(untitled)'
       });
     }).catch((error) => {
-      logger.error('CHROMA', `${agentName} chroma sync failed, continuing without vector search`, {
+      logger.error('CHROMA', `${agentName} vector sync failed, continuing without vector search`, {
         obsId,
         type: obs.type,
         title: obs.title || '(untitled)'
@@ -384,9 +384,7 @@ async function syncAndBroadcastObservations(
   // This runs per-observation batch to ensure folders are updated as work happens
   // Only runs if CLAUDE_MEM_FOLDER_CLAUDEMD_ENABLED is true (default: false)
   const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
-  // Handle both string 'true' and boolean true from JSON settings
-  const settingValue = settings.CLAUDE_MEM_FOLDER_CLAUDEMD_ENABLED;
-  const folderClaudeMdEnabled = settingValue === 'true' || settingValue === true;
+  const folderClaudeMdEnabled = settings.CLAUDE_MEM_FOLDER_CLAUDEMD_ENABLED === 'true';
 
   if (folderClaudeMdEnabled) {
     const allFilePaths: string[] = [];
@@ -409,7 +407,7 @@ async function syncAndBroadcastObservations(
 }
 
 /**
- * Sync summary to Chroma and broadcast to SSE clients
+ * Sync summary to the active vector backend and broadcast to SSE clients
  */
 async function syncAndBroadcastSummary(
   summary: ParsedSummary | null,
@@ -425,10 +423,10 @@ async function syncAndBroadcastSummary(
     return;
   }
 
-  const chromaStart = Date.now();
+  const vectorSyncStart = Date.now();
 
-  // Sync to Chroma (fire-and-forget, skipped if Chroma is disabled)
-  dbManager.getChromaSync()?.syncSummary(
+  // Sync to the selected vector backend (fire-and-forget, skipped if vector search is disabled)
+  dbManager.getVectorSync()?.syncSummary(
     result.summaryId,
     session.contentSessionId,
     session.project,
@@ -437,14 +435,14 @@ async function syncAndBroadcastSummary(
     result.createdAtEpoch,
     discoveryTokens
   ).then(() => {
-    const chromaDuration = Date.now() - chromaStart;
+    const vectorSyncDuration = Date.now() - vectorSyncStart;
     logger.debug('CHROMA', 'Summary synced', {
       summaryId: result.summaryId,
-      duration: `${chromaDuration}ms`,
+      duration: `${vectorSyncDuration}ms`,
       request: summaryForStore.request || '(no request)'
     });
   }).catch((error) => {
-    logger.error('CHROMA', `${agentName} chroma sync failed, continuing without vector search`, {
+    logger.error('CHROMA', `${agentName} vector sync failed, continuing without vector search`, {
       summaryId: result.summaryId,
       request: summaryForStore.request || '(no request)'
     }, error);

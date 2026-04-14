@@ -100,9 +100,7 @@ export class ConcurrencyManager {
       const settingsBaseName = basename(this.settingsPath);
 
       this.watcher = watch(settingsDir, (eventType, filename) => {
-        const normalizedName = typeof filename === 'string'
-          ? filename
-          : filename?.toString();
+        const normalizedName = typeof filename === 'string' ? filename : null;
 
         if (eventType === 'change' && normalizedName && basename(normalizedName) !== settingsBaseName) {
           return;
