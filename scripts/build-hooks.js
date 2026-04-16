@@ -173,7 +173,10 @@ async function buildHooks() {
         'ollama',
         // Default embedding function with native binaries
         '@chroma-core/default-embed',
-        'onnxruntime-node'
+        'onnxruntime-node',
+        // sqlite-vec uses require.resolve() to locate platform-specific vec0.so;
+        // inlining breaks it because bundled `require` lacks .resolve
+        'sqlite-vec',
       ],
       define: {
         '__DEFAULT_PACKAGE_VERSION__': `"${version}"`

@@ -99,6 +99,21 @@ const TOOL_ENDPOINT_MAP: Record<string, string> = {
   'timeline': '/api/timeline'
 };
 
+// Vector search through Qwen3 embeddings + sqlite-vec on 740k+ rows can take ~5s,
+// so MCP calls need a longer timeout than HEALTH_CHECK_TIMEOUT_MS (default 3s).
+// Override via CLAUDE_MEM_MCP_TIMEOUT_MS env var, range 500..300000ms.
+const MCP_REQUEST_TIMEOUT_MS = (() => {
+  const envVal = process.env.CLAUDE_MEM_MCP_TIMEOUT_MS;
+  if (envVal) {
+    const parsed = parseInt(envVal, 10);
+    if (Number.isFinite(parsed) && parsed >= 500 && parsed <= 300000) return parsed;
+    logger.warn('SYSTEM', 'Invalid CLAUDE_MEM_MCP_TIMEOUT_MS, using default', {
+      value: envVal, min: 500, max: 300000
+    });
+  }
+  return 30000;
+})();
+
 /**
  * Call Worker HTTP API endpoint (uses socket or TCP automatically)
  */
@@ -119,7 +134,7 @@ async function callWorkerAPI(
     }
 
     const apiPath = `${endpoint}?${searchParams}`;
-    const response = await workerHttpRequest(apiPath);
+    const response = await workerHttpRequest(apiPath, { timeoutMs: MCP_REQUEST_TIMEOUT_MS });
 
     if (!response.ok) {
       const errorText = await response.text();
@@ -157,7 +172,8 @@ async function callWorkerAPIPost(
     const response = await workerHttpRequest(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
+      body: JSON.stringify(body),
+      timeoutMs: MCP_REQUEST_TIMEOUT_MS
     });
 
     if (!response.ok) {

@@ -533,13 +533,25 @@ let cachedBinPath: string | null = null;
 function getTreeSitterBin(): string {
   if (cachedBinPath) return cachedBinPath;
 
-  // Try direct binary from tree-sitter-cli package
+  // Explicit override — useful when the bundled binary has libc compat issues
+  // and user wants to pin to a specific system/mise-managed tree-sitter.
+  if (process.env.CLAUDE_MEM_TREE_SITTER_BIN) {
+    cachedBinPath = process.env.CLAUDE_MEM_TREE_SITTER_BIN;
+    return cachedBinPath;
+  }
+
+  // Try bundled binary, but probe it first — existsSync doesn't catch
+  // ABI/libc mismatches (e.g. tree-sitter-cli 0.25+ requires GLIBC_2.39,
+  // which older long-term-support distros don't ship).
   try {
     const pkgPath = _require.resolve("tree-sitter-cli/package.json");
     const binPath = join(dirname(pkgPath), "tree-sitter");
     if (existsSync(binPath)) {
-      cachedBinPath = binPath;
-      return binPath;
+      try {
+        execFileSync(binPath, ["--version"], { timeout: 5000, stdio: "pipe" });
+        cachedBinPath = binPath;
+        return binPath;
+      } catch { /* incompatible binary — fall through to PATH */ }
     }
   } catch { /* fall through */ }
 
