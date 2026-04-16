@@ -33,6 +33,14 @@ EMBED_MODEL = "Qwen/Qwen3-Embedding-8B"
 COLLECTION_NAME = "cm__claude-mem"  # same name as before — easy to swap via mv
 DIM = 4096
 
+# --- sqlite-vec direct-write target (skips chroma-qwen3 entirely) ---
+SQLITE_VEC_CHUNKS_TABLE = "claude_mem_vec_chunks"
+SQLITE_VEC_EMBEDDINGS_TABLE = "claude_mem_vec_embeddings"
+SQLITE_VEC_STATE_TABLE = "claude_mem_vec_state"
+SQLITE_VEC_READY_KEY = "sqlite_vec_readiness"
+SQLITE_VEC_SOURCE = "direct-embed-qwen3"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
 logger = logging.getLogger("migrate")
 
 # -------- state DB -----------
@@ -252,6 +260,242 @@ class ChromaWriter:
         )
 
 
+# -------- sqlite-vec direct writer (drop-in replacement for ChromaWriter) --------
+
+
+def resolve_sqlite_vec_extension(repo_root: Path) -> Path:
+    import sys as _sys
+    import platform as _host_platform
+
+    platform = _sys.platform
+    machine = _host_platform.machine().lower()
+
+    if platform.startswith("linux"):
+        suffix = "so"
+        arch = "arm64" if machine in {"aarch64", "arm64"} else "x64"
+        pkg = f"sqlite-vec-linux-{arch}"
+    elif platform == "darwin":
+        suffix = "dylib"
+        arch = "arm64" if machine in {"aarch64", "arm64"} else "x64"
+        pkg = f"sqlite-vec-darwin-{arch}"
+    elif platform == "win32":
+        suffix = "dll"
+        pkg = "sqlite-vec-windows-x64"
+    else:
+        raise RuntimeError(f"unsupported platform for sqlite-vec: {platform}")
+
+    path = repo_root / "node_modules" / pkg / f"vec0.{suffix}"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"sqlite-vec extension not found at {path}. Run `npm install` in repo root first."
+        )
+    return path
+
+
+class SqliteVecWriter:
+    """Drop-in replacement for ChromaWriter that writes embeddings directly into
+    the sqlite-vec tables inside claude-mem.db, bypassing chroma-qwen3/ entirely.
+
+    Concurrency: SQLite serializes writers regardless of Python threading, so we
+    use a single shared connection guarded by threading.Lock. Throughput ceiling
+    is the embedder (gb10:18002), not the DB write path — SQLite WAL handles
+    hundreds of inserts/sec without breaking a sweat.
+    """
+
+    def __init__(self, db_path: Path, embedding_dim: int, repo_root: Path):
+        ext_path = resolve_sqlite_vec_extension(repo_root)
+        self._lock = threading.Lock()
+        self._embedding_dim = embedding_dim
+        self.conn = sqlite3.connect(
+            str(db_path),
+            timeout=60.0,
+            isolation_level=None,  # autocommit — we manage BEGIN/COMMIT explicitly
+            check_same_thread=False,
+        )
+        self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.conn.execute("PRAGMA foreign_keys=ON")
+        self.conn.execute("PRAGMA busy_timeout=60000")
+        self.conn.enable_load_extension(True)
+        self.conn.load_extension(str(ext_path))
+        self.conn.enable_load_extension(False)
+        self._ensure_schema()
+        logger.info("SqliteVecWriter ready: db=%s dim=%d", db_path, embedding_dim)
+
+    def _ensure_schema(self):
+        self.conn.executescript(
+            f"""
+            CREATE TABLE IF NOT EXISTS {SQLITE_VEC_CHUNKS_TABLE} (
+                rowid INTEGER PRIMARY KEY,
+                chunk_id TEXT NOT NULL UNIQUE,
+                sqlite_id INTEGER NOT NULL,
+                doc_type TEXT NOT NULL,
+                memory_session_id TEXT NOT NULL,
+                project TEXT NOT NULL,
+                created_at_epoch INTEGER NOT NULL,
+                type TEXT,
+                title TEXT,
+                subtitle TEXT,
+                concepts TEXT,
+                files_read TEXT,
+                files_modified TEXT,
+                field_type TEXT,
+                prompt_number INTEGER,
+                document_text TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_sqlite_vec_chunks_project_doc
+                ON {SQLITE_VEC_CHUNKS_TABLE}(project, doc_type, created_at_epoch DESC);
+            CREATE INDEX IF NOT EXISTS idx_sqlite_vec_chunks_sqlite_id
+                ON {SQLITE_VEC_CHUNKS_TABLE}(sqlite_id);
+            CREATE TABLE IF NOT EXISTS {SQLITE_VEC_STATE_TABLE} (
+                state_key TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                source TEXT NOT NULL,
+                started_at_epoch INTEGER,
+                completed_at_epoch INTEGER,
+                last_error TEXT
+            );
+            """
+        )
+        row = self.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name = ?",
+            (SQLITE_VEC_EMBEDDINGS_TABLE,),
+        ).fetchone()
+        if row is None:
+            self.conn.execute(
+                f"CREATE VIRTUAL TABLE IF NOT EXISTS {SQLITE_VEC_EMBEDDINGS_TABLE} "
+                f"USING vec0(embedding float[{self._embedding_dim}])"
+            )
+            return
+        import re
+        m = re.search(r"float\[(\d+)\]", row["sql"] or "")
+        if m and int(m.group(1)) != self._embedding_dim:
+            raise RuntimeError(
+                f"sqlite-vec dim mismatch: table has {m.group(1)}, config says "
+                f"{self._embedding_dim}. Drop {SQLITE_VEC_EMBEDDINGS_TABLE} first."
+            )
+
+    def upsert(self, ids: list[str], documents: list[str], embeddings: list[list[float]], metadatas: list[dict]):
+        """Match ChromaWriter.upsert signature."""
+        with self._lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                for chunk_id, document, embedding, metadata in zip(ids, documents, embeddings, metadatas):
+                    sqlite_id = metadata.get("sqlite_id")
+                    doc_type = metadata.get("doc_type")
+                    memory_session_id = metadata.get("memory_session_id")
+                    project = metadata.get("project")
+                    created_at_epoch = metadata.get("created_at_epoch")
+
+                    if (
+                        sqlite_id is None
+                        or doc_type is None
+                        or memory_session_id is None
+                        or project is None
+                        or created_at_epoch is None
+                    ):
+                        logger.warning(
+                            "skip chunk %s: NULL metadata (sqlite_id=%s doc_type=%s session=%s project=%s epoch=%s)",
+                            chunk_id, sqlite_id, doc_type, memory_session_id, project, created_at_epoch,
+                        )
+                        continue
+
+                    row = self.conn.execute(
+                        f"SELECT rowid FROM {SQLITE_VEC_CHUNKS_TABLE} WHERE chunk_id = ?",
+                        (chunk_id,),
+                    ).fetchone()
+
+                    if row:
+                        rowid = row["rowid"]
+                        self.conn.execute(
+                            f"""
+                            UPDATE {SQLITE_VEC_CHUNKS_TABLE}
+                            SET sqlite_id=?, doc_type=?, memory_session_id=?, project=?,
+                                created_at_epoch=?, type=?, title=?, subtitle=?, concepts=?,
+                                files_read=?, files_modified=?, field_type=?, prompt_number=?,
+                                document_text=?
+                            WHERE rowid=?
+                            """,
+                            (sqlite_id, doc_type, memory_session_id, project, created_at_epoch,
+                             metadata.get("type"), metadata.get("title"), metadata.get("subtitle"),
+                             metadata.get("concepts"), metadata.get("files_read"),
+                             metadata.get("files_modified"), metadata.get("field_type"),
+                             metadata.get("prompt_number"), document, rowid),
+                        )
+                        self.conn.execute(
+                            f"DELETE FROM {SQLITE_VEC_EMBEDDINGS_TABLE} WHERE rowid = ?",
+                            (rowid,),
+                        )
+                    else:
+                        cursor = self.conn.execute(
+                            f"""
+                            INSERT INTO {SQLITE_VEC_CHUNKS_TABLE} (
+                                chunk_id, sqlite_id, doc_type, memory_session_id, project,
+                                created_at_epoch, type, title, subtitle, concepts, files_read,
+                                files_modified, field_type, prompt_number, document_text
+                            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                            """,
+                            (chunk_id, sqlite_id, doc_type, memory_session_id, project,
+                             created_at_epoch, metadata.get("type"), metadata.get("title"),
+                             metadata.get("subtitle"), metadata.get("concepts"),
+                             metadata.get("files_read"), metadata.get("files_modified"),
+                             metadata.get("field_type"), metadata.get("prompt_number"),
+                             document),
+                        )
+                        rowid = cursor.lastrowid
+
+                    self.conn.execute(
+                        f"INSERT INTO {SQLITE_VEC_EMBEDDINGS_TABLE}(rowid, embedding) VALUES (?, ?)",
+                        (rowid, json.dumps([float(v) for v in embedding])),
+                    )
+                self.conn.execute("COMMIT")
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
+
+    def mark_started(self):
+        now = int(time.time())
+        with self._lock:
+            self.conn.execute(
+                f"""
+                INSERT INTO {SQLITE_VEC_STATE_TABLE} (
+                    state_key, status, source, started_at_epoch, completed_at_epoch, last_error
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(state_key) DO UPDATE SET
+                    status = excluded.status,
+                    source = excluded.source,
+                    started_at_epoch = COALESCE({SQLITE_VEC_STATE_TABLE}.started_at_epoch, excluded.started_at_epoch),
+                    last_error = NULL
+                """,
+                (SQLITE_VEC_READY_KEY, "in_progress", SQLITE_VEC_SOURCE, now, None, None),
+            )
+
+    def mark_complete(self):
+        now = int(time.time())
+        with self._lock:
+            self.conn.execute(
+                f"""
+                INSERT INTO {SQLITE_VEC_STATE_TABLE} (
+                    state_key, status, source, started_at_epoch, completed_at_epoch, last_error
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(state_key) DO UPDATE SET
+                    status = excluded.status,
+                    completed_at_epoch = excluded.completed_at_epoch,
+                    last_error = NULL
+                """,
+                (SQLITE_VEC_READY_KEY, "complete", SQLITE_VEC_SOURCE, None, now, None),
+            )
+
+    def close(self):
+        with self._lock:
+            try:
+                self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.Error:
+                pass
+            self.conn.close()
+
+
 # -------- main loop --------
 
 _stop = threading.Event()
@@ -362,6 +606,28 @@ def main():
     ap.add_argument("--max-chunks", type=int, default=0, help="0 = unlimited")
     ap.add_argument("--log-interval", type=int, default=20, help="log every N batches")
     ap.add_argument(
+        "--target",
+        choices=["chroma", "sqlite-vec"],
+        default="chroma",
+        help="where to write embeddings (chroma=chroma-qwen3/ [default]; sqlite-vec=claude-mem.db sqlite-vec tables)",
+    )
+    ap.add_argument(
+        "--target-db",
+        type=Path,
+        default=SOURCE_DB,
+        help="target DB for --target sqlite-vec (defaults to claude-mem.db)",
+    )
+    ap.add_argument(
+        "--reset-state",
+        action="store_true",
+        help="mark all chunks as pending before starting (use when switching targets)",
+    )
+    ap.add_argument(
+        "--yes",
+        action="store_true",
+        help="skip interactive confirmation prompts (e.g., --reset-state)",
+    )
+    ap.add_argument(
         "--refresh",
         action="store_true",
         help="catch-up mode: re-enumerate source DB and INSERT OR IGNORE new chunks "
@@ -393,8 +659,31 @@ def main():
 
     total, _pending = init_state(state, source, refresh=args.refresh)
 
-    # writer is thread-safe via chromadb's internal locking; one shared instance
-    writer = ChromaWriter(NEW_CHROMA_DIR, COLLECTION_NAME)
+    if args.reset_state:
+        embedded_count = state.execute("SELECT COUNT(*) FROM chunks WHERE status='embedded'").fetchone()[0]
+        if embedded_count > 0 and not args.yes:
+            sys.stderr.write(
+                f"--reset-state will mark {embedded_count} 'embedded' chunks back to 'pending'. "
+                "Re-running will re-embed them through the vllm server.\n"
+                "Type 'yes' to proceed, or pass --yes to skip this prompt: "
+            )
+            sys.stderr.flush()
+            answer = sys.stdin.readline().strip().lower()
+            if answer != "yes":
+                logger.error("aborted: --reset-state not confirmed")
+                sys.exit(1)
+        logger.warning("--reset-state: marking ALL chunks as pending (discards prior embedding progress)")
+        state.execute("UPDATE chunks SET status='pending', attempts=0, last_error=NULL")
+        state.commit()
+
+    # writer is thread-safe via internal locking; one shared instance shared across workers
+    if args.target == "chroma":
+        writer = ChromaWriter(NEW_CHROMA_DIR, COLLECTION_NAME)
+    elif args.target == "sqlite-vec":
+        writer = SqliteVecWriter(args.target_db, DIM, REPO_ROOT)
+        writer.mark_started()
+    else:
+        raise ValueError(f"unknown --target: {args.target}")
 
     bs = args.batch_size
     par = args.parallelism
@@ -456,6 +745,24 @@ def main():
         "DONE: embedded=%d failed=%d remaining=%d elapsed=%.1fmin  rate=%.1f items/s",
         final_embedded, final_failed, final_remaining, elapsed / 60, total_done / elapsed if elapsed > 0 else 0,
     )
+
+    if args.target == "sqlite-vec" and final_remaining == 0 and not _stop.is_set():
+        writer.mark_complete()
+        if final_failed > 0:
+            logger.warning(
+                "sqlite-vec readiness marked complete with %d terminal failures — inspect chunks.status='failed' for breakdown",
+                final_failed,
+            )
+        else:
+            logger.info("sqlite-vec readiness marked complete — backend ready for queries")
+    elif args.target == "sqlite-vec":
+        logger.info(
+            "sqlite-vec NOT marked complete (remaining=%d failed=%d stopped=%s) — run again to converge",
+            final_remaining, final_failed, _stop.is_set(),
+        )
+
+    if args.target == "sqlite-vec":
+        writer.close()
 
 
 if __name__ == "__main__":
