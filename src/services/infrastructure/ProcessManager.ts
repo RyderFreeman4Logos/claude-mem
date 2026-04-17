@@ -27,9 +27,10 @@ const PID_FILE = path.join(DATA_DIR, 'worker.pid');
 // Orphaned process cleanup patterns and thresholds
 // These are claude-mem processes that can accumulate if not properly terminated
 const ORPHAN_PROCESS_PATTERNS = [
-  'mcp-server.cjs',    // Main MCP server process
-  'worker-service.cjs', // Background worker daemon
-  'chroma-mcp'          // ChromaDB MCP subprocess
+  'mcp-server.cjs',       // Main MCP server process
+  'worker-service.cjs',   // Background worker daemon
+  'chroma-mcp',           // ChromaDB MCP subprocess (pre-uvx-exec cmdline)
+  'chroma-sse-wrapper.py' // Post-uvx-exec cmdline: `python .../chroma-sse-wrapper.py ...`
 ];
 
 // Only kill processes older than this to avoid killing the current session
@@ -488,7 +489,7 @@ export async function cleanupOrphanedProcesses(): Promise<void> {
 
 // Patterns that should be killed immediately at startup (no age gate)
 // These are child processes that should not outlive their parent worker
-const AGGRESSIVE_CLEANUP_PATTERNS = ['worker-service.cjs', 'chroma-mcp'];
+const AGGRESSIVE_CLEANUP_PATTERNS = ['worker-service.cjs', 'chroma-mcp', 'chroma-sse-wrapper.py'];
 
 // Patterns that keep the age-gated threshold (may be legitimately running)
 const AGE_GATED_CLEANUP_PATTERNS = ['mcp-server.cjs'];
