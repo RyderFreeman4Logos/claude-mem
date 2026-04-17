@@ -136,9 +136,11 @@ export class SqliteVecSync implements VectorSyncBackend {
   private bgSuccessRowCount = 0;
   private bgSuccessDocCount = 0;
   private bgSuccessLastLoggedAt = 0;
-  private static readonly BG_TICK_MS = 3000;
+  private static readonly BG_TICK_MS_DEFAULT = 3000;
   private static readonly BG_LOG_THROTTLE_MS = 60_000;
-  private static readonly BG_BATCH_ROWS = 10;
+  private static readonly BG_BATCH_ROWS_DEFAULT = 10;
+  private readonly bgTickMs: number;
+  private readonly bgBatchRows: number;
 
   constructor(
     private readonly project: string,
@@ -149,6 +151,21 @@ export class SqliteVecSync implements VectorSyncBackend {
     this.db.run('PRAGMA synchronous = NORMAL');
     this.db.run('PRAGMA foreign_keys = ON');
     this.db.run('PRAGMA busy_timeout = 5000');
+    const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
+    this.bgTickMs = this.parsePositiveInt(
+      settings.CLAUDE_MEM_SQLITE_VEC_BG_TICK_MS,
+      SqliteVecSync.BG_TICK_MS_DEFAULT
+    );
+    this.bgBatchRows = this.parsePositiveInt(
+      settings.CLAUDE_MEM_SQLITE_VEC_BG_BATCH_ROWS,
+      SqliteVecSync.BG_BATCH_ROWS_DEFAULT
+    );
+  }
+
+  private parsePositiveInt(raw: unknown, fallback: number): number {
+    if (raw === undefined || raw === null || raw === '') return fallback;
+    const parsed = Number.parseInt(String(raw), 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
   }
 
   async close(): Promise<void> {
@@ -162,14 +179,14 @@ export class SqliteVecSync implements VectorSyncBackend {
     }
     this.backgroundSyncStopped = false;
     logger.info('SQLITE_VEC', 'Background embed sync loop starting', {
-      intervalMs: SqliteVecSync.BG_TICK_MS,
-      batchRows: SqliteVecSync.BG_BATCH_ROWS
+      intervalMs: this.bgTickMs,
+      batchRows: this.bgBatchRows
     });
     this.backgroundSyncInterval = setInterval(() => {
       this.runBackgroundTick().catch((error) => {
         this.recordBackgroundFailure(error);
       });
-    }, SqliteVecSync.BG_TICK_MS);
+    }, this.bgTickMs);
   }
 
   async stopBackgroundSync(): Promise<void> {
@@ -248,7 +265,7 @@ export class SqliteVecSync implements VectorSyncBackend {
         ORDER BY o.id ASC
         LIMIT ?
       `
-    ).all(SqliteVecSync.BG_BATCH_ROWS) as StoredObservation[];
+    ).all(this.bgBatchRows) as StoredObservation[];
 
     if (rows.length === 0) {
       return false;
@@ -291,7 +308,7 @@ export class SqliteVecSync implements VectorSyncBackend {
         ORDER BY ss.id ASC
         LIMIT ?
       `
-    ).all(SqliteVecSync.BG_BATCH_ROWS) as StoredSummary[];
+    ).all(this.bgBatchRows) as StoredSummary[];
 
     if (rows.length === 0) {
       return false;
@@ -330,7 +347,7 @@ export class SqliteVecSync implements VectorSyncBackend {
         ORDER BY up.id ASC
         LIMIT ?
       `
-    ).all(SqliteVecSync.BG_BATCH_ROWS) as StoredUserPrompt[];
+    ).all(this.bgBatchRows) as StoredUserPrompt[];
 
     if (rows.length === 0) {
       return false;

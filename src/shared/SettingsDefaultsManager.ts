@@ -85,6 +85,8 @@ export interface SettingsDefaults {
   CLAUDE_MEM_EMBED_URL: string;
   CLAUDE_MEM_EMBED_MODEL: string;
   CLAUDE_MEM_EMBED_DIM: string;
+  CLAUDE_MEM_SQLITE_VEC_BG_TICK_MS: string;
+  CLAUDE_MEM_SQLITE_VEC_BG_BATCH_ROWS: string;
   CLAUDE_MEM_EMBED_QUERY_INSTRUCT: string;
   CLAUDE_MEM_EMBED_TIMEOUT_MS: string;
 }
@@ -172,6 +174,8 @@ export class SettingsDefaultsManager {
     CLAUDE_MEM_EMBED_URL: '',
     CLAUDE_MEM_EMBED_MODEL: 'Qwen/Qwen3-Embedding-8B',
     CLAUDE_MEM_EMBED_DIM: '4096',
+    CLAUDE_MEM_SQLITE_VEC_BG_TICK_MS: '3000',
+    CLAUDE_MEM_SQLITE_VEC_BG_BATCH_ROWS: '10',
     CLAUDE_MEM_EMBED_QUERY_INSTRUCT:
       'Instruct: Given a short title or user query about software engineering, code, ' +
       'tool usage, or debugging (in Chinese or English), retrieve the detailed ' +
