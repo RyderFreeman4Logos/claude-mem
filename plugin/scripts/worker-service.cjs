@@ -1437,6 +1437,7 @@ For more info: https://docs.claude-mem.ai/usage/gemini-provider
             AND c.sqlite_id = up.id
             AND c.project = s.project
         )
+          AND s.memory_session_id IS NOT NULL
           AND up.prompt_text IS NOT NULL
           AND TRIM(up.prompt_text) != ''
         ORDER BY up.id ASC
