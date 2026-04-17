@@ -42,7 +42,9 @@ export class DatabaseManager {
     if (backend === 'chroma') {
       this.vectorSync = new ChromaSync('claude-mem');
     } else if (backend === 'sqlite-vec') {
-      this.vectorSync = new SqliteVecSync('claude-mem', this.dbPath);
+      const sqliteVec = new SqliteVecSync('claude-mem', this.dbPath);
+      sqliteVec.startBackgroundSync();
+      this.vectorSync = sqliteVec;
     } else {
       logger.info('DB', 'Vector search disabled by configuration');
     }

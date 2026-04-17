@@ -128,6 +128,18 @@ export class SqliteVecSync implements VectorSyncBackend {
   private schemaReady = false;
   private extensionReady = false;
 
+  private backgroundSyncInterval: ReturnType<typeof setInterval> | null = null;
+  private backgroundSyncInFlight = false;
+  private backgroundSyncStopped = false;
+  private bgFailureCount = 0;
+  private bgFailureLastLoggedAt = 0;
+  private bgSuccessRowCount = 0;
+  private bgSuccessDocCount = 0;
+  private bgSuccessLastLoggedAt = 0;
+  private static readonly BG_TICK_MS = 3000;
+  private static readonly BG_LOG_THROTTLE_MS = 60_000;
+  private static readonly BG_BATCH_ROWS = 10;
+
   constructor(
     private readonly project: string,
     private readonly dbPath: string = DB_PATH
@@ -140,7 +152,212 @@ export class SqliteVecSync implements VectorSyncBackend {
   }
 
   async close(): Promise<void> {
+    await this.stopBackgroundSync();
     this.db.close();
+  }
+
+  startBackgroundSync(): void {
+    if (this.backgroundSyncInterval) {
+      return;
+    }
+    this.backgroundSyncStopped = false;
+    logger.info('SQLITE_VEC', 'Background embed sync loop starting', {
+      intervalMs: SqliteVecSync.BG_TICK_MS,
+      batchRows: SqliteVecSync.BG_BATCH_ROWS
+    });
+    this.backgroundSyncInterval = setInterval(() => {
+      this.runBackgroundTick().catch((error) => {
+        this.recordBackgroundFailure(error);
+      });
+    }, SqliteVecSync.BG_TICK_MS);
+  }
+
+  async stopBackgroundSync(): Promise<void> {
+    this.backgroundSyncStopped = true;
+    if (this.backgroundSyncInterval) {
+      clearInterval(this.backgroundSyncInterval);
+      this.backgroundSyncInterval = null;
+    }
+    while (this.backgroundSyncInFlight) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
+
+  private async runBackgroundTick(): Promise<void> {
+    if (this.backgroundSyncInFlight || this.backgroundSyncStopped) {
+      return;
+    }
+    this.backgroundSyncInFlight = true;
+    try {
+      const embedClient = this.getEmbeddingClientOrSkip('sync');
+      if (!embedClient) {
+        return;
+      }
+      await this.ensureDatabaseReady();
+
+      const processed =
+        (await this.backgroundSyncObservationsBatch()) ||
+        (await this.backgroundSyncSummariesBatch()) ||
+        (await this.backgroundSyncPromptsBatch());
+
+      if (processed) {
+        this.bgFailureCount = 0;
+        this.maybeLogBackgroundProgress();
+      }
+    } catch (error) {
+      this.recordBackgroundFailure(error);
+    } finally {
+      this.backgroundSyncInFlight = false;
+    }
+  }
+
+  private maybeLogBackgroundProgress(): void {
+    const now = Date.now();
+    if (now - this.bgSuccessLastLoggedAt >= SqliteVecSync.BG_LOG_THROTTLE_MS) {
+      if (this.bgSuccessRowCount > 0) {
+        logger.info('SQLITE_VEC', 'Background sync progress', {
+          rows: this.bgSuccessRowCount,
+          docs: this.bgSuccessDocCount,
+          windowMs: SqliteVecSync.BG_LOG_THROTTLE_MS
+        });
+      }
+      this.bgSuccessRowCount = 0;
+      this.bgSuccessDocCount = 0;
+      this.bgSuccessLastLoggedAt = now;
+    }
+  }
+
+  private async backgroundSyncObservationsBatch(): Promise<boolean> {
+    const rows = this.db.prepare(
+      `
+        SELECT o.id, o.memory_session_id, o.project, o.text, o.type, o.title, o.subtitle,
+               o.facts, o.narrative, o.concepts, o.files_read, o.files_modified,
+               o.prompt_number, o.discovery_tokens, o.created_at, o.created_at_epoch
+        FROM observations o
+        WHERE NOT EXISTS (
+          SELECT 1 FROM ${CHUNKS_TABLE} c
+          WHERE c.doc_type = 'observation'
+            AND c.sqlite_id = o.id
+            AND c.project = o.project
+        )
+          AND (
+            (o.narrative IS NOT NULL AND TRIM(o.narrative) != '')
+            OR (o.text IS NOT NULL AND TRIM(o.text) != '')
+            OR (o.facts IS NOT NULL AND o.facts != '' AND o.facts != '[]' AND o.facts != 'null')
+          )
+        ORDER BY o.id ASC
+        LIMIT ?
+      `
+    ).all(SqliteVecSync.BG_BATCH_ROWS) as StoredObservation[];
+
+    if (rows.length === 0) {
+      return false;
+    }
+
+    const docs: VectorDocument[] = [];
+    for (const row of rows) {
+      docs.push(...this.formatObservationDocs(row));
+    }
+    if (docs.length === 0) {
+      return true;
+    }
+    await this.addDocuments(docs, 'sync');
+    this.bgSuccessRowCount += rows.length;
+    this.bgSuccessDocCount += docs.length;
+    return true;
+  }
+
+  private async backgroundSyncSummariesBatch(): Promise<boolean> {
+    const rows = this.db.prepare(
+      `
+        SELECT ss.id, ss.memory_session_id, ss.project, ss.request, ss.investigated,
+               ss.learned, ss.completed, ss.next_steps, ss.notes, ss.prompt_number,
+               ss.discovery_tokens, ss.created_at, ss.created_at_epoch
+        FROM session_summaries ss
+        WHERE NOT EXISTS (
+          SELECT 1 FROM ${CHUNKS_TABLE} c
+          WHERE c.doc_type = 'session_summary'
+            AND c.sqlite_id = ss.id
+            AND c.project = ss.project
+        )
+          AND (
+            (ss.request IS NOT NULL AND TRIM(ss.request) != '')
+            OR (ss.investigated IS NOT NULL AND TRIM(ss.investigated) != '')
+            OR (ss.learned IS NOT NULL AND TRIM(ss.learned) != '')
+            OR (ss.completed IS NOT NULL AND TRIM(ss.completed) != '')
+            OR (ss.next_steps IS NOT NULL AND TRIM(ss.next_steps) != '')
+            OR (ss.notes IS NOT NULL AND TRIM(ss.notes) != '')
+          )
+        ORDER BY ss.id ASC
+        LIMIT ?
+      `
+    ).all(SqliteVecSync.BG_BATCH_ROWS) as StoredSummary[];
+
+    if (rows.length === 0) {
+      return false;
+    }
+
+    const docs: VectorDocument[] = [];
+    for (const row of rows) {
+      docs.push(...this.formatSummaryDocs(row));
+    }
+    if (docs.length === 0) {
+      return true;
+    }
+    await this.addDocuments(docs, 'sync');
+    this.bgSuccessRowCount += rows.length;
+    this.bgSuccessDocCount += docs.length;
+    return true;
+  }
+
+  private async backgroundSyncPromptsBatch(): Promise<boolean> {
+    const rows = this.db.prepare(
+      `
+        SELECT up.id, up.content_session_id, up.prompt_number, up.prompt_text,
+               up.created_at, up.created_at_epoch,
+               s.memory_session_id, s.project
+        FROM user_prompts up
+        JOIN sdk_sessions s ON s.content_session_id = up.content_session_id
+        WHERE NOT EXISTS (
+          SELECT 1 FROM ${CHUNKS_TABLE} c
+          WHERE c.doc_type = 'user_prompt'
+            AND c.sqlite_id = up.id
+            AND c.project = s.project
+        )
+          AND up.prompt_text IS NOT NULL
+          AND TRIM(up.prompt_text) != ''
+        ORDER BY up.id ASC
+        LIMIT ?
+      `
+    ).all(SqliteVecSync.BG_BATCH_ROWS) as StoredUserPrompt[];
+
+    if (rows.length === 0) {
+      return false;
+    }
+
+    const docs: VectorDocument[] = rows.map((row) => this.formatUserPromptDoc(row));
+    if (docs.length === 0) {
+      return true;
+    }
+    await this.addDocuments(docs, 'sync');
+    this.bgSuccessRowCount += rows.length;
+    this.bgSuccessDocCount += docs.length;
+    return true;
+  }
+
+  private recordBackgroundFailure(error: unknown): void {
+    this.bgFailureCount += 1;
+    const now = Date.now();
+    if (now - this.bgFailureLastLoggedAt >= SqliteVecSync.BG_LOG_THROTTLE_MS) {
+      const errMsg = error instanceof Error ? error.message : String(error);
+      logger.warn('SQLITE_VEC', 'Background embed sync failing', {
+        failures: this.bgFailureCount,
+        windowMs: SqliteVecSync.BG_LOG_THROTTLE_MS,
+        lastError: errMsg
+      });
+      this.bgFailureCount = 0;
+      this.bgFailureLastLoggedAt = now;
+    }
   }
 
   async syncObservation(
