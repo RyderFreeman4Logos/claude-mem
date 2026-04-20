@@ -1,0 +1,30 @@
+[package]
+name = "claude-mem-migration-server"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Read-only HTTP SQL server for migrating claude-mem snapshot to mempal"
+
+[[bin]]
+name = "claude-mem-migration-server"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tower-http = { version = "0.5", features = ["trace", "timeout"] }
+rusqlite = { version = "0.31", features = ["bundled", "hooks"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+thiserror = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

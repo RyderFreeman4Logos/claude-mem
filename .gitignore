@@ -58,6 +58,9 @@ src/agents/
 .claude/session-plan.md
 .octo/
 
+# Rust build output for tools/ binaries (migration-server etc.)
+tools/**/target/
+
 # Local contribution analysis (not part of upstream)
 CONTRIB_NOTES.md
 __pycache__/
