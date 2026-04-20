@@ -73,6 +73,12 @@ export class OpenRouterAgent {
   private static globalCooldownUntil: number = 0;
   private static modelCooldowns: Map<string, number> = new Map();
 
+  // Local LLM (self-hosted, cost-saving, best-effort) — separate endpoint/key from openrouter.
+  // Used to offload work from paid providers. On ANY failure we skip for UNHEALTHY_COOLDOWN_SEC
+  // so the main queue never backs up waiting on a flaky local backend.
+  private static localLlmInFlight: number = 0;
+  private static localLlmUnhealthyUntil: number = 0;
+
   constructor(dbManager: DatabaseManager, sessionManager: SessionManager) {
     this.dbManager = dbManager;
     this.sessionManager = sessionManager;
@@ -114,6 +120,14 @@ export class OpenRouterAgent {
 
   static getCooldownRemainingSeconds(): number {
     return OpenRouterAgent.getGlobalCooldownRemainingSeconds();
+  }
+
+  private static tryAcquireLocalLlmSlot(concurrency: number): boolean {
+    if (OpenRouterAgent.localLlmInFlight >= concurrency) {
+      return false;
+    }
+    OpenRouterAgent.localLlmInFlight += 1;
+    return true;
   }
 
   /**
@@ -546,8 +560,17 @@ export class OpenRouterAgent {
       throw new Error(`OpenRouter global cooldown (${remaining}s remaining). All free models rate-limited.`);
     }
 
-    for (let i = 0; i < models.length; i++) {
-      const model = models[i];
+    // Prepend best-effort local LLM when enabled + healthy + has a free slot.
+    // Saturation = skip (no queueing): new requests spill straight into openrouter fallback.
+    const localCfg = this.getLocalLlmConfig();
+    const useLocal =
+      !!localCfg &&
+      !OpenRouterAgent.isLocalLlmUnhealthy() &&
+      OpenRouterAgent.tryAcquireLocalLlmSlot(localCfg.concurrency);
+    const effectiveModels = useLocal ? [localCfg!.model, ...models.filter(m => m !== localCfg!.model)] : models;
+
+    for (let i = 0; i < effectiveModels.length; i++) {
+      const model = effectiveModels[i];
 
       // Skip models that are individually cooling down
       if (OpenRouterAgent.isModelInCooldown(model)) {
@@ -556,17 +579,14 @@ export class OpenRouterAgent {
         continue;
       }
 
-      try {
-        logger.debug('SDK', `Trying OpenRouter model ${i + 1}/${models.length}: ${model}`);
+      const isLocal = useLocal && i === 0;
 
-        const result = await this.queryOpenRouterMultiTurn(
-          history,
-          apiKey,
-          model,
-          baseUrl,
-          siteUrl,
-          appName
-        );
+      try {
+        logger.debug('SDK', `Trying OpenRouter model ${i + 1}/${effectiveModels.length}: ${model}`);
+
+        const result = isLocal
+          ? await this.queryLocalLlm(history, localCfg!)
+          : await this.queryOpenRouterMultiTurn(history, apiKey, model, baseUrl, siteUrl, appName);
 
         // Success - log if we had to fall back
         if (i > 0) {
@@ -584,12 +604,15 @@ export class OpenRouterAgent {
         errors.push({ model, error: errorMessage });
 
         // Fatal errors should not try the next model — they will fail the same way
-        const isFatalError = errorMessage.toLowerCase().includes('unauthorized') ||
+        // UNLESS the error came from the local LLM branch (credentials are separate)
+        const isFatalError = !isLocal && (
+          errorMessage.toLowerCase().includes('unauthorized') ||
           errorMessage.toLowerCase().includes('forbidden') ||
           errorMessage.toLowerCase().includes('invalid api key') ||
           errorMessage.toLowerCase().includes('authentication') ||
           errorMessage.includes('401') ||
-          errorMessage.includes('403');
+          errorMessage.includes('403')
+        );
 
         // Global cooldown was just set by the 429 handler — skip remaining models
         if (OpenRouterAgent.isInGlobalCooldown()) {
@@ -602,19 +625,19 @@ export class OpenRouterAgent {
         }
 
         // Try next model for any non-fatal error (quota, transient, server errors, etc.)
-        if (!isFatalError && i < models.length - 1) {
+        if (!isFatalError && i < effectiveModels.length - 1) {
           logger.warn('SDK', 'OpenRouter model failed, trying next model', {
             failedModel: model,
-            nextModel: models[i + 1],
+            nextModel: effectiveModels[i + 1],
             error: errorMessage
           });
           continue;
         }
 
         // Last model or fatal error - throw
-        if (i === models.length - 1) {
+        if (i === effectiveModels.length - 1) {
           logger.error('SDK', 'All OpenRouter models failed', {
-            attemptedModels: models.join(', '),
+            attemptedModels: effectiveModels.join(', '),
             errors: errors.map(e => `${e.model}: ${e.error}`).join(' | ')
           });
           throw new Error(`All OpenRouter models failed. Last error: ${errorMessage}`);
@@ -768,6 +791,81 @@ export class OpenRouterAgent {
   }
 
   /**
+   * Query the self-hosted "local LLM" backend. Separate from queryOpenRouterMultiTurn so failure
+   * surface (timeout / 5xx / connect refused / empty content / any throw) uniformly marks the
+   * endpoint unhealthy for LOCAL_LLM_UNHEALTHY_COOLDOWN_SEC, after which the outer fallback loop
+   * re-tries the openrouter chain.
+   */
+  private async queryLocalLlm(
+    history: ConversationMessage[],
+    cfg: NonNullable<ReturnType<OpenRouterAgent['getLocalLlmConfig']>>
+  ): Promise<{ content: string; tokensUsed?: number }> {
+    const truncatedHistory = this.truncateHistory(history);
+    const messages = this.conversationToOpenAIMessages(truncatedHistory);
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), cfg.timeoutMs);
+    try {
+      logger.debug('SDK', `Querying local LLM (${cfg.model})`, {
+        turns: truncatedHistory.length,
+        inFlight: OpenRouterAgent.localLlmInFlight,
+        enableThinking: cfg.enableThinking,
+        maxTokens: cfg.maxTokens,
+      });
+
+      const body: Record<string, unknown> = {
+        model: cfg.model,
+        messages,
+        temperature: 0.3,
+        max_tokens: cfg.maxTokens,
+        chat_template_kwargs: { enable_thinking: cfg.enableThinking },
+      };
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (cfg.apiKey) headers['Authorization'] = `Bearer ${cfg.apiKey}`;
+
+      const response = await fetch(cfg.baseUrl, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+
+      if (!response.ok) {
+        const errText = await response.text().catch(() => '<no body>');
+        throw new Error(`Local LLM ${response.status}: ${errText.slice(0, 300)}`);
+      }
+
+      const data = await response.json() as OpenRouterResponse;
+      if (data.error) throw new Error(`Local LLM API error: ${data.error.code} - ${data.error.message}`);
+      const content = data.choices?.[0]?.message?.content || '';
+      if (!content) throw new Error('Local LLM returned empty content');
+      const tokensUsed = data.usage?.total_tokens;
+      if (tokensUsed) {
+        logger.info('SDK', 'Local LLM usage', {
+          model: cfg.model,
+          inputTokens: data.usage?.prompt_tokens || 0,
+          outputTokens: data.usage?.completion_tokens || 0,
+          totalTokens: tokensUsed,
+          messagesInContext: truncatedHistory.length,
+        });
+      }
+      return { content, tokensUsed };
+    } catch (err: unknown) {
+      const cooldownMs = cfg.unhealthyCooldownSec * 1000;
+      OpenRouterAgent.localLlmUnhealthyUntil = Date.now() + cooldownMs;
+      const reason = err instanceof Error ? err.message : String(err);
+      logger.warn('SDK', `Local LLM failed, cooling down ${cfg.unhealthyCooldownSec}s`, {
+        model: cfg.model,
+        reason: reason.slice(0, 200),
+      });
+      throw err;
+    } finally {
+      clearTimeout(timer);
+      OpenRouterAgent.localLlmInFlight = Math.max(0, OpenRouterAgent.localLlmInFlight - 1);
+    }
+  }
+
+  /**
    * Get OpenRouter configuration from settings or environment
    * Supports multiple models separated by comma for automatic fallback
    * Issue #733: Uses centralized ~/.claude-mem/.env for credentials, not random project .env files
@@ -798,6 +896,42 @@ export class OpenRouterAgent {
     const appName = settings.CLAUDE_MEM_OPENROUTER_APP_NAME || 'claude-mem';
 
     return { apiKey, models, baseUrl, siteUrl, appName };
+  }
+
+  /**
+   * Best-effort self-hosted LLM config. Separate base URL / API key from openrouter so swapping
+   * the backing model (qwen35, gemma4, etc.) doesn't touch the openrouter fallback chain.
+   * Returns null when disabled or misconfigured so the caller can silently skip.
+   */
+  private getLocalLlmConfig(): {
+    model: string;
+    baseUrl: string;
+    apiKey: string;
+    concurrency: number;
+    maxTokens: number;
+    enableThinking: boolean;
+    timeoutMs: number;
+    unhealthyCooldownSec: number;
+  } | null {
+    const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
+    if (String(settings.CLAUDE_MEM_LOCAL_LLM_ENABLED || '').toLowerCase() !== 'true') return null;
+    const model = String(settings.CLAUDE_MEM_LOCAL_LLM_MODEL || '').trim();
+    const baseUrl = String(settings.CLAUDE_MEM_LOCAL_LLM_BASE_URL || '').trim();
+    if (!model || !baseUrl) return null;
+    return {
+      model,
+      baseUrl,
+      apiKey: String(settings.CLAUDE_MEM_LOCAL_LLM_API_KEY || '').trim(),
+      concurrency: parseInt(settings.CLAUDE_MEM_LOCAL_LLM_CONCURRENCY || '4', 10) || 4,
+      maxTokens: parseInt(settings.CLAUDE_MEM_LOCAL_LLM_MAX_TOKENS || '32768', 10) || 32768,
+      enableThinking: String(settings.CLAUDE_MEM_LOCAL_LLM_ENABLE_THINKING || 'true').toLowerCase() === 'true',
+      timeoutMs: parseInt(settings.CLAUDE_MEM_LOCAL_LLM_TIMEOUT_MS || '600000', 10) || 600000,
+      unhealthyCooldownSec: parseInt(settings.CLAUDE_MEM_LOCAL_LLM_UNHEALTHY_COOLDOWN_SEC || '60', 10) || 60,
+    };
+  }
+
+  static isLocalLlmUnhealthy(): boolean {
+    return Date.now() < OpenRouterAgent.localLlmUnhealthyUntil;
   }
 }
 
