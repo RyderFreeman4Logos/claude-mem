@@ -164,27 +164,58 @@ export class ConcurrencyManager {
 
   private readDesiredConcurrency(): number {
     try {
-      if (process.env.CLAUDE_MEM_CONCURRENT_MESSAGES !== undefined) {
-        return this.normalizeConcurrency(process.env.CLAUDE_MEM_CONCURRENT_MESSAGES);
+      const baseConcurrency = (() => {
+        if (process.env.CLAUDE_MEM_CONCURRENT_MESSAGES !== undefined) {
+          return this.normalizeConcurrency(process.env.CLAUDE_MEM_CONCURRENT_MESSAGES);
+        }
+        if (!existsSync(this.settingsPath)) {
+          return DEFAULT_CONCURRENCY;
+        }
+        const rawSettings = JSON.parse(readFileSync(this.settingsPath, 'utf-8'));
+        const flatSettings = rawSettings && typeof rawSettings === 'object' && !Array.isArray(rawSettings)
+          ? ('env' in rawSettings && rawSettings.env && typeof rawSettings.env === 'object' && !Array.isArray(rawSettings.env)
+            ? rawSettings.env
+            : rawSettings)
+          : null;
+        return this.normalizeConcurrency(flatSettings?.CLAUDE_MEM_CONCURRENT_MESSAGES);
+      })();
+
+      // Decouple local-LLM concurrency from the pending-messages pool size.
+      // If operator wants LOCAL_LLM_CONCURRENCY > CONCURRENT_MESSAGES, bump the pool so the
+      // local backend can actually reach its configured parallelism. Overflow (local saturated
+      // or unhealthy) still falls through to openrouter via OpenRouterAgent's gate.
+      const localBoost = this.readLocalLlmConcurrencyBoost();
+      if (localBoost > baseConcurrency) {
+        logger.info('SYSTEM', 'Worker pool expanded to honor local-LLM concurrency', {
+          concurrentMessages: baseConcurrency,
+          localLlmConcurrency: localBoost,
+          effectivePoolSize: localBoost
+        });
+        return this.normalizeConcurrency(localBoost);
       }
-
-      if (!existsSync(this.settingsPath)) {
-        return DEFAULT_CONCURRENCY;
-      }
-
-      const rawSettings = JSON.parse(readFileSync(this.settingsPath, 'utf-8'));
-      const flatSettings = rawSettings && typeof rawSettings === 'object' && !Array.isArray(rawSettings)
-        ? ('env' in rawSettings && rawSettings.env && typeof rawSettings.env === 'object' && !Array.isArray(rawSettings.env)
-          ? rawSettings.env
-          : rawSettings)
-        : null;
-
-      return this.normalizeConcurrency(flatSettings?.CLAUDE_MEM_CONCURRENT_MESSAGES);
+      return baseConcurrency;
     } catch (error) {
       logger.warn('SYSTEM', 'Failed to load concurrent message setting, using default', {
         settingsPath: this.settingsPath
       }, error as Error);
       return this.normalizeConcurrency(SettingsDefaultsManager.get('CLAUDE_MEM_CONCURRENT_MESSAGES'));
+    }
+  }
+
+  private readLocalLlmConcurrencyBoost(): number {
+    try {
+      if (!existsSync(this.settingsPath)) return 0;
+      const raw = JSON.parse(readFileSync(this.settingsPath, 'utf-8'));
+      const flat = raw && typeof raw === 'object' && !Array.isArray(raw)
+        ? ('env' in raw && raw.env && typeof raw.env === 'object' && !Array.isArray(raw.env) ? raw.env : raw)
+        : null;
+      if (!flat) return 0;
+      const enabled = String(flat.CLAUDE_MEM_LOCAL_LLM_ENABLED || '').toLowerCase() === 'true';
+      if (!enabled) return 0;
+      const c = parseInt(String(flat.CLAUDE_MEM_LOCAL_LLM_CONCURRENCY || ''), 10);
+      return Number.isFinite(c) && c > 0 ? c : 0;
+    } catch {
+      return 0;
     }
   }
 

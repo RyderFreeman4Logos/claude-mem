@@ -89,6 +89,16 @@ export interface SettingsDefaults {
   CLAUDE_MEM_SQLITE_VEC_BG_BATCH_ROWS: string;
   CLAUDE_MEM_EMBED_QUERY_INSTRUCT: string;
   CLAUDE_MEM_EMBED_TIMEOUT_MS: string;
+  // Local LLM (self-hosted, best-effort offload, unstable — fail-fast to openrouter)
+  CLAUDE_MEM_LOCAL_LLM_ENABLED: string;
+  CLAUDE_MEM_LOCAL_LLM_MODEL: string;
+  CLAUDE_MEM_LOCAL_LLM_BASE_URL: string;
+  CLAUDE_MEM_LOCAL_LLM_API_KEY: string;
+  CLAUDE_MEM_LOCAL_LLM_CONCURRENCY: string;
+  CLAUDE_MEM_LOCAL_LLM_MAX_TOKENS: string;
+  CLAUDE_MEM_LOCAL_LLM_ENABLE_THINKING: string;
+  CLAUDE_MEM_LOCAL_LLM_TIMEOUT_MS: string;
+  CLAUDE_MEM_LOCAL_LLM_UNHEALTHY_COOLDOWN_SEC: string;
 }
 
 export class SettingsDefaultsManager {
@@ -181,6 +191,16 @@ export class SettingsDefaultsManager {
       'tool usage, or debugging (in Chinese or English), retrieve the detailed ' +
       'description that most closely matches.\nQuery: ',
     CLAUDE_MEM_EMBED_TIMEOUT_MS: '120000',
+    // Local LLM defaults — disabled until operator opts in with model+base_url
+    CLAUDE_MEM_LOCAL_LLM_ENABLED: 'false',
+    CLAUDE_MEM_LOCAL_LLM_MODEL: '',
+    CLAUDE_MEM_LOCAL_LLM_BASE_URL: '',
+    CLAUDE_MEM_LOCAL_LLM_API_KEY: '',
+    CLAUDE_MEM_LOCAL_LLM_CONCURRENCY: '4',
+    CLAUDE_MEM_LOCAL_LLM_MAX_TOKENS: '32768',
+    CLAUDE_MEM_LOCAL_LLM_ENABLE_THINKING: 'true',
+    CLAUDE_MEM_LOCAL_LLM_TIMEOUT_MS: '600000',
+    CLAUDE_MEM_LOCAL_LLM_UNHEALTHY_COOLDOWN_SEC: '60',
   };
 
   /**
