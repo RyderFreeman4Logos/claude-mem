@@ -19,6 +19,7 @@ export class ConcurrencyManager {
   private reloadTimer: ReturnType<typeof setTimeout> | null = null;
   private watching = false;
   private pendingReloadEventType: 'change' | 'rename' | 'unknown' = 'unknown';
+  private watcherErrorLogged = false;
 
   constructor(
     private settingsPath: string = USER_SETTINGS_PATH
@@ -69,6 +70,7 @@ export class ConcurrencyManager {
     }
 
     this.watching = true;
+    this.watcherErrorLogged = false;
     logger.debug('SYSTEM', `${COMPONENT_NAME} watcher starting`, {
       settingsPath: this.settingsPath
     });
@@ -77,6 +79,7 @@ export class ConcurrencyManager {
 
   stopWatching(): void {
     this.watching = false;
+    this.watcherErrorLogged = false;
 
     if (this.reloadTimer) {
       clearTimeout(this.reloadTimer);
@@ -124,13 +127,18 @@ export class ConcurrencyManager {
         }, RELOAD_DEBOUNCE_MS);
       });
       this.watcher.on('error', (error) => {
-        logger.warn('SYSTEM', `${COMPONENT_NAME} watcher error`, {
-          settingsPath: this.settingsPath
-        }, error as Error);
-
-        if (this.watching) {
-          this.restartWatcher();
+        if (!this.watching) {
+          return;
         }
+
+        if (!this.watcherErrorLogged) {
+          logger.warn('SYSTEM', `${COMPONENT_NAME} watcher error; stopping settings watch until restart`, {
+            settingsPath: this.settingsPath
+          }, error as Error);
+          this.watcherErrorLogged = true;
+        }
+
+        this.stopWatching();
       });
     } catch (error) {
       logger.warn('SYSTEM', 'Failed to watch settings.json for concurrency updates', {
@@ -140,6 +148,7 @@ export class ConcurrencyManager {
   }
 
   private reloadFromSettings(eventType: 'change' | 'rename' | 'unknown'): void {
+    SettingsDefaultsManager.invalidateCache(this.settingsPath);
     const next = this.readDesiredConcurrency();
     const previous = this.desiredConcurrency;
 
@@ -163,8 +172,8 @@ export class ConcurrencyManager {
   }
 
   private readDesiredConcurrency(): number {
-    try {
-      const baseConcurrency = (() => {
+    const baseConcurrency = (() => {
+      try {
         if (process.env.CLAUDE_MEM_CONCURRENT_MESSAGES !== undefined) {
           return this.normalizeConcurrency(process.env.CLAUDE_MEM_CONCURRENT_MESSAGES);
         }
@@ -178,28 +187,26 @@ export class ConcurrencyManager {
             : rawSettings)
           : null;
         return this.normalizeConcurrency(flatSettings?.CLAUDE_MEM_CONCURRENT_MESSAGES);
-      })();
-
-      // Decouple local-LLM concurrency from the pending-messages pool size.
-      // If operator wants LOCAL_LLM_CONCURRENCY > CONCURRENT_MESSAGES, bump the pool so the
-      // local backend can actually reach its configured parallelism. Overflow (local saturated
-      // or unhealthy) still falls through to openrouter via OpenRouterAgent's gate.
-      const localBoost = this.readLocalLlmConcurrencyBoost();
-      if (localBoost > baseConcurrency) {
-        logger.info('SYSTEM', 'Worker pool expanded to honor local-LLM concurrency', {
-          concurrentMessages: baseConcurrency,
-          localLlmConcurrency: localBoost,
-          effectivePoolSize: localBoost
-        });
-        return this.normalizeConcurrency(localBoost);
+      } catch {
+        return DEFAULT_CONCURRENCY;
       }
-      return baseConcurrency;
-    } catch (error) {
-      logger.warn('SYSTEM', 'Failed to load concurrent message setting, using default', {
-        settingsPath: this.settingsPath
-      }, error as Error);
-      return this.normalizeConcurrency(SettingsDefaultsManager.get('CLAUDE_MEM_CONCURRENT_MESSAGES'));
+    })();
+
+    // Decouple local-LLM concurrency from the pending-messages pool size.
+    // If operator wants LOCAL_LLM_CONCURRENCY > CONCURRENT_MESSAGES, bump the pool so the
+    // local backend can actually reach its configured parallelism. Overflow (local saturated
+    // or unhealthy) still falls through to openrouter via OpenRouterAgent's gate.
+    const localBoost = this.readLocalLlmConcurrencyBoost();
+    if (localBoost > baseConcurrency) {
+      logger.info('SYSTEM', 'Worker pool expanded to honor local-LLM concurrency', {
+        concurrentMessages: baseConcurrency,
+        localLlmConcurrency: localBoost,
+        effectivePoolSize: localBoost
+      });
+      return this.normalizeConcurrency(localBoost);
     }
+
+    return baseConcurrency;
   }
 
   private readLocalLlmConcurrencyBoost(): number {
