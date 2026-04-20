@@ -571,10 +571,11 @@ export class OpenRouterAgent {
         continue;
       }
 
+      const isLocal = useLocal && i === 0;
+
       try {
         logger.debug('SDK', `Trying OpenRouter model ${i + 1}/${effectiveModels.length}: ${model}`);
 
-        const isLocal = !!localCfg && model === localCfg.model;
         const result = isLocal
           ? await this.queryLocalLlm(history, localCfg!)
           : await this.queryOpenRouterMultiTurn(history, apiKey, model, baseUrl, siteUrl, appName);
@@ -595,12 +596,15 @@ export class OpenRouterAgent {
         errors.push({ model, error: errorMessage });
 
         // Fatal errors should not try the next model — they will fail the same way
-        const isFatalError = errorMessage.toLowerCase().includes('unauthorized') ||
+        // UNLESS the error came from the local LLM branch (credentials are separate)
+        const isFatalError = !isLocal && (
+          errorMessage.toLowerCase().includes('unauthorized') ||
           errorMessage.toLowerCase().includes('forbidden') ||
           errorMessage.toLowerCase().includes('invalid api key') ||
           errorMessage.toLowerCase().includes('authentication') ||
           errorMessage.includes('401') ||
-          errorMessage.includes('403');
+          errorMessage.includes('403')
+        );
 
         // Global cooldown was just set by the 429 handler — skip remaining models
         if (OpenRouterAgent.isInGlobalCooldown()) {
