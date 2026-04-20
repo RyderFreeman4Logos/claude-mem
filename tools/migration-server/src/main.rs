@@ -26,6 +26,7 @@ use serde::Deserialize;
 use serde_json::{json, Value as JsonValue};
 use tokio::sync::{mpsc, Semaphore};
 use tokio_stream::wrappers::ReceiverStream;
+use tower_http::timeout::TimeoutLayer;
 use tracing::{info, warn};
 
 #[derive(Parser, Debug, Clone)]
@@ -116,53 +117,43 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // Clamp channel depth to >= 1 because tokio::sync::mpsc::channel(0) panics,
+    // and a one-off CLI typo should not crash the server at startup.
+    let channel_depth = args.channel_depth.max(1);
+    let query_timeout = Duration::from_secs(args.query_timeout_sec);
+
     let state = AppState {
         db_path: args.db.clone(),
         max_rows: args.max_rows,
-        query_timeout: Duration::from_secs(args.query_timeout_sec),
+        query_timeout,
         cache_kb: args.cache_kb,
-        channel_depth: args.channel_depth,
+        channel_depth,
         sem: Arc::new(Semaphore::new(args.max_concurrent)),
     };
 
+    // Request-level timeout. axum drops the response future on timeout, which
+    // drops `rx` and causes the blocking task's `tx.blocking_send` to error
+    // out — this is what guarantees a slow client cannot hold a semaphore
+    // permit past the per-query wall-clock budget (see Reviewer Guidance →
+    // Timing/Race Scenarios: channel-full backpressure).
     let app = Router::new()
         .route("/health", get(health))
         .route("/stats", get(stats))
         .route("/sql", post(run_sql))
+        .layer(TimeoutLayer::new(query_timeout))
         .with_state(state);
 
     info!(bind = %args.bind, "migration server listening");
 
+    // Intentionally NOT using `with_graceful_shutdown`: on gb10 this binary
+    // coexists with an earlyoom-protected LLM service. If earlyoom or the
+    // operator sends SIGTERM, we want to exit immediately and let the OS
+    // reclaim memory — waiting for in-flight streams to drain defeats the
+    // purpose and risks SIGKILL escalation hitting the wrong process.
     let listener = tokio::net::TcpListener::bind(args.bind).await?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(listener, app).await?;
 
     Ok(())
-}
-
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl+C handler");
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install SIGTERM handler")
-            .recv()
-            .await;
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = ctrl_c => info!("SIGINT received; shutting down"),
-        _ = terminate => info!("SIGTERM received; shutting down"),
-    }
 }
 
 async fn health() -> &'static str {
@@ -257,6 +248,16 @@ fn stream_sql(
 ) -> anyhow::Result<()> {
     let conn = open_readonly(db_path, cache_kb)?;
 
+    // Install a progress handler so SQLite can be interrupted from inside a
+    // long-running `sqlite3_step` call (e.g. heavy aggregation, massive
+    // cross-join) — the between-row timeout check below only fires between
+    // yielded rows, so without this a single query could pin a blocking
+    // thread and a semaphore permit for minutes despite the wall-clock
+    // budget. `Instant` is `Copy`, so the `move` closure takes its own copy
+    // and `started` remains usable for the per-row check below.
+    let started = Instant::now();
+    conn.progress_handler(1000, Some(move || started.elapsed() > timeout));
+
     let stmt_check = conn.prepare(sql)?;
     if !stmt_check.readonly() {
         return Err(anyhow::anyhow!(
@@ -274,7 +275,6 @@ fn stream_sql(
     let bound: Vec<Box<dyn ToSql>> = params.iter().map(json_to_sql_param).collect();
     let bound_refs: Vec<&dyn ToSql> = bound.iter().map(|b| b.as_ref()).collect();
 
-    let started = Instant::now();
     let mut rows = stmt.query(bound_refs.as_slice())?;
     let mut emitted: usize = 0;
 
@@ -299,7 +299,18 @@ fn stream_sql(
             let v = match row.get_ref(i)? {
                 ValueRef::Null => JsonValue::Null,
                 ValueRef::Integer(n) => json!(n),
-                ValueRef::Real(f) => json!(f),
+                ValueRef::Real(f) => {
+                    // serde_json panics on NaN / ±Inf. A panic inside the
+                    // blocking task drops `tx` and axum ends the NDJSON stream
+                    // with a silent 200 OK — client would wrongly believe the
+                    // query completed with partial data. Map non-finite to Null
+                    // so a row with a NaN/Inf is still delivered explicitly.
+                    if f.is_finite() {
+                        json!(f)
+                    } else {
+                        JsonValue::Null
+                    }
+                }
                 ValueRef::Text(t) => match std::str::from_utf8(t) {
                     Ok(s) => JsonValue::String(s.to_string()),
                     Err(_) => JsonValue::String(String::from_utf8_lossy(t).into_owned()),
