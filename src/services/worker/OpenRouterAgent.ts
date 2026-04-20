@@ -122,6 +122,14 @@ export class OpenRouterAgent {
     return OpenRouterAgent.getGlobalCooldownRemainingSeconds();
   }
 
+  private static tryAcquireLocalLlmSlot(concurrency: number): boolean {
+    if (OpenRouterAgent.localLlmInFlight >= concurrency) {
+      return false;
+    }
+    OpenRouterAgent.localLlmInFlight += 1;
+    return true;
+  }
+
   /**
    * Set the Gemini agent for secondary fallback
    * Must be set after construction to avoid circular dependency
@@ -546,20 +554,20 @@ export class OpenRouterAgent {
   ): Promise<{ content: string; tokensUsed?: number; modelId: string }> {
     const errors: Array<{ model: string; error: string }> = [];
 
+    // Global cooldown: all free models are blocked — bail out immediately
+    if (OpenRouterAgent.isInGlobalCooldown()) {
+      const remaining = OpenRouterAgent.getGlobalCooldownRemainingSeconds();
+      throw new Error(`OpenRouter global cooldown (${remaining}s remaining). All free models rate-limited.`);
+    }
+
     // Prepend best-effort local LLM when enabled + healthy + has a free slot.
     // Saturation = skip (no queueing): new requests spill straight into openrouter fallback.
     const localCfg = this.getLocalLlmConfig();
     const useLocal =
       !!localCfg &&
       !OpenRouterAgent.isLocalLlmUnhealthy() &&
-      OpenRouterAgent.localLlmInFlight < localCfg.concurrency;
+      OpenRouterAgent.tryAcquireLocalLlmSlot(localCfg.concurrency);
     const effectiveModels = useLocal ? [localCfg!.model, ...models.filter(m => m !== localCfg!.model)] : models;
-
-    // Global cooldown: all free models are blocked — bail out immediately
-    if (OpenRouterAgent.isInGlobalCooldown()) {
-      const remaining = OpenRouterAgent.getGlobalCooldownRemainingSeconds();
-      throw new Error(`OpenRouter global cooldown (${remaining}s remaining). All free models rate-limited.`);
-    }
 
     for (let i = 0; i < effectiveModels.length; i++) {
       const model = effectiveModels[i];
@@ -795,7 +803,6 @@ export class OpenRouterAgent {
     const truncatedHistory = this.truncateHistory(history);
     const messages = this.conversationToOpenAIMessages(truncatedHistory);
 
-    OpenRouterAgent.localLlmInFlight += 1;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), cfg.timeoutMs);
     try {

@@ -204,16 +204,11 @@ export class ConcurrencyManager {
 
   private readLocalLlmConcurrencyBoost(): number {
     try {
-      if (!existsSync(this.settingsPath)) return 0;
-      const raw = JSON.parse(readFileSync(this.settingsPath, 'utf-8'));
-      const flat = raw && typeof raw === 'object' && !Array.isArray(raw)
-        ? ('env' in raw && raw.env && typeof raw.env === 'object' && !Array.isArray(raw.env) ? raw.env : raw)
-        : null;
-      if (!flat) return 0;
-      const enabled = String(flat.CLAUDE_MEM_LOCAL_LLM_ENABLED || '').toLowerCase() === 'true';
+      const settings = SettingsDefaultsManager.loadFromFile(this.settingsPath);
+      const enabled = String(settings.CLAUDE_MEM_LOCAL_LLM_ENABLED || '').toLowerCase() === 'true';
       if (!enabled) return 0;
-      const c = parseInt(String(flat.CLAUDE_MEM_LOCAL_LLM_CONCURRENCY || ''), 10);
-      return Number.isFinite(c) && c > 0 ? c : 0;
+      const concurrency = parseInt(String(settings.CLAUDE_MEM_LOCAL_LLM_CONCURRENCY || ''), 10);
+      return Number.isFinite(concurrency) && concurrency > 0 ? concurrency : 0;
     } catch {
       return 0;
     }
